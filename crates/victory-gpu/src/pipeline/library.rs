@@ -138,7 +138,13 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
-    let library = make(&[]).ok()?;
+    let library = match make(&[]) {
+        Ok(library) => library,
+        Err(e) => {
+            tracing::info!(error = %e, "the host makes no pipeline library");
+            return None;
+        }
+    };
     Some(Library { library, _blob: Vec::new(), added: 0 })
 }
 
@@ -441,12 +447,33 @@ pub(crate) fn save(now: bool) {
     // replace files under each other.
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
+    let Some(dir) = DIR.get() else { return };
     let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
     if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
         return;
     }
     *last = Some(std::time::Instant::now());
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        tracing::warn!(error = %e, "host pipeline library not saved");
+        return;
+    }
+    // A host that makes no pipeline library (vkd3d-proton under Wine) keeps
+    // pipelines in caches of its own; the early list is kept all the same,
+    // so the next run starts making what this one drew as soon as the title
+    // creates it, and finds it in those caches.
+    let Some(library) = library() else {
+        if USED_CHANGED.swap(false, Ordering::Relaxed) {
+            let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+            match write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
+                Ok(()) => tracing::info!(early = used.len(), "early pipeline list saved (no host pipeline library)"),
+                Err(e) => {
+                    USED_CHANGED.store(true, Ordering::Relaxed);
+                    tracing::warn!(error = %e, "early pipeline list not saved");
+                }
+            }
+        }
+        return;
+    };
     let (blob, saved_additions) = {
         let l = library.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !USED_CHANGED.load(Ordering::Relaxed) {
