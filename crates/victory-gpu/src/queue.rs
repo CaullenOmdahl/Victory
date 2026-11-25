@@ -390,6 +390,16 @@ fn show(shown: Option<object::Ref>, over: Option<object::Ref>) {
         if frame >= 256 {
             let (hits, misses) = crate::shader_cache::counts();
             tracing::info!(hits, misses, "shaders from the cache and translated so far");
+            static WAVE64_LOGGED: std::sync::Once = std::sync::Once::new();
+            WAVE64_LOGGED.call_once(|| {
+                let (wave64, total) = crate::pipeline::compute_wave_counts();
+                tracing::info!(
+                    wave64,
+                    total,
+                    force_wave64 = victory_shader::emit::force_wave64(),
+                    "compute shaders with WaveSize(64)"
+                );
+            });
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]

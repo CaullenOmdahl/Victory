@@ -168,6 +168,26 @@ pub fn rays() -> bool {
     *RAYS.get_or_init(|| cfg!(test) || std::env::var("VICTORY_RAYS").is_ok_and(|v| v == "1"))
 }
 
+/// Whether native wave64 compute shaders declare `WaveSize(64)` when the
+/// host supports 64-lane waves (`VICTORY_FORCE_WAVE64=0` disables it).
+pub fn force_wave64() -> bool {
+    static FORCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCE.get_or_init(|| parse_force_wave64(std::env::var_os("VICTORY_FORCE_WAVE64").as_deref()))
+}
+
+fn parse_force_wave64(value: Option<&std::ffi::OsStr>) -> bool {
+    value.is_none_or(|v| v != "0")
+}
+
+/// The wave size a DXIL container's `PSV0` requires (minimum = maximum).
+pub fn dxil_wave_size(dxil: &[u8]) -> Option<u32> {
+    let c = Container::parse(dxil).ok()?;
+    let psv = c.part(FourCC::PSV0)?.data;
+    let u = |at: usize| crate::dxbc::u32_at(psv, at).ok();
+    let (min, max) = (u(4 + 16)?, u(4 + 20)?);
+    (min == max).then_some(min)
+}
+
 /// Slots reserved at the top of each view heap for memory-by-address views.
 pub const MEMORY_SLOTS: u32 = 1024;
 
@@ -1710,7 +1730,23 @@ mod tests {
             0x7E02_0300, // v_mov_b32 v1, v0
             0xBF81_0000, // s_endpgm
         ];
-        assert!(emit_for(&compute(&words, true), NVIDIA).is_ok());
+        let nvidia = emit_for(&compute(&words, true), NVIDIA).unwrap();
+        assert_eq!(super::dxil_wave_size(&nvidia.dxil), None);
+
+        let rdna = super::Target {
+            lanes_min: 32,
+            lanes_max: 64,
+            ..NVIDIA
+        };
+        let radv_w64 = emit_for(&compute(&words, true), rdna).unwrap();
+        assert_eq!(super::dxil_wave_size(&radv_w64.dxil), Some(64));
+
+        let radv_w32 = emit_for(&compute(&words, false), rdna).unwrap();
+        assert_eq!(super::dxil_wave_size(&radv_w32.dxil), None);
+
+        assert!(super::parse_force_wave64(None));
+        assert!(super::parse_force_wave64(Some(std::ffi::OsStr::new("1"))));
+        assert!(!super::parse_force_wave64(Some(std::ffi::OsStr::new("0"))));
     }
 
     /// The VALU instructions added for packing, dot products and ldexp

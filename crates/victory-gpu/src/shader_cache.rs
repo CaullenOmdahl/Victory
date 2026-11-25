@@ -69,6 +69,7 @@ fn build() -> &'static [u8; 32] {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.push(victory_shader::emit::rays().into());
+                bytes.push(victory_shader::emit::force_wave64().into());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

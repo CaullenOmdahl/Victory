@@ -364,51 +364,105 @@ impl<'a> Tracer<'a> {
 
     /// Optimistic copy propagation: a move's result is its source's
     /// origin, a phi's the one origin its arguments agree on.
+    ///
+    /// Round 0 settles every non-copy and constant write once in reverse
+    /// postorder while collecting only phis and value-copy edges into `work`.
+    /// When no phi argument or copy source observes an unresolved (`None`)
+    /// origin on round 0, every dependency is strictly forward in RPO and the
+    /// result has already converged in one pass.
     fn propagate_copies(&self, n: usize) -> Result<Vec<Term>, ShaderError> {
+        enum Work {
+            Phi(u32, u32),
+            Copy { dst: Value, src: Value },
+        }
         let mut o: Vec<Option<Term>> = vec![None; n];
         for &(_, v) in &self.p.inputs {
             o[v.0 as usize] = Some(Term::Value(v));
         }
         let order = crate::ir::reverse_postorder(&self.p.blocks);
-        for _ in 0..MAX_ROUNDS {
-            let mut changed = false;
-            for &b in &order {
-                let block = &self.p.blocks[b];
-                for phi in &block.phis {
-                    let own = Term::Value(phi.value);
-                    let mut args = phi
-                        .args
-                        .iter()
-                        .filter_map(|a| o[a.0 as usize])
-                        .filter(|&t| t != own);
-                    let new = args
-                        .next()
-                        .map(|first| if args.all(|t| t == first) { first } else { own });
-                    if new.is_some() && new != o[phi.value.0 as usize] {
-                        o[phi.value.0 as usize] = new;
-                        changed = true;
+        let mut work: Vec<Work> = Vec::new();
+        let mut saw_none = false;
+        for &b in &order {
+            let block = &self.p.blocks[b];
+            for (pi, phi) in block.phis.iter().enumerate() {
+                work.push(Work::Phi(b as u32, pi as u32));
+                let own = Term::Value(phi.value);
+                let mut first: Option<Term> = None;
+                let mut uniform = true;
+                for &a in &phi.args {
+                    let Some(t) = o[a.0 as usize] else {
+                        saw_none = true;
+                        continue;
+                    };
+                    if t == own {
+                        continue;
+                    }
+                    match first {
+                        None => first = Some(t),
+                        Some(f) if f != t => uniform = false,
+                        _ => {}
                     }
                 }
-                for inst in &block.insts {
-                    for (k, &(_, v)) in inst.writes.iter().enumerate() {
-                        let new = match copy_source(inst, k).or_else(|| self.restored(inst)) {
-                            Some(Moved::Const(c)) => Some(Term::Const(c)),
-                            Some(Moved::Value(s)) => o[s.0 as usize],
-                            None => Some(Term::Value(v)),
-                        };
-                        if new.is_some() && new != o[v.0 as usize] {
-                            o[v.0 as usize] = new;
+                if let Some(f) = first {
+                    o[phi.value.0 as usize] = Some(if uniform { f } else { own });
+                }
+            }
+            for inst in &block.insts {
+                for (k, &(_, v)) in inst.writes.iter().enumerate() {
+                    match copy_source(inst, k).or_else(|| self.restored(inst)) {
+                        Some(Moved::Const(c)) => o[v.0 as usize] = Some(Term::Const(c)),
+                        Some(Moved::Value(s)) => {
+                            work.push(Work::Copy { dst: v, src: s });
+                            match o[s.0 as usize] {
+                                Some(t) => o[v.0 as usize] = Some(t),
+                                None => saw_none = true,
+                            }
+                        }
+                        None => o[v.0 as usize] = Some(Term::Value(v)),
+                    }
+                }
+            }
+        }
+        let finish = |o: Vec<Option<Term>>| -> Vec<Term> {
+            o.into_iter()
+                .enumerate()
+                .map(|(v, t)| t.unwrap_or(Term::Value(Value(v as u32))))
+                .collect()
+        };
+        if !saw_none {
+            return Ok(finish(o));
+        }
+        for _ in 1..MAX_ROUNDS {
+            let mut changed = false;
+            for item in &work {
+                match *item {
+                    Work::Phi(b, pi) => {
+                        let phi = &self.p.blocks[b as usize].phis[pi as usize];
+                        let own = Term::Value(phi.value);
+                        let mut args = phi
+                            .args
+                            .iter()
+                            .filter_map(|a| o[a.0 as usize])
+                            .filter(|&t| t != own);
+                        let new = args
+                            .next()
+                            .map(|first| if args.all(|t| t == first) { first } else { own });
+                        if new.is_some() && new != o[phi.value.0 as usize] {
+                            o[phi.value.0 as usize] = new;
+                            changed = true;
+                        }
+                    }
+                    Work::Copy { dst, src } => {
+                        let new = o[src.0 as usize];
+                        if new.is_some() && new != o[dst.0 as usize] {
+                            o[dst.0 as usize] = new;
                             changed = true;
                         }
                     }
                 }
             }
             if !changed {
-                return Ok(o
-                    .into_iter()
-                    .enumerate()
-                    .map(|(v, t)| t.unwrap_or(Term::Value(Value(v as u32))))
-                    .collect());
+                return Ok(finish(o));
             }
         }
         Err(ShaderError::Unsupported {

@@ -1365,7 +1365,10 @@ impl<'a> Lower<'a> {
             }
             if split {
                 s.wave_size = Some(32);
-            } else if console_lanes || one_wave && s.lds_dwords > 0 {
+            } else if console_lanes
+                || (one_wave && s.lds_dwords > 0)
+                || (x.native.wave64 && x.target.runs(64) && super::force_wave64())
+            {
                 s.wave_size = Some(wave);
             }
         }
@@ -8869,7 +8872,7 @@ impl<'a> Lower<'a> {
                         self.s.flags |= flags::DOUBLE_EXT;
                         let f64t = self.s.m.double();
                         self.s
-                            .op(c, "fma.f64", Attr::ReadNone, f64t, 47, &[a, b, d])
+                            .op(c, "tertiary.f64", Attr::ReadNone, f64t, 47, &[a, b, d])
                     }
                 };
                 self.write_f64(inst, r, guard)
