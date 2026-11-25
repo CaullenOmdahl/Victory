@@ -1792,6 +1792,8 @@ impl HostHeap {
         if !made_any && (!b.full.1 || !remake) && let Some(plan) = &b.plan {
             return Some(plan.clone());
         }
+        fresh.sort_unstable_by_key(|b| b.1);
+        let fresh_reads = merged(fresh_reads, READ_GAP);
         // All of it is copied by the first submission of a frame only: the
         // later ones take what is new.
         if !remake && let Some(plan) = &b.plan {

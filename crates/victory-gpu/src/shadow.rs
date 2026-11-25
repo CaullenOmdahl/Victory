@@ -716,37 +716,23 @@ impl Shadow {
             mode = NOT_WATCHED;
         }
         let lazy = lazy && !forced && always != 2;
-        if mode == WATCHED_GUARDED {
-            let ge = crate::watch::region_epoch(from, to);
-            {
-                let spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
-                if spans.get(&(from, to)) == Some(&ge) {
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        use crate::copystat::{C, add};
-                        add(C::Checked, (to - from) as u64);
-                        add(C::Unchanged, (to - from) as u64);
-                    }
-                    return 0;
-                }
-            }
-            if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
-                let copied = self.copy_stale(from, to, now, &written);
-                if crate::watch::region_epoch(from, to) == ge {
-                    let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
-                    if spans.len() >= 8192 {
-                        spans.clear();
-                    }
-                    spans.insert((from, to), ge);
-                }
-                #[cfg(feature = "diagnostics")]
-                {
-                    use crate::copystat::{C, add};
-                    add(C::Checked, (to - from) as u64);
-                    add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+        if !forced && mode == WATCHED_GUARDED {
+            // Subdivide large guarded spans into 8 MiB chunks so a single write
+            // fault in one corner of a 174 MiB buffer does not invalidate
+            // `clean_spans` or scan all 2,784 pages on every submission.
+            const SPAN_CHUNK: usize = 8 << 20;
+            if to - from > SPAN_CHUNK {
+                let mut copied = 0usize;
+                let mut at = from;
+                while at < to {
+                    let next = ((at + SPAN_CHUNK) & !(SPAN_CHUNK - 1)).min(to);
+                    let next = if next <= at { (at + SPAN_CHUNK).min(to) } else { next };
+                    copied += self.update_guarded_chunk(at, next, lazy);
+                    at = next;
                 }
                 return copied;
             }
+            return self.update_guarded_chunk(from, to, lazy);
         } else if mode != NOT_WATCHED {
             // Probe write-watch first; if that fails and guard succeeds, mark
             // this shadow as guarded so subsequent calls skip GetWriteWatch.
@@ -790,6 +776,60 @@ impl Shadow {
         }
         // shortcut: memory that cannot be watched (unmapped, mostly) is copied
         // once a frame.
+        self.update_unwatched(from, to, lazy)
+    }
+
+    /// Updates `[from, to)` via write-guard tracking, caching clean chunks by
+    /// their 1 MiB region epochs and falling back cleanly when unguarded.
+    fn update_guarded_chunk(&self, from: usize, to: usize, lazy: bool) -> usize {
+        let ge = crate::watch::region_epoch(from, to);
+        {
+            let spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
+            if spans.get(&(from, to)) == Some(&ge) {
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (to - from) as u64);
+                    add(C::Unchanged, (to - from) as u64);
+                }
+                return 0;
+            }
+        }
+        if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
+            let copied = self.copy_stale(from, to, now, &written);
+            if crate::watch::region_epoch(from, to) == ge {
+                let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
+                if spans.len() >= 8192 {
+                    spans.clear();
+                }
+                spans.insert((from, to), ge);
+            }
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Checked, (to - from) as u64);
+                add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+            }
+            return copied;
+        }
+        // A sparse 2 GiB chunk can hold MEM_PRIVATE allocations alongside
+        // MEM_MAPPED views; probe GetWriteWatch before unwatched hashing.
+        if self.sparse.is_some()
+            && let Some((now, written)) = crate::watch::writes(from, to, false)
+        {
+            let copied = self.copy_stale(from, to, now, &written);
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::Checked, (to - from) as u64);
+                add(C::Unchanged, (to - from).saturating_sub(copied) as u64);
+            }
+            return copied;
+        }
+        self.update_unwatched(from, to, lazy)
+    }
+
+    fn update_unwatched(&self, from: usize, to: usize, lazy: bool) -> usize {
         let frame = crate::queue::presented() + 1;
         {
             let mut seen = self.unwatched.lock().unwrap_or_else(|e| e.into_inner());

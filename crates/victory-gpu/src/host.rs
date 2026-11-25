@@ -2842,23 +2842,27 @@ impl Batch {
             update(&shadow, from, to - from);
         }
         let mut pieces = std::mem::take(&mut self.pieces);
+        if pieces.is_empty() {
+            return;
+        }
         pieces.sort_unstable_by_key(|(s, from, _)| (s.root_key(), *from));
-        let mut run: Option<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = None;
+        let mut merged_pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
+            Vec::new();
         for (shadow, from, to) in pieces {
-            if let Some((s, _, end)) = &mut run
+            if let Some((s, _, end)) = merged_pieces.last_mut()
                 && s.root_key() == shadow.root_key()
                 && from <= *end + 4096
             {
                 *end = (*end).max(to);
                 continue;
             }
-            if let Some((s, a, b)) = run.replace((shadow, from, to)) {
-                update(&s, a, b - a);
+            merged_pieces.push((shadow, from, to));
+        }
+        in_parallel(&merged_pieces, 2, |chunk| {
+            for (s, a, b) in chunk {
+                update(s, *a, b - a);
             }
-        }
-        if let Some((s, a, b)) = run {
-            update(&s, a, b - a);
-        }
+        });
     }
 
     /// After every list's steps (no title copy follows): each directly
