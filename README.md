@@ -1,19 +1,46 @@
-# VIctory fork for AMD Radeon (work in progress)
+# VIctory fork for AMD Radeon & Linux/Proton (work in progress)
 
-This is a fork of [VIctory](https://github.com/Marvisak/VIctory) by Marvisak
-and its contributors. It follows upstream `main` up to `8e79c80` (2026-11-24),
-carries a number of upstream pull requests, and adds fixes found while running
-the game's world on one AMD card.
+This fork ([CaullenOmdahl/Victory](https://github.com/CaullenOmdahl/Victory)) builds on [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD) and [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (plus selected fixes from upstream PRs, `DexNom/VIctory`, and `fxceless/victory-fork`) to run **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on **Linux under Proton (`vkd3d-proton` + RADV)**.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
-## State of this fork (2026-11-25)
+## Linux / Proton Status (`CaullenOmdahl/Victory`, 2026-11-26)
 
-**Not playable yet: 3 to 5 frames per second.** Tested on one machine only:
-Windows 11, AMD Radeon RX 9070 XT 16 GB, Ryzen 7 9800X3D, 64 GB RAM, Series X
-profile. Nothing here has been run on an NVIDIA or Intel card.
+Tested on: **CachyOS Linux (`7.3.4-1-cachyos`), Proton (`proton-patched`, `vkd3d-proton` + Mesa RADV), AMD Radeon RX 6800 16 GB (RDNA2), Ryzen 9 5900X (12C/24T), 62 GiB RAM, Series X profile.**
+
+| What | State on CachyOS + Proton (RX 6800) |
+|------|-------------------------------------|
+| Boot, menus | 22–30 fps |
+| In-world rendering | Renders lit open world, characters, textures, water, sky, and geometry |
+| Frame rate in the world | **1.5–2.1 fps** (`474–669 ms/frame` in `diag` builds; `126–165 ms` on the GPU, down from `752–1,150 ms/frame` / `363–662 ms` GPU baseline) |
+| Stability | In-world runs complete without `0x887A0005` GPUVM faults once Proton null-buffer guards, remap invalidations, and `USERPTR` gating landed |
+| Memory | ~5.6 GiB commit (~10.9 GiB title private, ~19.9 GiB mapped) |
+
+### Additions over `Belobug/VIctory-Belobug-AMD`
+- **Linux / Proton (`vkd3d-proton` + RADV) fixes:**
+  - Page-aligned `vkMapMemory` view offsets, batched `UpdateTileMappings`, and null-blob `ID3D12PipelineLibrary` support under Proton.
+  - Gated `OpenExistingHeapFromAddress1` (`direct()`) behind `VICTORY_IN_PLACE_WINE=1` on Wine (`MEM_PRIVATE` round-trips, `MEM_MAPPED` reads zeroes, and host-RAM `USERPTR` slows RX 6800 GPU execution ~20× vs VRAM copies).
+  - Added `VirtualFree`/`VirtualProtect`/`XMemFreeDefault` remap invalidation notifications, buffer/view span clamping, null root buffer handling, early-pipeline list save, and 64 MB compiler worker stacks with stuck-compile recovery.
+- **CPU, watch, bindless & GPU speedups:**
+  - Persistent 20-thread `in_parallel` pool and 16 compiler workers; `RwLock` conversion on `GUARDS`, `JOURNAL`, and descriptor `VIEWS`; `64 KiB` per-block region epochs, pin cleanup on remap, 8 MiB guarded chunks, and disjoint `Batch` refresh spans.
+  - Dirty-generation texture hash bypass (`xmem` persistent views), incremental bindless planning, lock-free descriptor heap gets, stack root slots, cached `bind_pipeline`, hoisted & wave-coalesced indirect clamps with device-local budget, DirectStorage cross-queue staging bypass, and thin LTO (`codegen-units = 1`) release builds.
+- **Shader & rendering correctness:**
+  - Ported upstream normalized buffer exact quotient rounding (`da82e444`), `UAVS_EVERY_STAGE` (`a1a2077a`), right-angle rectangle completion (`8ff79135`), sparse `any_mapped()` texture residency (`921d8d3b`), `CalculateLOD` spatial array fixes & packed pixel inputs (`5f4c3df4`), DXIL dead-code elimination, branch pruning, handle dedup, reachable-only liveness, VOP1/VOP3 CMPX EXEC & divergent-loop Wave64 fixes, and BC7 dictionary entry 0 fix.
+
+### Building & Running on Linux (with `cargo-xwin` + Proton)
+```bash
+cargo xwin build --profile diag --target x86_64-pc-windows-msvc -p victory --features diagnostics
+cargo xwin build --release --target x86_64-pc-windows-msvc -p victory
+```
+Launch via Proton (`proton runinprefix`) with `WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3dcompiler_47=n"` and `VKD3D_SHADER_CACHE_PATH` pointed outside the repository so `vkd3d-proton.cache.write` stays out of the working tree.
+
+---
+
+## Upstream Forkbase State (`Belobug/VIctory-Belobug-AMD`, 2026-11-25)
+
+**On Belobug's Windows 11 test machine (3 to 5 frames per second):** Windows 11, AMD Radeon RX 9070 XT 16 GB, Ryzen 7 9800X3D, 64 GB RAM, Series X profile. Nothing here has been run on an NVIDIA or Intel card.
 
 | What | State on that machine |
 |------|-----------------------|
