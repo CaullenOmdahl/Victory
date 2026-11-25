@@ -3952,6 +3952,22 @@ impl<'a> Lower<'a> {
         {
             return self.boolean(m, self.cur);
         }
+        // An inline constant mask: no lane, every lane, or (with console
+        // lanes) the lane's own bit of the sign-extended constant.
+        if let Some(&Operand::Const(k)) = mask {
+            let x = crate::resource::inline(k).ok_or(UNTRACKED_SELECT)?;
+            return if x == 0 {
+                Ok(self.s.m.bool(false))
+            } else if x == u32::MAX {
+                Ok(self.s.m.bool(true))
+            } else if self.console_lanes {
+                let lo = self.s.m.i32(x);
+                let hi = self.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 });
+                Ok(self.lane_bit(self.cur, lo, Some(hi)))
+            } else {
+                Err("a constant lane mask")
+            };
+        }
         let Some(&Operand::Scalar { code, .. }) = mask else {
             return Err(UNTRACKED_SELECT);
         };
@@ -3959,6 +3975,15 @@ impl<'a> Lower<'a> {
             return Ok(self.s.m.bool(false));
         }
         if !self.numeric_selects || !self.console_lanes {
+            // A mask derived from neither EXEC nor a VALU result (a uniform
+            // select, a constant, an opaque value). Failing here leaves a
+            // compute program its retry with numeric selects.
+            if let Some(&m) = inst
+                .read(Reg::S(code))
+                .and_then(|m| self.x.st.others.get(&m))
+            {
+                return self.boolean(m, self.cur).map_err(|_| UNTRACKED_SELECT);
+            }
             return Err(UNTRACKED_SELECT);
         }
         // A scalar operation can define either dword independently. The SSA
@@ -5408,6 +5433,20 @@ impl<'a> Lower<'a> {
                 l.s.m.cmp(c, pred::NE, o, z)
             };
             return match name {
+                "s_quadmask_b64" => {
+                    let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
+                    let low = self.quad_mask(a);
+                    let high = self.quad_mask(b);
+                    let k8 = self.s.m.i32(8);
+                    let high = self.s.m.bin(c, Bin::Shl, high, k8);
+                    let mask = self.s.m.bin(c, Bin::Or, low, high);
+                    let zero = self.s.m.i32(0);
+                    self.set(lo, Val::I32(mask));
+                    self.set(hi, Val::I32(zero));
+                    let nonzero = self.s.m.cmp(c, pred::NE, mask, zero);
+                    self.set(scc, Val::Bit(nonzero));
+                    Ok(())
+                }
                 "s_bcnt0_i32_b64" | "s_bcnt1_i32_b64" => {
                     let (a, b) = (half(self, 0, 0)?, half(self, 0, 1)?);
                     let r = self.bcnt1_64(c, a, b);
@@ -5650,6 +5689,10 @@ impl<'a> Lower<'a> {
                 let old = self.operand(inst, d)?;
                 (self.s.m.select(c, cond, a, old), None)
             }
+            "s_quadmask_b32" => {
+                let pixels = src32(self, 0)?;
+                (self.quad_mask(pixels), None)
+            }
             "s_cselect_b32" => {
                 let cond = self.scc_in(inst)?;
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -5888,6 +5931,29 @@ impl<'a> Lower<'a> {
             self.vals.insert(scc, val);
         }
         Ok(())
+    }
+
+    /// Packs whether each consecutive group of four pixels has a set bit.
+    fn quad_mask(&mut self, pixels: V) -> V {
+        let c = self.cur;
+        let one = self.s.m.i32(1);
+        let shifted = self.s.m.bin(c, Bin::LShr, pixels, one);
+        let mut mask = self.s.m.bin(c, Bin::Or, pixels, shifted);
+        // Fold each nibble into its bottom bit, then gather those bits into
+        // the low byte in three stages without needing a 64-bit operation.
+        for (distance, keep) in [
+            (2, 0x1111_1111),
+            (3, 0x0303_0303),
+            (6, 0x000f_000f),
+            (12, 0x0000_00ff),
+        ] {
+            let distance = self.s.m.i32(distance);
+            let shifted = self.s.m.bin(c, Bin::LShr, mask, distance);
+            let combined = self.s.m.bin(c, Bin::Or, mask, shifted);
+            let keep = self.s.m.i32(keep);
+            mask = self.s.m.bin(c, Bin::And, combined, keep);
+        }
+        mask
     }
 
     /// `a + b (+ cin)` or `a - b (- cin)` with the carry (borrow) out, as the
@@ -10405,6 +10471,9 @@ impl<'a> Lower<'a> {
                         let gt = self.s.m.cmp(c, pred::OGT, a, b);
                         self.s.m.bin(c, Bin::Or, lt, gt)
                     }
+                    // Always false / always true: constants, not `fcmp false`
+                    // / `fcmp true`, which WARP removes its device over.
+                    "f" | "tru" => self.s.m.bool(op == "tru"),
                     _ => {
                         let p = match op {
                             "f" => pred::FALSE,
@@ -10656,8 +10725,11 @@ impl<'a> Lower<'a> {
                     self.as_int(f)
                 } else if f16 {
                     let f = half(self, h)?.ok_or("a packed input half no element holds")?;
+                    // omod and clamp are part of the f16 instruction; op_sel[3]
+                    // picks the destination half.
+                    let f = self.half_modifiers(inst, f);
                     let lo = to_f16(self, f);
-                    self.low_half(inst, reg, lo)
+                    return self.write_half(inst, lo, None);
                 } else if matches!(eval, Eval::Mode(1)) {
                     // The whole dword of a flat input: both halves.
                     let h = 2 * attribute.channel;
@@ -10832,6 +10904,25 @@ impl<'a> Lower<'a> {
         let old = self.s.m.bin(c, Bin::And, old, high);
         let x = self.s.m.bin(c, Bin::And, x, low);
         self.s.m.bin(c, Bin::Or, old, x)
+    }
+
+    /// VOP3 f16 output modifiers: omod, then clamp, applied to the f32
+    /// value before its one conversion to f16 (the order `write_f` uses).
+    fn half_modifiers(&mut self, inst: &Inst, f: V) -> V {
+        let Fields::Valu(v) = &inst.fields else {
+            return f;
+        };
+        let c = self.cur;
+        let mut f = f;
+        if v.omod != 0 {
+            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+            let k = self.s.m.f32(factor.to_bits());
+            f = self.s.m.bin(c, Bin::Mul, f, k);
+        }
+        if v.clamp {
+            f = self.unary(7, f);
+        }
+        f
     }
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -13959,6 +14050,24 @@ mod tests {
         for words in [add, sub] {
             lowers_rsrc2(&words, 0).unwrap();
         }
+    }
+
+    #[test]
+    fn v_cndmask_accepts_uniform_and_constant_masks() {
+        // Uniform select (`s_cselect_b32`) and inline constant masks in `v_cndmask_b32`
+        // (resolved in `Structured::others` or directly as constants).
+        let words = [
+            0xBF06_8000u32, // s_cmp_eq_u32 s0, 0
+            0x8500_80C1,    // s_cselect_b32 s0, -1, 0
+            0xD501_0001,
+            0x0001_0080,    // v_cndmask_b32 v1, 0, 1, s0
+            0xD501_0002,
+            0x0201_02C1,    // v_cndmask_b32 v2, 1, v1, -1
+            0xD834_0000,
+            0x0000_0200,    // ds_write_b32 v0, v2
+            S_ENDPGM,
+        ];
+        lowers_rsrc2(&words, 0x8001).unwrap();
     }
 
     /// A dword load by index through a descriptor built around the root
