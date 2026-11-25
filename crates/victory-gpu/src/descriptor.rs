@@ -136,16 +136,19 @@ const SAMPLERS: u32 = 1;
 const SHADER_VISIBLE: u32 = 1;
 
 /// Shader-visible heaps by address range, for mirroring descriptor writes:
-/// start, end, heap.
+/// start, end, heap. Read by every title thread that writes a view (to find
+/// the heap the handle is in); readers share it, and only a heap's
+/// registration and its release take it alone.
 #[cfg(windows)]
-static SHADER_HEAPS: std::sync::Mutex<Vec<(u64, u64, usize)>> = std::sync::Mutex::new(Vec::new());
+static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> =
+    std::sync::RwLock::new(Vec::new());
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
+/// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for reading
 /// so `Heap::drop` cannot free the heap concurrently.
 #[cfg(windows)]
 fn mirror(handle: u64) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     let Some(&(_, _, at)) = heaps
         .iter()
         .find(|&&(start, end, _)| (start..end).contains(&handle))
@@ -174,7 +177,7 @@ fn mirror(handle: u64) {
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
-    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
         // SAFETY: registered heaps are live (removed when dropped).
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
@@ -187,7 +190,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 impl Drop for Heap {
     fn drop(&mut self) {
         let at = std::ptr::from_ref::<Heap>(self) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
     }
 }
@@ -350,8 +353,11 @@ impl View {
 const FREED_KEPT: usize = 1 << 16;
 
 struct Views {
-    /// Each entry's view and generation.
-    list: Vec<(View, u32)>,
+    /// Each entry's view.
+    list: Vec<View>,
+    /// Each entry's generation: kept apart from the view, so staleness checks
+    /// read a 4-byte generation rather than a cache line of view data.
+    current: Vec<u32>,
     index: std::collections::BTreeMap<View, u32>,
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
@@ -367,6 +373,7 @@ struct Views {
 // (6,600 context switches a second each, PIX timing capture, 2026-11-25).
 static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     list: Vec::new(),
+    current: Vec::new(),
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
@@ -396,11 +403,12 @@ fn record(handle: u64, view: View) {
         None => {
             let i = match views.free.pop() {
                 Some(i) => {
-                    views.list[i as usize].0 = view.clone();
+                    views.list[i as usize] = view.clone();
                     i
                 }
                 None => {
-                    views.list.push((view.clone(), 1));
+                    views.list.push(view.clone());
+                    views.current.push(1);
                     views.list.len() as u32 - 1
                 }
             };
@@ -411,7 +419,7 @@ fn record(handle: u64, view: View) {
             i
         }
     };
-    let generation = views.list[i as usize].1;
+    let generation = views.current[i as usize];
     // SAFETY: the handle is a descriptor slot, at least 16 bytes.
     unsafe { (handle as *mut [u32; 3]).write_unaligned([VIEW_TAG, i, generation]) };
     drop(views);
@@ -428,14 +436,14 @@ pub(crate) fn forget(resource: usize) {
         };
         let mut freed = false;
         for i in entries {
-            let (view, generation) = views.list[i as usize].clone();
+            let (view, generation) = (views.list[i as usize].clone(), views.current[i as usize]);
             // Entries freed through a view's other resource may hold another
             // view by now.
             if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
                 continue;
             }
             views.index.remove(&view);
-            views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+            views.current[i as usize] = generation.wrapping_add(1).max(1);
             // The view's other resource (a counter) keeps a stale entry, which
             // `forget` of that resource skips.
             views.free.push(i);
@@ -486,12 +494,7 @@ fn stale_views(entries: &[(u32, (u32, u32))]) -> Vec<(u32, (u32, u32))> {
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     entries
         .iter()
-        .filter(|(_, (i, generation))| {
-            views
-                .list
-                .get(*i as usize)
-                .is_none_or(|(_, current)| current != generation)
-        })
+        .filter(|(_, (i, generation))| views.current.get(*i as usize) != Some(generation))
         .copied()
         .collect()
 }
@@ -500,8 +503,10 @@ fn stale_views(entries: &[(u32, (u32, u32))]) -> Vec<(u32, (u32, u32))> {
 #[cfg(windows)]
 fn view_at(i: u32, generation: u32) -> Option<View> {
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (*current == generation).then(|| view.clone())
+    if views.current.get(i as usize) != Some(&generation) {
+        return None;
+    }
+    views.list.get(i as usize).cloned()
 }
 
 /// Resolves a batch of optional `(view_index, generation)` pairs under a
@@ -512,8 +517,9 @@ fn views_at_batch(entries: &[Option<(u32, u32)>], out: &mut Vec<Option<View>>) {
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     for entry in entries {
         let view = entry.and_then(|(i, generation)| {
-            let (view, current) = views.list.get(i as usize)?;
-            (*current == generation).then(|| view.clone())
+            (views.current.get(i as usize) == Some(&generation))
+                .then(|| views.list.get(i as usize).cloned())
+                .flatten()
         });
         out.push(view);
     }
@@ -527,8 +533,9 @@ pub(crate) fn view(handle: u64) -> Option<View> {
     // SAFETY: the handle is a descriptor slot the title passes back.
     let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
-    let (view, current) = views.list.get(i as usize)?;
-    (tag == VIEW_TAG && *current == generation).then(|| view.clone())
+    (tag == VIEW_TAG && views.current.get(i as usize) == Some(&generation))
+        .then(|| views.list.get(i as usize).cloned())
+        .flatten()
 }
 
 /// A description of `N` words, if the title passes one.
@@ -759,7 +766,7 @@ pub(crate) extern "system" fn create_heap(
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;
-        let mut heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.push((start, start + size, at));
     }
     #[cfg(not(windows))]

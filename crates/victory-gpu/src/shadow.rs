@@ -39,8 +39,11 @@ pub(crate) struct Shadow {
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
-    /// title memory there is older than the copy.
+    /// title memory there is older than the copy, and how many there are,
+    /// read without the lock (a world submission refreshes thousands of
+    /// ranges, and most find none).
     pending: Mutex<Vec<(usize, usize)>>,
+    pending_len: std::sync::atomic::AtomicUsize,
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Before>,
@@ -292,6 +295,7 @@ impl Shadow {
             copied: Mutex::new(vec![0; pages as usize]),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
+            pending_len: std::sync::atomic::AtomicUsize::new(0),
             before: Mutex::default(),
             direct: None,
             unwatched: Mutex::default(),
@@ -414,6 +418,7 @@ impl Shadow {
         for &(address, len) in declared {
             pending.retain(|&r| r != (address, address + len));
         }
+        self.pending_len.store(pending.len(), Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -517,19 +522,19 @@ impl Shadow {
             return;
         }
         if self.card.is_some() {
-            self.pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push((address, address + len));
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.push((address, address + len));
+            self.pending_len.store(pending.len(), Ordering::Relaxed);
             return;
         }
         if let Some((root, s)) = self.sparse_root() {
             return root.sparse_writing(s, address, len);
         }
-        self.pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push((address, address + len));
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.push((address, address + len));
+            self.pending_len.store(pending.len(), Ordering::Relaxed);
+        }
         let (from, to) = self.inside(address, len);
         // SAFETY: inside the mapping.
         let host =
@@ -584,6 +589,7 @@ impl Shadow {
         if from < to && crate::wc::skip_back(&[(start + from, start + to)], (to - from) as u64) {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             pending.retain(|&r| r != (address, address + len));
+            self.pending_len.store(pending.len(), Ordering::Relaxed);
             if pending.is_empty()
                 && let Some((_, bytes)) = snapshot.take()
             {
@@ -668,6 +674,7 @@ impl Shadow {
         // submission runs at a time), and the snapshot with the last range.
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
+        self.pending_len.store(pending.len(), Ordering::Relaxed);
         if pending.is_empty()
             && let Some((_, bytes)) = snapshot.take()
         {
@@ -698,14 +705,19 @@ impl Shadow {
         if from >= to {
             return 0;
         }
-        let mut busy: Vec<(usize, usize)> = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .copied()
-            .filter(|&(a, e)| a < to && e > from)
-            .collect();
+        // Most ranges refreshed in a submission have none: ask the count
+        // first, not the lock.
+        let mut busy: Vec<(usize, usize)> = if self.pending_len.load(Ordering::Relaxed) == 0 {
+            Vec::new()
+        } else {
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .copied()
+                .filter(|&(a, e)| a < to && e > from)
+                .collect()
+        };
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -1107,6 +1119,7 @@ fn placed(
         copied: Mutex::default(),
         watched: AtomicU8::new(NOT_WATCHED),
         pending: Mutex::default(),
+        pending_len: std::sync::atomic::AtomicUsize::new(0),
         before: Mutex::default(),
         direct: Some(Direct {
             heap: heap.clone(),
@@ -2007,6 +2020,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
         copied: Mutex::new(if of.is_some() { Vec::new() } else { vec![0; (len / PAGE as u64) as usize] }),
         watched: AtomicU8::new(0),
         pending: Mutex::default(),
+        pending_len: std::sync::atomic::AtomicUsize::new(0),
         before: Mutex::default(),
         direct: None,
         unwatched: Mutex::default(),
@@ -2248,6 +2262,7 @@ impl Shadow {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             let covered = pending.iter().any(|&(a, b)| a <= address && end <= b);
             pending.push((address, end));
+            self.pending_len.store(pending.len(), Ordering::Relaxed);
             covered
         };
         #[cfg(feature = "diagnostics")]
@@ -2341,6 +2356,7 @@ impl Shadow {
         let written = written.into_inner();
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
+        self.pending_len.store(pending.len(), Ordering::Relaxed);
         if pending.is_empty() {
             give_back_tiles(before.drain().map(|(_, buf)| buf));
         }
