@@ -23,6 +23,8 @@ pub(crate) mod flags {
     pub const DOUBLE_EXT: u64 = 1 << 6;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
+    /// UAVs in a vertex, geometry or mesh program.
+    pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -443,6 +445,10 @@ impl Shader {
 
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        let compute = self.threads.is_some() && self.mesh.is_none() && !self.rectangles;
+        if !self.root_uavs.is_empty() && !self.pixel && !compute {
+            self.flags |= flags::UAVS_EVERY_STAGE;
+        }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
         self.fix_user_data_size(ud_size);
         let mut resources = None;
@@ -764,6 +770,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::UAVS_EVERY_STAGE != 0 {
+            features |= 0x4;
+        }
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
         }
@@ -878,5 +887,54 @@ impl Shader {
             list.push(Some(self.m.md_node(ops)));
         }
         Some(self.m.md_node(list))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::bitcode::Term;
+    use super::*;
+
+    fn finish_with_root_uav(pixel: bool, threads: Option<[u32; 3]>, mesh: bool, with_uav: bool) -> u64 {
+        let mut s = Shader::new(pixel);
+        s.threads = threads;
+        if mesh {
+            s.mesh = Some(Mesh {
+                max_vertices: 1,
+                max_primitives: 1,
+                topology: 2,
+            });
+        }
+        if with_uav {
+            let u = s.root_uav_handle(0, false);
+            let b = s.entry;
+            let (or, zero, one) = (s.m.i32(2), s.m.i32(0), s.m.i32(1));
+            let iu = s.m.undef(s.t.i32);
+            let i32t = s.t.i32;
+            s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[u, or, zero, iu, iu, one]);
+        }
+        let b = s.entry;
+        s.m.terminate(b, Term::Ret);
+        let dxil = s.finish();
+        // Read SFI0 feature flags chunk from the DXBC container.
+        let count = u32::from_le_bytes(dxil[28..32].try_into().unwrap()) as usize;
+        for i in 0..count {
+            let off = u32::from_le_bytes(dxil[32 + i * 4..36 + i * 4].try_into().unwrap()) as usize;
+            if &dxil[off..off + 4] == b"SFI0" {
+                return u64::from_le_bytes(dxil[off + 8..off + 16].try_into().unwrap());
+            }
+        }
+        panic!("missing SFI0 chunk");
+    }
+
+    #[test]
+    fn uavs_outside_pixel_and_compute_declare_feature_bit() {
+        // Vertex and mesh shaders with declared root UAVs set bit 0x4 (UAVS_EVERY_STAGE).
+        assert_ne!(finish_with_root_uav(false, None, false, true) & 0x4, 0);
+        assert_ne!(finish_with_root_uav(false, Some([32, 1, 1]), true, true) & 0x4, 0);
+        // Pixel, compute, and UAV-less vertex shaders leave bit 0x4 clear.
+        assert_eq!(finish_with_root_uav(true, None, false, true) & 0x4, 0);
+        assert_eq!(finish_with_root_uav(false, Some([64, 1, 1]), false, true) & 0x4, 0);
+        assert_eq!(finish_with_root_uav(false, None, false, false) & 0x4, 0);
     }
 }
