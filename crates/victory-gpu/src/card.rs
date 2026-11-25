@@ -841,6 +841,8 @@ impl CardEngine {
         for (entry_idx, entry) in plan.entries.iter().enumerate() {
             let mut out_idx = entry.out_start as usize;
             let mut cur: Option<(u32, u32)> = None;
+            let mut entry_runs: Vec<DirtyRun> = Vec::new();
+            let mut entry_bytes = 0u64;
             for &(first, count) in &entry.runs {
                 for k in 0..count {
                     let piece = first + k;
@@ -849,13 +851,13 @@ impl CardEngine {
                             Some((s, c)) if *s + *c == piece => *c += 1,
                             Some((s, c)) => {
                                 let bytes = u64::from(*c) * PAGE as u64;
-                                dirty_runs.push(DirtyRun {
+                                entry_runs.push(DirtyRun {
                                     entry_idx,
                                     first_piece: *s,
                                     count: *c,
-                                    rb_offset: total_bytes,
+                                    rb_offset: total_bytes + entry_bytes,
                                 });
-                                total_bytes += bytes;
+                                entry_bytes += bytes;
                                 cur = Some((piece, 1));
                             }
                             None => cur = Some((piece, 1)),
@@ -866,13 +868,17 @@ impl CardEngine {
             }
             if let Some((s, c)) = cur {
                 let bytes = u64::from(c) * PAGE as u64;
-                dirty_runs.push(DirtyRun {
+                entry_runs.push(DirtyRun {
                     entry_idx,
                     first_piece: s,
                     count: c,
-                    rb_offset: total_bytes,
+                    rb_offset: total_bytes + entry_bytes,
                 });
-                total_bytes += bytes;
+                entry_bytes += bytes;
+            }
+            if entry_bytes > 0 && !crate::wc::skip_back(&entry.declared, entry_bytes) {
+                dirty_runs.extend(entry_runs);
+                total_bytes += entry_bytes;
             }
         }
 

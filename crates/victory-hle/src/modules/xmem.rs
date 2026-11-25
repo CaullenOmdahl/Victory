@@ -94,6 +94,7 @@ pub extern "system" fn XMemVirtualAlloc(
     protect: u32,
 ) -> *mut c_void {
     start_memory_log();
+    let raw_protect = protect;
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -156,6 +157,9 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if constrained && !at.is_null() {
+        victory_gpu::title_memory_reserved(at as usize, size, raw_protect);
+    }
     if kind & MEM_RESERVE_PLACEHOLDER != 0 && !at.is_null() {
         physical().reservations.push((at as usize, size));
     }

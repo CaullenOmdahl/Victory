@@ -71,6 +71,8 @@ mod texpool;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(windows)]
+mod wc;
 
 #[cfg(windows)]
 pub use host::on_failure;
@@ -82,3 +84,5 @@ pub use watch::{
     title_memory_committed, title_memory_remapped, title_memory_view, title_memory_view_gone, title_memory_written,
     writing as kernel_will_write,
 };
+#[cfg(windows)]
+pub use wc::title_memory_reserved;

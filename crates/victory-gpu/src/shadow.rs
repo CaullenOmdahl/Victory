@@ -581,6 +581,17 @@ impl Shadow {
         let mut written = 0;
         let (from, to) = self.inside(address, len);
         let start = self.start as usize;
+        if from < to && crate::wc::skip_back(&[(start + from, start + to)], (to - from) as u64) {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.retain(|&r| r != (address, address + len));
+            if pending.is_empty()
+                && let Some((_, bytes)) = snapshot.take()
+            {
+                unchanged.clear();
+                give_back(bytes);
+            }
+            return 0;
+        }
         if let Some((taken, before)) = &*snapshot
             && *taken <= from
             && to <= taken + before.len()
