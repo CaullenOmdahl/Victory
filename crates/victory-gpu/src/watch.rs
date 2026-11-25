@@ -581,17 +581,25 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
         let open = block < last && !g.clean.contains(&block) && !g.holes.contains(&block);
         if open {
             if !g.pins.is_empty() && g.pinned(block) {
+                if let Some(from) = run.take() {
+                    protect(&mut g, from, block, &mut written);
+                }
                 // The kernel may be writing it: left writable, reported
                 // written at every check until the pin ends.
                 g.dirty.insert(block);
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
                 // No range holding it is clean meanwhile (`region_epoch`).
                 bump_region_epochs(block * BLOCK, (block + 1) * BLOCK);
+                continue;
             } else if g.protected.contains(&block) {
+                if let Some(from) = run.take() {
+                    protect(&mut g, from, block, &mut written);
+                }
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
                 g.dirty.remove(&block);
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                continue;
             } else {
                 run.get_or_insert(block);
                 continue;
