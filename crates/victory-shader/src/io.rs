@@ -31,8 +31,6 @@
 //! lane sends the output counts (`s_sendmsg` GS_ALLOC_REQ, m0 = vertices |
 //! primitives << 12).
 
-use std::collections::HashMap;
-
 use crate::ShaderError;
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{Inst, Program, Reg, Value};
@@ -272,7 +270,6 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         .iter()
         .filter_map(|&(reg, v)| loaded.iter().find(|l| l.0 == reg).map(|l| (v, l.1)))
         .collect();
-    let input_of = |v: Value| inputs.iter().find(|i| i.0 == v).map(|i| i.1);
     let attribute = |inst: &Inst, attr: &Operand| match *attr {
         Operand::Attr { index, chan, high } => ps_inputs
             .iter()
@@ -289,14 +286,9 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
             )),
         _ => Err(unsupported(inst.machine.offset, "an interpolation operand")),
     };
-    // A VGPR value's barycentric kind and index, if it is one as loaded.
-    let barycentric = |v: Option<Value>| match v.and_then(input_of) {
-        Some(Input::Barycentric { kind, index }) => Some((kind, index)),
-        _ => None,
-    };
 
     let mut io = Io {
-        inputs: inputs.clone(),
+        inputs,
         initialized_sgprs: match &native.io {
             StageIo::Cs(cs) => Some(cs.initialized_sgprs()),
             _ => None,
@@ -304,7 +296,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
         ..Io::default()
     };
     // Only a second interpolation half needs to trace SSA definitions.
-    let mut halves = None;
+    let mut halves = Halves::new(p);
     for (b, block) in p.blocks.iter().enumerate() {
         for (i, inst) in block.insts.iter().enumerate() {
             let site = (b, i);
@@ -324,12 +316,11 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                             };
                             // The first half's result is this one's old dst.
                             let interp = halves
-                                .get_or_insert_with(|| Halves::new(p))
                                 .pair(
                                     attr,
                                     inst.read(Reg::V(d)),
                                     inst.read(Reg::V(reg)),
-                                    &barycentric,
+                                    &io.inputs,
                                 )
                                 .map_err(|what| unsupported(at, what))?;
                             push_pair(&mut io, site, interp, attribute);
@@ -348,8 +339,7 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                                 _ => None,
                             };
                             let interp = halves
-                                .get_or_insert_with(|| Halves::new(p))
-                                .pair(&v.src[0], read(2), read(1), &barycentric)
+                                .pair(&v.src[0], read(2), read(1), &io.inputs)
                                 .map_err(|what| unsupported(at, what))?;
                             push_pair(&mut io, site, interp, attribute);
                         }
@@ -512,40 +502,71 @@ fn push_pair(io: &mut Io, site: Site, pair: Pair, attribute: Attribute) {
     io.interps.push((site, pair.with(attribute)));
 }
 
+/// Where a dense SSA [`Value`] is defined for [`Halves`] lookups.
+#[derive(Clone, Copy)]
+enum Def {
+    None,
+    Phi(u32, u32),
+    Inst(u32, u32),
+}
+
+/// A VGPR value's barycentric kind and index, if it is one as loaded.
+fn barycentric_of(inputs: &[(Value, Input)], v: Option<Value>) -> Option<(Barycentric, u8)> {
+    let v = v?;
+    match inputs.iter().find(|i| i.0 == v)?.1 {
+        Input::Barycentric { kind, index } => Some((kind, index)),
+        _ => None,
+    }
+}
+
 /// Finds the first halves of interpolations.
 struct Halves<'a> {
     p: &'a Program,
-    defs: HashMap<Value, Site>,
-    phis: HashMap<Value, (usize, usize)>,
+    /// Built lazily on the first `v_interp_p2_*` instruction, indexed by `Value.0`.
+    defs: Option<Vec<Def>>,
 }
 
 impl<'a> Halves<'a> {
     fn new(p: &'a Program) -> Self {
-        let defs = p
+        Self { p, defs: None }
+    }
+
+    fn ensure_defs(&mut self) {
+        if self.defs.is_some() {
+            return;
+        }
+        let max_v = self
+            .p
             .blocks
             .iter()
-            .enumerate()
-            .flat_map(|(b, block)| {
-                block
-                    .insts
+            .flat_map(|b| {
+                b.phis
                     .iter()
-                    .enumerate()
-                    .flat_map(move |(i, inst)| inst.writes.iter().map(move |w| (w.1, (b, i))))
+                    .map(|phi| phi.value.0)
+                    .chain(b.insts.iter().flat_map(|i| i.writes.iter().map(|w| w.1.0)))
             })
-            .collect();
-        let phis = p
-            .blocks
-            .iter()
-            .enumerate()
-            .flat_map(|(b, block)| {
-                block
-                    .phis
-                    .iter()
-                    .enumerate()
-                    .map(move |(i, phi)| (phi.value, (b, i)))
-            })
-            .collect();
-        Self { p, defs, phis }
+            .max()
+            .map_or(0, |m| m as usize + 1);
+        let mut defs = vec![Def::None; max_v];
+        for (b, block) in self.p.blocks.iter().enumerate() {
+            for (i, phi) in block.phis.iter().enumerate() {
+                defs[phi.value.0 as usize] = Def::Phi(b as u32, i as u32);
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                for &(_, v) in &inst.writes {
+                    defs[v.0 as usize] = Def::Inst(b as u32, i as u32);
+                }
+            }
+        }
+        self.defs = Some(defs);
+    }
+
+    #[inline]
+    fn def_of(&self, v: Value) -> Def {
+        self.defs
+            .as_deref()
+            .and_then(|d| d.get(v.0 as usize).copied())
+            .unwrap_or(Def::None)
     }
 
     /// The interpolation whose second half reads the first half's result
@@ -554,19 +575,20 @@ impl<'a> Halves<'a> {
     /// i loaded as one kind's, the pair interpolates with that kind;
     /// otherwise each half evaluates on its own (`Interp::Weighted`).
     fn pair(
-        &self,
+        &mut self,
         attr: &Operand,
         acc: Option<Value>,
         j: Option<Value>,
-        barycentric: &impl Fn(Option<Value>) -> Option<(Barycentric, u8)>,
+        inputs: &[(Value, Input)],
     ) -> Result<Pair, &'static str> {
+        self.ensure_defs();
         let mut first = Vec::new();
         self.sites(
             acc.ok_or("an interpolation without its first half")?,
             &mut Vec::new(),
             &mut first,
         )?;
-        let mut kind = match barycentric(j) {
+        let mut kind = match barycentric_of(inputs, j) {
             Some((kind, 1)) => Some(kind),
             _ => None,
         };
@@ -587,7 +609,7 @@ impl<'a> Halves<'a> {
             if a != *attr {
                 return Err("interpolation halves of different attributes");
             }
-            if kind.is_some_and(|k| barycentric(i) != Some((k, 0))) {
+            if kind.is_some_and(|k| barycentric_of(inputs, i) != Some((k, 0))) {
                 kind = None;
             }
         }
@@ -605,23 +627,25 @@ impl<'a> Halves<'a> {
         seen: &mut Vec<Value>,
         out: &mut Vec<Site>,
     ) -> Result<(), &'static str> {
-        if let Some(&site) = self.defs.get(&v) {
-            if !out.contains(&site) {
-                out.push(site);
+        match self.def_of(v) {
+            Def::Inst(b, i) => {
+                let site = (b as usize, i as usize);
+                if !out.contains(&site) {
+                    out.push(site);
+                }
+                Ok(())
             }
-            return Ok(());
-        }
-        let &(b, i) = self
-            .phis
-            .get(&v)
-            .ok_or("an interpolation without its first half")?;
-        if !seen.contains(&v) {
-            seen.push(v);
-            for &a in &self.p.blocks[b].phis[i].args {
-                self.sites(a, seen, out)?;
+            Def::Phi(b, i) => {
+                if !seen.contains(&v) {
+                    seen.push(v);
+                    for &a in &self.p.blocks[b as usize].phis[i as usize].args {
+                        self.sites(a, seen, out)?;
+                    }
+                }
+                Ok(())
             }
+            Def::None => Err("an interpolation without its first half"),
         }
-        Ok(())
     }
 }
 
@@ -951,5 +975,41 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn halves_defs_are_lazy_and_match_phi_and_inst_defs() {
+        let p = program(&[
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0002, // s_cbranch_scc1 -> arm_b
+            0xC808_0000, // arm_a: v_interp_p1_f32 v2, v0, attr0.x
+            0xBF82_0001, // s_branch -> join
+            0xC808_0000, // arm_b: v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // join: v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0302_0102, // exp mrt0, v2, v1, v2, v3 done vm
+            S_ENDPGM,
+        ]);
+        let mut h = Halves::new(&p);
+        assert!(h.defs.is_none(), "defs table stays unallocated before pair()");
+        h.ensure_defs();
+        let defs = h.defs.as_ref().unwrap();
+        for (b, block) in p.blocks.iter().enumerate() {
+            for (i, phi) in block.phis.iter().enumerate() {
+                assert!(matches!(defs[phi.value.0 as usize], Def::Phi(bb, ii) if bb as usize == b && ii as usize == i));
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                for &(_, v) in &inst.writes {
+                    assert!(matches!(defs[v.0 as usize], Def::Inst(bb, ii) if bb as usize == b && ii as usize == i));
+                }
+            }
+        }
+        assert!(matches!(h.def_of(Value(u32::MAX)), Def::None));
+        let io = raise(&p, &pixel(vec![TEXCOORD], 2)).unwrap();
+        assert_eq!(io.interps.len(), 1);
+        let Interp::Interpolated { first, .. } = &io.interps[0].1 else {
+            panic!("expected interpolated attribute");
+        };
+        assert_eq!(first.len(), 2);
     }
 }
