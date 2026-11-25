@@ -699,13 +699,15 @@ pub(crate) fn warn_depth_bounds() {
 
 /// A list's buffers for hoisted clamped indirect arguments with their
 /// states, how many are in use since the reset, the bytes taken of the last
-/// of those, and whether the list has the barrier that precedes the clamps.
+/// of those, whether the list has the barrier that precedes the clamps, and
+/// whether it has the clamps' root signature, pipeline and budget bound.
 #[derive(Default)]
 struct ClampChunks {
     all: Vec<(ID3D12Resource, D3D12_RESOURCE_STATES)>,
     used: usize,
     at: u64,
     barrier: bool,
+    bound: bool,
 }
 
 /// Timestamps per list (diagnostics); commands past them are not timed.
@@ -956,6 +958,13 @@ struct Deferred {
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    /// Buffer ranges declared written by shaders since the last title copy
+    /// (host copy, address, bytes): declaring them again would change nothing.
+    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    /// Upload memory filled from title memory since the last title write
+    /// (source, bytes): its host address, which a second fill would find
+    /// holding the same bytes.
+    filled: std::collections::HashMap<(usize, usize), u64>,
     /// View heaps the list's draws index directly (`ResourceDescriptorHeap[]`),
     /// and whether any of their shaders may write memory: their slots are
     /// brought up to date once per submission, after every other step.
@@ -1293,31 +1302,29 @@ impl Host {
         let mut card_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> =
             Vec::new();
         let mut cpu_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
+        // A copy is either a card's or not, so one set of ranges serves both.
+        let mut declared = std::collections::HashSet::new();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step {
+                if let Step::GpuWrite(shadow, address, len) = step
+                    && declared.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
+                {
                     let target = if shadow.is_card() {
                         &mut card_writes
                     } else {
                         &mut cpu_back
                     };
-                    if !target.iter().any(|(s, a, l)| {
-                        std::sync::Arc::ptr_eq(s, shadow) && (*a, *l) == (*address, *len)
-                    }) {
-                        target.push((shadow.clone(), *address, *len));
-                    }
+                    target.push((shadow.clone(), *address, *len));
                 }
             }
         }
         for (shadow, address, len) in batch.bindless_writes.drain(..) {
-            let target = if shadow.is_card() {
-                &mut card_writes
-            } else {
-                &mut cpu_back
-            };
-            if !target.iter().any(|(s, a, l)| {
-                std::sync::Arc::ptr_eq(s, &shadow) && (*a, *l) == (address, len)
-            }) {
+            if declared.insert((std::sync::Arc::as_ptr(&shadow) as usize, address, len)) {
+                let target = if shadow.is_card() {
+                    &mut card_writes
+                } else {
+                    &mut cpu_back
+                };
                 target.push((shadow, address, len));
             }
         }
@@ -1985,6 +1992,7 @@ impl HostList {
             chunks.used = 0;
             chunks.at = 0;
             chunks.barrier = false;
+            chunks.bound = false;
         }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2226,6 +2234,8 @@ impl HostList {
             .copies
             .push(Step::Copy(dst as usize, src as usize, len));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
+        deferred.filled.clear();
     }
 
     /// Copies `len` bytes of title memory at `src` into the list's upload
@@ -2234,6 +2244,21 @@ impl HostList {
         self.deferred()
             .copies
             .push(Step::Fill(dst as usize, src as usize, len));
+    }
+
+    /// The host GPU address of `len` bytes of upload memory holding the title
+    /// memory at `src` as of the list's submission: one copy for every ask
+    /// until a title copy intervenes.
+    pub(crate) fn fill_scratch(&self, src: *const u8, len: u64) -> Option<u64> {
+        let key = (src as usize, len as usize);
+        let known = self.deferred().filled.get(&key).copied();
+        if known.is_some() {
+            return known;
+        }
+        let (gpu, to) = self.scratch(len)?;
+        self.defer_fill(to, src, len as usize);
+        self.deferred().filled.insert(key, gpu);
+        Some(gpu)
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -2262,9 +2287,13 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
-        self.deferred()
-            .copies
-            .push(Step::GpuWrite(shadow.clone(), address, len));
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len));
+        }
     }
 
     /// A wait for a memory value.
@@ -2370,6 +2399,14 @@ impl HostList {
         Some((buffer, 0))
     }
 
+    /// Whether the list's clamps still have to bind their root signature,
+    /// pipeline and budget: the first after the reset does, and the rest
+    /// find them bound (nothing else records compute state in the list).
+    pub(crate) fn clamp_unbound(&self) -> bool {
+        let mut chunks = self.clamp_chunks.lock().unwrap_or_else(|e| e.into_inner());
+        !std::mem::replace(&mut chunks.bound, true)
+    }
+
     /// The clamped arguments written so far become readable as indirect
     /// arguments by the lists after this one.
     pub(crate) fn clamp_end(&self) {
@@ -2461,15 +2498,11 @@ impl HostList {
         });
     }
 
-    /// A mapped upload buffer of `size` bytes, alive until the list is
-    /// reset.
-    ///
-    /// shortcut: one buffer per copy; pool them once uploads are frequent.
-    pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
-        let (buffer, data) = host.upload_buffer(size)?;
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().uploads.push(buffer.clone());
-        Some((buffer, data))
+    /// `size` bytes of mapped upload memory, 512-byte aligned for a placed
+    /// footprint, alive until the list is reset: the buffer, the offset in
+    /// it and the CPU pointer.
+    pub(crate) fn upload(&self, size: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_in(size, 512, |buffer, at, _, data| (buffer.clone(), at, data))
     }
 
     /// A mapped readback buffer of `size` bytes, alive until the list is
@@ -2484,6 +2517,18 @@ impl HostList {
     /// `len` bytes of upload memory (256-byte aligned) until the list is
     /// reset: the host GPU address and the CPU pointer.
     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+        self.scratch_in(len, 256, |_, _, gpu, data| (gpu, data))
+    }
+
+    /// `len` bytes of upload memory at a multiple of `align` until the list
+    /// is reset, handed to `f` with the buffer, the offset in it, the host GPU
+    /// address and the CPU pointer.
+    fn scratch_in<R>(
+        &self,
+        len: u64,
+        align: u64,
+        f: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> R,
+    ) -> Option<R> {
         let host = host()?;
         let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
@@ -2492,10 +2537,11 @@ impl HostList {
             name(&buffer, || format!("list scratch {len:#x}"));
             // SAFETY: a live buffer.
             let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let made = f(&buffer, 0, gpu, data);
             self.deferred().uploads.push(buffer);
-            return Some((gpu, data));
+            return Some(made);
         }
-        if s.used + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
+        if s.used.next_multiple_of(align) + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
         }
         if s.current == s.chunks.len() {
@@ -2513,10 +2559,11 @@ impl HostList {
             s.chunks.push(chunk);
             s.used = 0;
         }
-        let (_, data, gpu) = s.chunks[s.current];
-        let at = s.used;
-        s.used += len;
-        Some((gpu + at, (data + at as usize) as *mut u8))
+        let (buffer, data, gpu) = &s.chunks[s.current];
+        let at = s.used.next_multiple_of(align);
+        let made = f(buffer, at, gpu + at, (data + at as usize) as *mut u8);
+        s.used = at + len;
+        Some(made)
     }
 
     /// The host address of the list's indirect-work budget, zeroed at each
@@ -2588,6 +2635,8 @@ impl HostList {
         let mut deferred = self.deferred();
         deferred.copies.push(Step::Run(Box::new(work)));
         deferred.refreshed.clear();
+        deferred.gpu_written.clear();
+        deferred.filled.clear();
     }
 
     /// Queues submission-time materialization and refresh of the bindless
