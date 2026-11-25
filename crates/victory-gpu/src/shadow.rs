@@ -1042,10 +1042,19 @@ fn windows_of_memory() -> std::sync::MutexGuard<'static, BTreeMap<u64, Arc<Shado
 /// Buffers of windows gone since (by interface address): views of them are
 /// made again.
 static GONE: Mutex<std::collections::BTreeSet<usize>> = Mutex::new(std::collections::BTreeSet::new());
+static HAS_GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether any window shadow has ever been retired into `GONE`.
+pub(crate) fn has_gone() -> bool {
+    HAS_GONE.load(Ordering::Acquire)
+}
 
 /// Whether a host buffer is one of a window gone since.
 pub(crate) fn gone(buffer: &ID3D12Resource) -> bool {
     use windows::core::Interface;
+    if !HAS_GONE.load(Ordering::Acquire) {
+        return false;
+    }
     let gone = GONE.lock().unwrap_or_else(|e| e.into_inner());
     !gone.is_empty() && gone.contains(&(buffer.as_raw() as usize))
 }
@@ -1389,6 +1398,7 @@ pub(crate) fn remapped(start: u64, end: u64) {
         let Some(s) = map.remove(&key) else { continue };
         let mut gone = GONE.lock().unwrap_or_else(|e| e.into_inner());
         gone.insert(s.buffer.as_raw() as usize);
+        HAS_GONE.store(true, Ordering::Release);
         if let Some(d) = &s.direct {
             d.dead.store(true, Ordering::Release);
             DIED.fetch_add(1, Ordering::Release);

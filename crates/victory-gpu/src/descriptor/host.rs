@@ -19,6 +19,16 @@ use super::{
 };
 use crate::host::{Host, host};
 
+/// The slots of one piece of [`HostHeap::kept`].
+const KEPT_PIECE: u32 = 1024;
+
+/// Whether a slot made from the same record already is found without the
+/// heap's locks (`HostHeap::made_now`; `VICTORY_HEAP_LOCKS=0` disables it).
+fn heap_locks() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_LOCKS").is_none_or(|v| v != "0"))
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -35,11 +45,16 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// The same, readable without the lock once the descriptor has been
+    /// written: zeroed immediately when invalidated.
+    made_now: Vec<AtomicU64>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    /// Sharded in pieces of [`KEPT_PIECE`] slots so recording threads
+    /// updating disjoint ranges do not serialize on a single mutex.
+    kept: Vec<Mutex<Vec<Option<ID3D12Resource>>>>,
     /// Owning `HostTexture` (and its `texpool::Slot` / `ID3D12Heap`) for any
     /// slot viewing a pooled texture, so the backing heap cannot be freed while
     /// a shader-visible descriptor slot still points into it.
@@ -138,9 +153,11 @@ impl StrideTable {
 
 impl Drop for HostHeap {
     fn drop(&mut self) {
-        if let Ok(mut kept) = self.kept.lock() {
-            for res in kept.drain(..).flatten() {
-                crate::host::retire(res);
+        for piece in &self.kept {
+            if let Ok(mut kept) = piece.lock() {
+                for res in kept.drain(..).flatten() {
+                    crate::host::retire(res);
+                }
             }
         }
         if let Ok(mut texs) = self.kept_textures.lock() {
@@ -1188,7 +1205,10 @@ impl HostHeap {
             memory_first,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            made_now: (0..count).map(|_| AtomicU64::new(0)).collect(),
+            kept: (0..(count + extra).div_ceil(KEPT_PIECE))
+                .map(|_| Mutex::new(vec![None; KEPT_PIECE as usize]))
+                .collect(),
             kept_textures: Mutex::default(),
             next: Mutex::new((0, vec![false; extra as usize], usize::MAX)),
             strides,
@@ -1519,11 +1539,10 @@ impl HostHeap {
     ) {
         // A running submission may still read the old resource through
         // this slot; it is retired outside the lock.
-        let old = {
-            let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-            kept.get_mut(index as usize)
-                .and_then(|slot| std::mem::replace(slot, resource))
-        };
+        let old = self.kept.get((index / KEPT_PIECE) as usize).and_then(|piece| {
+            let mut kept = piece.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut kept[(index % KEPT_PIECE) as usize], resource)
+        });
         let old_tex = if texture.is_some()
             || self.kept_textures_count.load(Ordering::Acquire) > 0
         {
@@ -1617,12 +1636,20 @@ impl HostHeap {
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
+        if let Some(view) = view.as_ref()
+            && heap_locks()
+            && self.made_now[index as usize].load(Ordering::Acquire) == key
+            && (self.sampler || !for_draw || !view.is_buffer() || !crate::shadow::has_gone())
+        {
+            return view_at(i, generation);
+        }
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             {
                 let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
                 if made[index as usize] != 0 {
+                    self.made_now[index as usize].store(0, Ordering::Release);
                     made[index as usize] = 0;
                     self.make_null(index);
                 }
@@ -1637,16 +1664,24 @@ impl HostHeap {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             let gone = is_buf
                 && for_draw
+                && crate::shadow::has_gone()
                 && self
                     .kept
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .get(index as usize)
-                    .and_then(Option::as_ref)
-                    .is_some_and(crate::shadow::gone);
+                    .get((index / KEPT_PIECE) as usize)
+                    .is_some_and(|piece| {
+                        piece
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get((index % KEPT_PIECE) as usize)
+                            .and_then(Option::as_ref)
+                            .is_some_and(crate::shadow::gone)
+                    });
             if made[index as usize] != key || gone {
                 let later = !for_draw && is_buf;
                 made[index as usize] = if later { 0 } else { key };
+                if later {
+                    self.made_now[index as usize].store(0, Ordering::Release);
+                }
                 let kept = if later {
                     None
                 } else {
@@ -1659,6 +1694,9 @@ impl HostHeap {
                 // The stride is the title view's, however and whenever the
                 // host view is made.
                 self.set_stride_count(index, view_stride(&view), view_count(&view));
+                if !later {
+                    self.made_now[index as usize].store(key, Ordering::Release);
+                }
             }
         }
         if !self.sampler {
@@ -1739,6 +1777,7 @@ impl HostHeap {
     fn clear_stale_slot(&self, index: u32) {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         if made[index as usize] != 0 {
+            self.made_now[index as usize].store(0, Ordering::Release);
             made[index as usize] = 0;
             self.make_null(index);
         }
@@ -1746,6 +1785,7 @@ impl HostHeap {
 
     fn set_unmapped_null(&self, index: u32, view: &View) {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        self.made_now[index as usize].store(0, Ordering::Release);
         made[index as usize] = 0;
         if !self.sampler {
             null_for(view, self.cpu(index));
@@ -1764,12 +1804,17 @@ impl HostHeap {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let same_tex = self
             .kept
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(index as usize)
-            .and_then(Option::as_ref)
-            .is_some_and(|r| r.as_raw() == raw_tex);
+            .get((index / KEPT_PIECE) as usize)
+            .is_some_and(|piece| {
+                piece
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get((index % KEPT_PIECE) as usize)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|r| r.as_raw() == raw_tex)
+            });
         if made[index as usize] != key || !same_tex {
+            self.made_now[index as usize].store(0, Ordering::Release);
             let kept = make(shader_view, self.cpu(index));
             if kept.is_none() {
                 null_for(shader_view, self.cpu(index));
@@ -1779,12 +1824,14 @@ impl HostHeap {
             }
             self.keep_with_view(index, kept.flatten(), shader_view);
             self.set_stride(index, 0);
+            self.made_now[index as usize].store(made[index as usize], Ordering::Release);
         }
     }
 
     fn ensure_buffer_slot(&self, index: u32, key: u64, view: &View) -> Option<ID3D12Resource> {
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         if made[index as usize] != key {
+            self.made_now[index as usize].store(0, Ordering::Release);
             let kept = make(view, self.cpu(index));
             let res = kept.flatten();
             if res.is_none() {
@@ -1794,13 +1841,18 @@ impl HostHeap {
                 made[index as usize] = key;
             }
             self.keep(index, res.clone());
+            self.made_now[index as usize].store(made[index as usize], Ordering::Release);
             return res;
         }
         self.kept
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(index as usize)
-            .and_then(Option::clone)
+            .get((index / KEPT_PIECE) as usize)
+            .and_then(|piece| {
+                piece
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get((index % KEPT_PIECE) as usize)
+                    .and_then(Option::clone)
+            })
     }
 
     fn ensure_cbv_bounce(
@@ -1862,6 +1914,7 @@ impl HostHeap {
             {
                 let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
                 if made[index as usize] != key || bounce_active {
+                    self.made_now[index as usize].store(0, Ordering::Release);
                     let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                         BufferLocation: shadow.gpu(address),
                         SizeInBytes: aligned,
@@ -1873,6 +1926,7 @@ impl HostHeap {
                     };
                     made[index as usize] = key;
                     self.keep(index, Some(shadow.buffer.clone()));
+                    self.made_now[index as usize].store(key, Ordering::Release);
                 }
             }
             let len = u64::from(capped).min(shadow.left(address)) as usize;
@@ -1890,6 +1944,7 @@ impl HostHeap {
         {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             if made[index as usize] != key || !was_active {
+                self.made_now[index as usize].store(0, Ordering::Release);
                 let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                     BufferLocation: gpu,
                     SizeInBytes: aligned,
@@ -1901,6 +1956,7 @@ impl HostHeap {
                 };
                 made[index as usize] = key;
                 self.keep(index, Some(resource.clone()));
+                self.made_now[index as usize].store(key, Ordering::Release);
             }
         }
         Some(CbvMaterialized {
@@ -2335,6 +2391,7 @@ impl HostHeap {
         if !remade.is_empty() {
             let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
             for i in remade {
+                self.made_now[i as usize].store(0, Ordering::Release);
                 made[i as usize] = 0;
             }
         }
@@ -4290,6 +4347,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert!(reused, "unchanged slots reuse the plan");
 
         // Slot 0 marked unmade: were it made again, it would be made anew.
+        host_heap.made_now[0].store(0, Ordering::Release);
         host_heap.made.lock().unwrap()[0] = 0;
         cbv(mem.address() + 0x1000, 1);
         let second = host_heap.bindless_plan().unwrap();
