@@ -859,7 +859,7 @@ extern "system" fn copy_texture_region(
             else {
                 return;
             };
-            let Some((buffer, staging)) = list.readback(host, staging_bytes) else {
+            let Some((buffer, offset, staging)) = list.readback_space(staging_bytes) else {
                 return;
             };
             if crate::resource::skipped_mips(src.resource) > 0 {
@@ -869,7 +869,7 @@ extern "system" fn copy_texture_region(
             ensure_state(&list, src.resource, COPY_SOURCE);
             let mut to_location = dst;
             to_location.resource = buffer.as_raw().cast_const().cast();
-            to_location.footprint.offset = 0;
+            to_location.footprint.offset = offset;
             to_location.footprint.format = host_format;
             to_location.footprint.row_pitch = host_pitch;
             let mut from_location = src;
@@ -1354,13 +1354,12 @@ fn host_resolve(this: This, heap: This, kind: u32, first: u32, count: u32, at: *
     let len = u64::from(count) * bytes;
     let host_kind = D3D12_QUERY_TYPE(kind as i32);
     if kind == crate::query::TIMESTAMP {
-        let Some((back, data)) = crate::host::host().and_then(|h| list.readback(h, len)) else {
+        let Some((back, back_at, data)) = list.readback_space(len) else {
             return Vec::new();
         };
         for &(from, n) in &runs {
-            // SAFETY: an open list, a live heap, a read-back buffer of `len`
-            // bytes.
-            unsafe { list.list.ResolveQueryData(&host.heap, host_kind, first + from, n, &back, u64::from(from) * 8) };
+            // SAFETY: an open list, a live heap, `len` bytes inside `back` starting at `back_at`.
+            unsafe { list.list.ResolveQueryData(&host.heap, host_kind, first + from, n, &back, back_at + u64::from(from) * 8) };
         }
         for (i, _) in measured.iter().enumerate().filter(|(_, m)| **m) {
             // SAFETY: both inside their buffers (`i < count`).
