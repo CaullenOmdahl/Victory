@@ -1046,6 +1046,20 @@ fn placed(
 /// How far a window reaches at most (host heaps end below 4 GiB).
 const WINDOW_REACH: u64 = 1 << 30;
 
+/// Whether the current process is running under Wine/Proton.
+fn on_wine() -> bool {
+    static ON_WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON_WINE.get_or_init(|| {
+        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+        // SAFETY: querying ntdll for Wine's version export.
+        unsafe {
+            let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+            !ntdll.is_null()
+                && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+        }
+    })
+}
+
 /// The run of committed pages of one allocation that holds `[from, to)`, in
 /// whole 64 KiB pages.
 fn run_of(from: u64, to: u64) -> Option<(u64, u64)> {
@@ -1086,8 +1100,14 @@ fn run_of(from: u64, to: u64) -> Option<(u64, u64)> {
     let page = PAGE as u64;
     let (start, end) = (start.max(low).next_multiple_of(page), end.min(high) & !(page - 1));
     // Not short views: the title maps and unmaps those (streaming), which
-    // the host refuses while the GPU uses them.
-    if first.Type == windows_sys::Win32::System::Memory::MEM_MAPPED && end - start < 16 << 20 {
+    // the host refuses while the GPU uses them. Under Wine/Proton,
+    // vkd3d-proton + RADV silently reads/writes zeroes on `MEM_MAPPED` views
+    // via `OpenExistingHeapFromAddress1`, so keep `MEM_MAPPED` copied/guarded
+    // while using `MEM_PRIVATE` buffers in place.
+    if first.Type == windows_sys::Win32::System::Memory::MEM_MAPPED
+        && (end - start < 16 << 20
+            || (on_wine() && std::env::var_os("VICTORY_IN_PLACE_MAPPED").is_none()))
+    {
         return None;
     }
     (start <= from && end >= to).then_some((start, end))
@@ -1113,26 +1133,19 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     let device = DEVICE.get_or_init(|| {
-        // Under Wine/Proton, vkd3d-proton's host-memory import can accept
-        // OpenExistingHeapFromAddress1 while the GPU reads zeroes; default to
-        // copies there unless VICTORY_IN_PLACE=1 opts back in.
-        let on_wine = {
-            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-            // SAFETY: querying ntdll for Wine's version export.
-            unsafe {
-                let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
-                !ntdll.is_null()
-                    && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
-            }
-        };
-        let on = std::env::var_os("VICTORY_COPY_MEMORY").is_none()
-            && (!on_wine || std::env::var_os("VICTORY_IN_PLACE").is_some());
+        let on_wine = on_wine();
+        let on = std::env::var_os("VICTORY_COPY_MEMORY").is_none();
         let device: Option<ID3D12Device13> = if on {
             host().and_then(|h| h.device.cast().ok())
         } else {
             None
         };
-        tracing::info!(on = device.is_some(), on_wine, "title memory used in place by the host GPU");
+        tracing::info!(
+            on = device.is_some(),
+            on_wine,
+            private_only = on_wine && std::env::var_os("VICTORY_IN_PLACE_MAPPED").is_none(),
+            "title memory used in place by the host GPU"
+        );
         device
     });
     let device = device.as_ref()?;
@@ -2637,5 +2650,125 @@ mod tests {
             cached[2],
             baseline[2].as_secs_f64() / cached[2].as_secs_f64(),
         );
+    }
+
+    #[test]
+    fn in_place_private_write_watch_round_trips_on_gpu() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::*;
+
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let Ok(device) = host.device.cast::<ID3D12Device13>() else {
+            return;
+        };
+
+        // Allocate with `MEM_WRITE_WATCH` (same flags as `xmem`) and verify
+        // both CPU->GPU reads and GPU->CPU writes work in place via `run_of`.
+        // SAFETY: private allocation freed at the end of the test.
+        let ptr = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as *mut u32;
+        assert!(!ptr.is_null());
+        assert!(run_of(ptr as u64, ptr as u64 + PAGE as u64).is_some());
+
+        // SAFETY: `ptr` points to 64 KiB of committed RW memory.
+        unsafe {
+            for i in 0..16 {
+                ptr.add(i).write_volatile(0xDEAD_BEEF);
+            }
+        }
+        // SAFETY: committed 64 KiB `MEM_PRIVATE` allocation.
+        let heap: ID3D12Heap = unsafe { device.OpenExistingHeapFromAddress1(ptr.cast(), PAGE) }
+            .expect("OpenExistingHeapFromAddress1 on MEM_PRIVATE | MEM_WRITE_WATCH");
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: PAGE as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS
+                | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER,
+            ..Default::default()
+        };
+        let mut placed: Option<ID3D12Resource> = None;
+        // SAFETY: live heap of `PAGE` bytes and valid buffer description.
+        unsafe {
+            host.device
+                .CreatePlacedResource(
+                    &heap,
+                    0,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    None,
+                    &mut placed,
+                )
+                .unwrap();
+        }
+        let placed = placed.unwrap();
+        let (readback, rb_ptr) = host.readback_buffer(PAGE as u64).unwrap();
+        let (upload, up_ptr) = host.upload_buffer(PAGE as u64).unwrap();
+        // SAFETY: valid mapped staging pointers.
+        unsafe {
+            std::ptr::write_bytes(rb_ptr.cast_mut(), 0, PAGE);
+            for i in 0..16 {
+                up_ptr.cast::<u32>().add(i).write_volatile(0xCAFE_BABE);
+            }
+        }
+        let list = host.new_list().unwrap();
+        // SAFETY: open command list with live buffers.
+        unsafe {
+            list.list.CopyBufferRegion(&readback, 0, &placed, 0, 64);
+            list.list.CopyBufferRegion(&placed, 128, &upload, 0, 64);
+        }
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: `host.execute` waited for GPU completion.
+        let (gpu_read, cpu_saw) = unsafe {
+            (
+                rb_ptr.cast::<u32>().read_volatile(),
+                ptr.add(32).read_volatile(),
+            )
+        };
+        assert_eq!(gpu_read, 0xDEAD_BEEF, "GPU must read CPU writes in place");
+        assert_eq!(cpu_saw, 0xCAFE_BABE, "CPU must read GPU writes in place");
+
+        // SAFETY: freeing private allocation.
+        unsafe { VirtualFree(ptr.cast(), 0, MEM_RELEASE) };
+
+        // Also confirm `run_of` rejects `MEM_MAPPED` views under Wine unless opted in.
+        // SAFETY: pagefile-backed mapped view freed below.
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                PAGE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let map_ptr = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE).Value as usize;
+            assert_ne!(map_ptr, 0);
+            assert!(run_of(map_ptr as u64, map_ptr as u64 + 4096).is_none());
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: map_ptr as *mut _,
+            });
+            CloseHandle(section);
+        }
     }
 }
