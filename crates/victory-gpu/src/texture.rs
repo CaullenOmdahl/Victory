@@ -784,12 +784,14 @@ fn create_staging(
         }
     };
     STAGED.fetch_add(total, Ordering::Relaxed);
-    crate::host::name(&buffer, || {
-        format!(
-            "staging of {resource:?} {}x{}x{} f{}",
-            d.Width, d.Height, d.DepthOrArraySize, d.Format.0
-        )
-    });
+    if slot.is_none() {
+        crate::host::name(&buffer, || {
+            format!(
+                "staging of {resource:?} {}x{}x{} f{}",
+                d.Width, d.Height, d.DepthOrArraySize, d.Format.0
+            )
+        });
+    }
     Some(Arc::new(Staging {
         buffer,
         _slot: slot,

@@ -61,7 +61,8 @@ pub(crate) struct Shader {
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
     container: Vec<u8>,
-    /// It animates or draws hair strands ([`hair_strands`]).
+    /// It is left out: it animates or draws hair strands ([`hair_strands`]),
+    /// or serves rays that do not run ([`idle_without_rays`]).
     #[cfg(windows)]
     hair: bool,
     /// Its result gets the least indirect light ([`crate::ambient`]).
@@ -69,6 +70,18 @@ pub(crate) struct Shader {
     pub(crate) resolves_light: bool,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+}
+
+/// Whether a container's program only makes sense with the title's rays,
+/// which do not run (`VICTORY_RAYS` has them run, and it with them): the
+/// program that tells the screen probes which rays to trace.
+/// shortcut: left out. Once clean-up passes shorten it enough for the AMD
+/// driver to compile, running it with no rays behind it loses lighting,
+/// shadows and reflections (`Belobug` `6986a571`).
+#[cfg(windows)]
+fn idle_without_rays(container: &[u8]) -> bool {
+    const NAME: &[u8] = b"CS_ScreenProbes_ActivateRays";
+    !victory_shader::emit::rays() && container.windows(NAME.len()).any(|w| w == NAME)
 }
 
 /// Whether a container's program is one of those that animate and draw hair
@@ -186,7 +199,7 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         hash: full.to_hex()[..16].to_owned(),
         container: bytes.to_vec(),
         #[cfg(windows)]
-        hair: hair_strands(bytes),
+        hair: hair_strands(bytes) || idle_without_rays(bytes),
         #[cfg(windows)]
         resolves_light: bytes
             .windows(crate::ambient::PROGRAM.len())

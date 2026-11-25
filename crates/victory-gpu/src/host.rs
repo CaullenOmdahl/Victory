@@ -1096,18 +1096,43 @@ impl Host {
                     )
                     .is_ok()
             };
+            // Probe once whether the driver supports the full tier-3 view heap
+            // or caps shader-visible view heaps at `PORTABLE_VIEWS` (1M).
+            let probe: windows::core::Result<ID3D12DescriptorHeap> = unsafe {
+                self.device
+                    .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                        Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                        NumDescriptors: victory_shader::emit::VIEW_SLOTS,
+                        Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+                        NodeMask: 0,
+                    })
+            };
+            let view_slots = if probe.is_ok() {
+                victory_shader::emit::VIEW_SLOTS
+            } else {
+                crate::descriptor::host::PORTABLE_VIEWS
+            };
+            drop(probe);
             let target = if ok && options.WaveOps.as_bool() && options.WaveLaneCountMin > 0 {
                 victory_shader::emit::Target {
                     lanes_min: options.WaveLaneCountMin,
                     lanes_max: options.WaveLaneCountMax,
+                    view_slots,
+                    sampler_slots: victory_shader::emit::SAMPLER_SLOTS,
                 }
             } else {
-                victory_shader::emit::Target::ANY
+                victory_shader::emit::Target {
+                    view_slots,
+                    sampler_slots: victory_shader::emit::SAMPLER_SLOTS,
+                    ..victory_shader::emit::Target::ANY
+                }
             };
             tracing::info!(
                 lanes_min = target.lanes_min,
                 lanes_max = target.lanes_max,
-                "host wave sizes"
+                view_slots = target.view_slots,
+                sampler_slots = target.sampler_slots,
+                "host wave sizes and descriptor heap limits"
             );
             if !target.runs(64) {
                 tracing::warn!(

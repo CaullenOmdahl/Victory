@@ -109,6 +109,7 @@ pub(crate) fn staging(
     let size = class(bytes.max(1));
     let (slot, memory) = slot((size, true), |bytes| {
         let (buffer, data) = host.upload_buffer(bytes)?;
+        crate::host::name(&buffer, || format!("texpool staging slab ({bytes})"));
         Some(Memory::Upload(buffer, data as usize))
     })?;
     let Memory::Upload(buffer, data) = memory else {

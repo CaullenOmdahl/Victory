@@ -165,20 +165,63 @@ pub fn rays() -> bool {
     *RAYS.get_or_init(|| cfg!(test) || std::env::var("VICTORY_RAYS").is_ok_and(|v| v == "1"))
 }
 
+/// Slots reserved at the top of each view heap for memory-by-address views.
+pub const MEMORY_SLOTS: u32 = 1024;
+
 /// Slots the host's view heaps have at least (`victory-gpu` pads them); the
-/// last is always null. The title's heap is 1,245,184 slots, with
-/// `victory-gpu`'s own slots after it.
+/// slot right below the memory-by-address range (`own_slots - 1`) is always
+/// null. The title's heap is 1,245,184 slots, with `victory-gpu`'s own slots
+/// after it.
 pub const VIEW_SLOTS: u32 = 2_294_784;
 
 /// Those before the views of memory by address, which programs without
 /// such views stay below.
-pub const OWN_SLOTS: u32 = VIEW_SLOTS - 1024;
+pub const OWN_SLOTS: u32 = VIEW_SLOTS - MEMORY_SLOTS;
 
+/// Slots the host's shader-visible sampler heaps have (`D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE`);
+/// the last slot (`SAMPLER_SLOTS - 1`) is always a null point sampler.
+pub const SAMPLER_SLOTS: u32 = 2048;
 
-/// Whether heap indices are kept below [`VIEW_SLOTS`]: skinning programs
-/// take them from title data, and one past the heap stops the host GPU.
+/// Whether heap indices are kept below the bound heap's sentinel slot:
+/// skinning and bindless programs take indices from title data, and one past
+/// the heap faults the host GPU.
 fn limits_indices() -> bool {
     !cfg!(test)
+}
+
+std::thread_local! {
+    /// Active `(view_clamp, sampler_clamp)` sentinel indices for the current
+    /// shader lowering call.
+    static ACTIVE_CLAMP: std::cell::Cell<Option<(Option<u32>, Option<u32>)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn active_clamp() -> (Option<u32>, Option<u32>) {
+    ACTIVE_CLAMP.with(|c| {
+        c.get().unwrap_or_else(|| {
+            if limits_indices() {
+                (Some(OWN_SLOTS - 1), Some(SAMPLER_SLOTS - 1))
+            } else {
+                (None, None)
+            }
+        })
+    })
+}
+
+struct ClampGuard(Option<(Option<u32>, Option<u32>)>);
+
+impl ClampGuard {
+    fn new(target: Target) -> Self {
+        let next = (target.clamp_view_last(), target.clamp_sampler_last());
+        let prev = ACTIVE_CLAMP.with(|c| c.replace(Some(next)));
+        Self(prev)
+    }
+}
+
+impl Drop for ClampGuard {
+    fn drop(&mut self) {
+        ACTIVE_CLAMP.with(|c| c.set(self.0));
+    }
 }
 
 /// A translated shader and what the host binds for it.
@@ -244,6 +287,14 @@ pub struct UserData {
 pub struct Target {
     pub lanes_min: u32,
     pub lanes_max: u32,
+    /// Total shader-visible view heap slots on the host (`VIEW_SLOTS` on
+    /// tier-3 hosts, `1_000_000` on capped hosts). `0` uses [`VIEW_SLOTS`]
+    /// outside tests without forcing clamping in synthetic unit tests.
+    pub view_slots: u32,
+    /// Total shader-visible sampler heap slots on the host (`SAMPLER_SLOTS`).
+    /// `0` uses [`SAMPLER_SLOTS`] outside tests without forcing clamping in
+    /// synthetic unit tests.
+    pub sampler_slots: u32,
 }
 
 impl Target {
@@ -252,6 +303,8 @@ impl Target {
     pub const ANY: Target = Target {
         lanes_min: 4,
         lanes_max: 128,
+        view_slots: 0,
+        sampler_slots: 0,
     };
 
     /// Whether the host runs waves of `lanes`.
@@ -259,11 +312,46 @@ impl Target {
         (self.lanes_min..=self.lanes_max).contains(&lanes)
     }
 
-    /// The range as bytes, for cache keys.
-    pub fn key(self) -> [u8; 8] {
-        let mut k = [0; 8];
-        k[..4].copy_from_slice(&self.lanes_min.to_le_bytes());
-        k[4..].copy_from_slice(&self.lanes_max.to_le_bytes());
+    /// View slots below the memory-by-address reservation on this host.
+    pub fn own_slots(self) -> u32 {
+        if self.view_slots > MEMORY_SLOTS + 1 {
+            self.view_slots - MEMORY_SLOTS
+        } else {
+            OWN_SLOTS
+        }
+    }
+
+    /// Last valid view-heap slot (permanent null view) to clamp indices to,
+    /// or `None` when clamping is disabled in synthetic tests.
+    pub fn clamp_view_last(self) -> Option<u32> {
+        if self.view_slots > 0 {
+            Some(self.own_slots() - 1)
+        } else if limits_indices() {
+            Some(OWN_SLOTS - 1)
+        } else {
+            None
+        }
+    }
+
+    /// Last valid sampler-heap slot (permanent null sampler) to clamp indices
+    /// to, or `None` when clamping is disabled in synthetic tests.
+    pub fn clamp_sampler_last(self) -> Option<u32> {
+        if self.sampler_slots > 0 {
+            Some(self.sampler_slots - 1)
+        } else if limits_indices() {
+            Some(SAMPLER_SLOTS - 1)
+        } else {
+            None
+        }
+    }
+
+    /// The wave range and descriptor heap limits as bytes, for cache keys.
+    pub fn key(self) -> [u8; 16] {
+        let mut k = [0; 16];
+        k[0..4].copy_from_slice(&self.lanes_min.to_le_bytes());
+        k[4..8].copy_from_slice(&self.lanes_max.to_le_bytes());
+        k[8..12].copy_from_slice(&self.view_slots.to_le_bytes());
+        k[12..16].copy_from_slice(&self.sampler_slots.to_le_bytes());
         k
     }
 }
@@ -452,6 +540,7 @@ fn emit_program(
         console_cf: false,
         per_lane_only: false,
     };
+    let _clamp = ClampGuard::new(target);
     let l = match lower::lower(&parts) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
             let console = structure::structure_console(p);
@@ -1072,10 +1161,12 @@ mod tests {
     const NVIDIA: Target = Target {
         lanes_min: 32,
         lanes_max: 32,
+        ..Target::ANY
     };
     const RDNA: Target = Target {
         lanes_min: 32,
         lanes_max: 64,
+        ..Target::ANY
     };
 
     #[test]

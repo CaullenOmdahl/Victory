@@ -28,6 +28,10 @@ pub(crate) struct HostHeap {
     /// Dynamic slots past the title's: [`DYNAMIC`] in a view heap,
     /// [`SAMPLER_DYNAMIC`] in a capped sampler heap, none in another.
     spare: u32,
+    /// First slot of memory-by-address views (`total - crate::memory::SLOTS`
+    /// for view heaps); slot `memory_first - 1` is permanently reserved as a
+    /// null sentinel so clamped out-of-bounds indices never hit live slots.
+    memory_first: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
@@ -82,9 +86,12 @@ struct StrideTable {
 
 impl StrideTable {
     /// The element counts follow the strides, from [`COUNTS_AT`] dwords on
-    /// (where shaders, which know no heap's size, look for them).
+    /// (where shaders, which know no heap's size, look for them). Always
+    /// covers at least `COUNTS_AT` slots on both halves so clamped out-of-
+    /// bounds indices at `COUNTS_AT - 1` stay in bounds and read zero.
     fn new(device: &ID3D12Device, len: u32) -> Option<Self> {
-        let bytes = ((u64::from(COUNTS_AT) + u64::from(len)) * 4).max(4);
+        let cap = len.max(COUNTS_AT);
+        let bytes = ((u64::from(COUNTS_AT) + u64::from(cap)) * 4).max(4);
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: bytes,
@@ -928,30 +935,29 @@ pub(crate) fn near_heaps(va: u64) -> String {
 
 /// The host's limit for shader-visible view heaps on resource binding
 /// tiers 1 and 2; tier 3 hardware may take more.
-const PORTABLE_VIEWS: u32 = 1_000_000;
+pub(crate) const PORTABLE_VIEWS: u32 = 1_000_000;
 
 /// Slots past the title's in a view heap, for tables a draw needs made
-/// afresh (constant buffers copied per draw). A list holds the slots it
-/// took until it is reset (its submissions have run) or released. A world
-/// frame of some 7,000 draws held over 400,000 of 2^19, and tables of 150
-/// slots no longer fit: the draws that needed them were dropped (the
-/// subsurface resolve, tree imposters). `victory_shader::emit::VIEW_SLOTS`
-/// is the title's 1,245,184 slots, these and those of [`crate::memory`].
-const DYNAMIC: u32 = 1 << 20;
+/// afresh (constant buffers copied per draw). Leaves 1 slot below
+/// [`crate::memory`] permanently reserved as the null sentinel
+/// (`OWN_SLOTS - 1`) so out-of-bounds clamped indices never hit a dynamic
+/// slot.
+const DYNAMIC: u32 = (1 << 20) - 1;
 /// Smaller dynamic reserve when the host caps the whole view heap at
-/// [`PORTABLE_VIEWS`].
-const DYNAMIC_CAPPED: u32 = 1 << 16;
+/// [`PORTABLE_VIEWS`], leaving 1 slot permanently reserved as null sentinel.
+const DYNAMIC_CAPPED: u32 = (1 << 16) - 1;
 
 /// The host's limit for shader-visible sampler heaps, on every binding
 /// tier.
 const SAMPLERS: u32 = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
 
-/// The slots to make of a view heap of `count` title and dynamic slots: with
-/// those of [`crate::memory`] after them, and enough that shaders' indices,
-/// which stay below [`victory_shader::emit::VIEW_SLOTS`], are inside it.
-fn view_slots(count: u32) -> u32 {
-    let slots = count + crate::memory::SLOTS;
-    if cfg!(test) { slots } else { slots.max(victory_shader::emit::VIEW_SLOTS) }
+/// The slots to make of a view heap of `count` title and dynamic slots: 1
+/// permanent null sentinel slot, then those of [`crate::memory`], padded to
+/// at least `min_total` outside tests so shader-clamped indices stay in
+/// bounds.
+fn view_slots(count: u32, min_total: u32) -> u32 {
+    let slots = count + 1 + crate::memory::SLOTS;
+    if cfg!(test) { slots } else { slots.max(min_total) }
 }
 
 /// Dynamic slots of a sampler heap capped at [`SAMPLERS`], for tables
@@ -1063,6 +1069,7 @@ impl HostHeap {
         } else {
             D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV
         };
+        let min_views = host.target().view_slots;
         let create = |count: u32| -> windows::core::Result<ID3D12DescriptorHeap> {
             // SAFETY: plain heap creation.
             unsafe {
@@ -1077,15 +1084,18 @@ impl HostHeap {
         };
         let make = |count: u32| {
             if sampler {
-                return create(count);
+                // Always allocate the full 2,048-slot sampler heap (32 KiB) so
+                // slot `SAMPLERS - 1` is always a valid permanent null sampler.
+                return create(SAMPLERS);
             }
-            // A host with room for fewer slots gets no padding.
-            let slots = view_slots(count);
-            create(slots).or_else(|_| create(count + crate::memory::SLOTS))
+            // A host with room for fewer slots gets no padding past its cap.
+            let slots = view_slots(count, min_views);
+            create(slots).or_else(|_| create(count + 1 + crate::memory::SLOTS))
         };
-        if sampler && count > SAMPLERS {
+        if sampler && count >= SAMPLERS {
             // shortcut: samplers past the host's limit are left out; tables
-            // reaching them are made afresh in the dynamic slots.
+            // reaching them are made afresh in the dynamic slots. Reserve the
+            // last slot (`SAMPLERS - 1`) permanently as the null sentinel.
             tracing::warn!(count, "host sampler heap capped at {SAMPLERS}");
             let heap = match make(SAMPLERS) {
                 Ok(heap) => heap,
@@ -1098,7 +1108,7 @@ impl HostHeap {
                 host,
                 heap,
                 kind,
-                SAMPLERS - SAMPLER_DYNAMIC,
+                SAMPLERS - SAMPLER_DYNAMIC - 1,
                 SAMPLER_DYNAMIC,
             ));
         }
@@ -1106,19 +1116,21 @@ impl HostHeap {
         let wanted = count;
         let (heap, count, extra) = match make(count + extra) {
             Ok(heap) => (heap, count, extra),
-            Err(e) if !sampler && count + extra + crate::memory::SLOTS > PORTABLE_VIEWS => {
+            Err(e) if !sampler && count + extra + 1 + crate::memory::SLOTS > PORTABLE_VIEWS => {
                 // shortcut: descriptors past the host's limit are left out;
                 // draw::tables now remaps the root tables that reach them.
+                // Reserve 1 permanent null sentinel slot below `crate::memory`.
+                let capped_count = PORTABLE_VIEWS - DYNAMIC_CAPPED - 1 - crate::memory::SLOTS;
                 tracing::warn!(
                     error = %e,
                     wanted,
-                    made = PORTABLE_VIEWS - DYNAMIC_CAPPED,
-                    lost = wanted + DYNAMIC_CAPPED - PORTABLE_VIEWS,
+                    made = capped_count,
+                    lost = wanted.saturating_sub(capped_count),
                     "host view heap capped at {PORTABLE_VIEWS}"
                 );
                 (
-                    make(PORTABLE_VIEWS - crate::memory::SLOTS).ok()?,
-                    PORTABLE_VIEWS - DYNAMIC_CAPPED - crate::memory::SLOTS,
+                    create(PORTABLE_VIEWS).ok()?,
+                    capped_count,
                     DYNAMIC_CAPPED,
                 )
             }
@@ -1141,18 +1153,24 @@ impl HostHeap {
     ) -> Self {
         let sampler = kind == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
         // SAFETY: a live heap.
-        let (cpu, step) = unsafe {
+        let (cpu, step, total) = unsafe {
             (
                 heap.GetCPUDescriptorHandleForHeapStart().ptr,
                 host.device.GetDescriptorHandleIncrementSize(kind),
+                heap.GetDesc().NumDescriptors,
             )
         };
-        tracing::info!(count, extra, sampler, "host descriptor heap");
+        let memory_first = if sampler {
+            total
+        } else {
+            total.saturating_sub(crate::memory::SLOTS)
+        };
+        tracing::info!(count, extra, total, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
         GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
             gpu,
-            u64::from(count + extra) * u64::from(step),
+            u64::from(total) * u64::from(step),
             u64::from(step),
             sampler,
         ));
@@ -1167,6 +1185,7 @@ impl HostHeap {
             step,
             count,
             spare: extra,
+            memory_first,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
@@ -1190,10 +1209,9 @@ impl HostHeap {
         // used-resource entry names) read a wild address. Every slot starts
         // null instead.
         let started = std::time::Instant::now();
-        // SAFETY: a plain call on a live heap.
-        let total = unsafe { h.heap.GetDesc() }.NumDescriptors;
-        if !sampler && total < victory_shader::emit::VIEW_SLOTS {
-            tracing::warn!(total, "a view heap shorter than shaders keep their indices in");
+        let min_views = host.target().view_slots;
+        if !sampler && total < min_views {
+            tracing::warn!(total, min_views, "a view heap shorter than shaders keep their indices in");
         }
         if let Err(e) = h.fill_null(kind, total) {
             tracing::warn!(error = %e, "host descriptor heap not made null");
@@ -1204,7 +1222,7 @@ impl HostHeap {
 
     /// The first slot of memory by address, its views made.
     pub(crate) fn memory(&self) -> u32 {
-        let first = self.count + self.spare;
+        let first = self.memory_first;
         if let Some(host) = host() {
             let mut seen = self.memory_seen.lock().unwrap_or_else(|e| e.into_inner());
             *seen = crate::memory::fill(&host.device, *seen, |k| self.cpu(first + k));
@@ -3744,25 +3762,31 @@ void main() {
         assert_eq!(heap.dynamic(40), Some(4 + heap.spare - 40));
     }
 
-    /// A sampler heap past the host's limit is capped, not lost, and keeps
-    /// dynamic slots for the tables reaching past what it holds.
+    /// A sampler heap past the host's limit is capped, not lost, keeps
+    /// dynamic slots for tables reaching past what it holds, and reserves
+    /// slot `SAMPLERS - 1` permanently as the null sentinel.
     #[test]
     fn large_sampler_heap_is_capped() {
         let Some(heap) = HostHeap::new(true, 4 * SAMPLERS) else {
             return; // no host GPU
         };
-        let count = SAMPLERS - SAMPLER_DYNAMIC;
+        let count = SAMPLERS - SAMPLER_DYNAMIC - 1;
         assert_eq!(heap.count(), count);
         assert_eq!(heap.dynamic(SAMPLER_DYNAMIC + 1), None);
         let a = heap.dynamic(SAMPLER_DYNAMIC).unwrap();
         assert_eq!(a, count);
+        assert!(
+            a + SAMPLER_DYNAMIC < SAMPLERS,
+            "last sampler slot must remain permanently reserved as null sentinel"
+        );
         assert_eq!(heap.dynamic(1), None);
         heap.release(a, 8);
         assert_eq!(heap.dynamic(8), Some(count));
     }
 
-    /// A sampler heap within the limit has a slot per title slot and no
-    /// dynamic ones.
+    /// A sampler heap within the limit has a slot per title slot, no dynamic
+    /// ones, and is padded to `SAMPLERS` so slot `SAMPLERS - 1` is always a
+    /// valid permanent null sampler.
     #[test]
     fn small_sampler_heap_has_no_dynamic_slots() {
         let Some(heap) = HostHeap::new(true, 16) else {
@@ -3770,6 +3794,38 @@ void main() {
         };
         assert_eq!(heap.count(), 16);
         assert_eq!(heap.dynamic(1), None);
+        // SAFETY: plain query on a live descriptor heap.
+        let total = unsafe { heap.heap.GetDesc() }.NumDescriptors;
+        assert_eq!(total, SAMPLERS);
+    }
+
+    /// A view heap permanently reserves `memory_first - 1` as a null sentinel
+    /// outside both title and dynamic allocations, and allocates its stride
+    /// table to cover `COUNTS_AT` on both halves (so clamped out-of-bounds
+    /// lookups read zero in bounds).
+    #[test]
+    fn view_heap_reserves_null_sentinel_and_covers_stride_table() {
+        let Some(heap) = HostHeap::new(false, 64) else {
+            return; // no host GPU
+        };
+        assert!(
+            heap.count + heap.spare < heap.memory_first,
+            "sentinel slot below memory() must never overlap title or dynamic slots"
+        );
+        let sentinel = heap.memory_first - 1;
+        let first_dyn = heap.dynamic(heap.spare).unwrap();
+        assert!(
+            first_dyn + heap.spare <= sentinel,
+            "dynamic allocations must never reach the permanent null sentinel"
+        );
+        heap.release(first_dyn, heap.spare);
+        let strides = heap.strides.as_ref().expect("view heap has a stride table");
+        // SAFETY: plain query on a live upload buffer.
+        let stride_bytes = unsafe { strides._resource.GetDesc() }.Width;
+        assert!(
+            stride_bytes >= u64::from(COUNTS_AT) * 2 * 4,
+            "stride table must cover both stride and count halves up to COUNTS_AT"
+        );
     }
 
     /// A structured view whose start in its host copy is not on an element

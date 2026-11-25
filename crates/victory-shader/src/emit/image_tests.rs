@@ -1075,3 +1075,99 @@ fn forms_without_an_sm_6_6_equivalent_name_why() {
         }
     }
 }
+
+/// Out-of-bounds view and sampler heap indices clamp to each heap's
+/// dedicated sentinel slot (`own_slots - 1` and `sampler_slots - 1`) on
+/// real hardware and WARP without faulting past the bound descriptor heaps.
+#[test]
+fn out_of_bounds_view_and_sampler_indices_clamp_to_sentinel_slots() {
+    let words = program(mimg("image_sample_lz", 0xF), &[]);
+    let n = native(&words);
+    let p = ir::build(&n.code, n.wave64, n.vgprs).expect("ir");
+    let res = resource::track(&p, &n.layout, n.stage).expect("track");
+    let io = io::raise(&p, &n).expect("io");
+    let st = structure::structure(&p).expect("structure");
+    let bytes = dxbc::build(&[]);
+    let c = Container::parse(&bytes).expect("container");
+    let target = super::Target {
+        lanes_min: 4,
+        lanes_max: 128,
+        view_slots: super::MEMORY_SLOTS + 4, // own_slots = 4 -> sentinel view slot = 3
+        sampler_slots: 2,                    // sentinel sampler slot = 1
+    };
+    let shader = emit(&c, &n, &p, &st, &io, &res, target).expect("emit");
+    if let Ok(mut v) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut shader.dxil.clone()).expect("DXIL validation");
+    }
+
+    let real_tex = [[1.0f32, 2.0, 3.0, 4.0]];
+    let sentinel_tex = [[0.0f32, 0.0, 0.0, 0.0]];
+    let addr_data: Vec<u32> = (0..LANES * ADDR).map(|_| 0.5f32.to_bits()).collect();
+    let smp = point(false);
+
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+        let run_case = |view_byte_off: u32, sampler_byte_off: u32| -> [f32; 4] {
+            let mut ud = vec![0u32; shader.user_data_dwords().max(4) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Table, 1) => view_byte_off,
+                    (RootType::Table, 2) => sampler_byte_off,
+                    (RootType::Table, 3) => 2 * 32, // slot 2 = output RawUav
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[
+                            View::Texture(1, 1, &real_tex),
+                            View::Buffer {
+                                data: &addr_data,
+                                stride: Stride::Raw,
+                            },
+                            View::RawUav((LANES * 4) as u32),
+                            View::Texture(1, 1, &sentinel_tex),
+                        ],
+                        samplers: &[smp, smp],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+            [
+                f32::from_bits(out[0][0]),
+                f32::from_bits(out[0][1]),
+                f32::from_bits(out[0][2]),
+                f32::from_bits(out[0][3]),
+            ]
+        };
+
+        // 1. In-bounds view (slot 0) + in-bounds sampler (slot 0) -> real texel.
+        assert_eq!(run_case(0, 0), [1.0, 2.0, 3.0, 4.0], "{label}: valid view + sampler");
+        // 2. Wild OOB view (slot 134,217,727) + wild OOB sampler (slot 268,435,455)
+        //    -> both clamp cleanly to sentinel slots without GPU fault.
+        assert_eq!(
+            run_case(0xFFFF_FFE0, 0xFFFF_FFF0),
+            [0.0, 0.0, 0.0, 0.0],
+            "{label}: OOB view + OOB sampler must clamp to sentinel"
+        );
+        // 3. Valid view (slot 0) + wild OOB sampler (slot 268,435,455)
+        //    -> sampler clamps to sentinel point sampler slot 1 and returns real texel.
+        assert_eq!(
+            run_case(0, 0xFFFF_FFF0),
+            [1.0, 2.0, 3.0, 4.0],
+            "{label}: valid view + OOB sampler must clamp sampler to sentinel"
+        );
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}

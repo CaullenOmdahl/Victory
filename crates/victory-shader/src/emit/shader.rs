@@ -96,6 +96,10 @@ pub(crate) struct Shader {
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
+    /// Sentinel null view slot to clamp `ResourceDescriptorHeap` indices to.
+    view_clamp: Option<u32>,
+    /// Sentinel null sampler slot to clamp `SamplerDescriptorHeap` indices to.
+    sampler_clamp: Option<u32>,
     /// A compute shader with this thread-group size.
     pub threads: Option<[u32; 3]>,
     /// The wave size a compute shader requires (`WaveSize`).
@@ -157,6 +161,8 @@ impl Shader {
             stride_table: None,
             flags: 0,
             nonuniform_handles: 0,
+            view_clamp: super::active_clamp().0,
+            sampler_clamp: super::active_clamp().1,
             threads: None,
             wave_size: None,
             lds_dwords: 0,
@@ -405,9 +411,16 @@ impl Shader {
         nonuniform: bool,
         props: (u32, u32),
     ) -> V {
-        // An index past the heap is a fault that stops the host GPU.
-        let index = if !sampler && super::limits_indices() {
-            let last = self.m.i32(super::OWN_SLOTS - 1);
+        // An index past the bound heap faults the host GPU (e.g. AMD RDNA
+        // `s_load_b128` off the end of a view or sampler heap); clamp both to
+        // their permanent null sentinel slots.
+        let limit = if sampler {
+            self.sampler_clamp
+        } else {
+            self.view_clamp
+        };
+        let index = if let Some(last) = limit {
+            let last = self.m.i32(last);
             let i32t = self.t.i32;
             self.op(block, "binary.i32", Attr::ReadNone, i32t, 40, &[index, last])
         } else {

@@ -387,13 +387,24 @@ mod tests {
         let nvidia = Target {
             lanes_min: 32,
             lanes_max: 32,
+            ..Target::ANY
         };
         let rdna = Target {
             lanes_min: 32,
             lanes_max: 64,
+            ..Target::ANY
+        };
+        let capped_views = Target {
+            view_slots: crate::descriptor::host::PORTABLE_VIEWS,
+            ..rdna
+        };
+        let full_views = Target {
+            view_slots: victory_shader::emit::VIEW_SLOTS,
+            ..rdna
         };
         assert_eq!(key(&build, nvidia), key(&build, nvidia));
         assert_ne!(key(&build, nvidia), key(&build, rdna));
+        assert_ne!(key(&build, capped_views), key(&build, full_views));
         assert_ne!(key(&build, nvidia), key(&[8; 32], nvidia));
     }
 
