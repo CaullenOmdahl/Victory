@@ -1806,14 +1806,18 @@ impl State {
         .then(|| {
             use windows::core::Interface;
             let src_id = args.buffer.as_raw() as u64;
-            let slot = crate::indirect::gather(
+            let (scratch, at, recorded) = crate::indirect::gather(
                 list,
                 (&args.buffer, src_id),
                 args.offset(arguments),
                 (kind, stride),
             )?;
             args.refresh(list, arguments, len);
-            Some(slot)
+            if recorded {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
+            Some((scratch, at))
         })
         .flatten();
         if kind == DISPATCH || may_store {

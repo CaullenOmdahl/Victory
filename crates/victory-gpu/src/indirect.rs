@@ -65,6 +65,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     [branch]
     if (active && (has_count & 4u) != 0) {
         src_at = count_buf.Load(count_offset + id.x * 4u);
+        // A slot no draw has taken: the table of a run is filled while
+        // the list is recorded, after this pass was (`gather_runs`).
+        if (src_at == 0xffffffffu) {
+            active = false;
+        }
     }
     uint dst_at = id.x * stride;
     uint cost = 0;
@@ -511,6 +516,7 @@ pub(crate) struct GatherSet {
     pub(crate) scratch: ID3D12Resource,
     table_gpu: u64,
     table: usize,
+    most: u32,
     slots: std::collections::HashMap<u32, u32>,
 }
 
@@ -534,8 +540,42 @@ impl GatherSet {
             scratch,
             table_gpu,
             table: table as usize,
+            most: GATHER_MOST,
             slots: Default::default(),
         }
+    }
+
+    /// A set of one run inside a list ([`gather_runs`]): `RUN_MOST` slots,
+    /// its table initialized to "no record" until later draws take slots.
+    pub(crate) fn new_run(
+        src: ID3D12Resource,
+        src_id: u64,
+        (kind, stride): (u32, u32),
+        scratch: ID3D12Resource,
+        (table_gpu, table): (u64, *mut u8),
+    ) -> Self {
+        // SAFETY: the table holds `RUN_MOST` words of the list's upload memory.
+        unsafe { std::ptr::write_bytes(table, 0xff, RUN_MOST as usize * 4) };
+        Self {
+            src,
+            src_id,
+            kind,
+            stride,
+            scratch,
+            table_gpu,
+            table: table as usize,
+            most: RUN_MOST,
+            slots: Default::default(),
+        }
+    }
+
+    /// Whether the set is of `src` (`src_id`), `kind` and `stride`.
+    pub(crate) fn is_of(&self, src: &ID3D12Resource, src_id: u64, (kind, stride): (u32, u32)) -> bool {
+        use windows::core::Interface;
+        self.src_id == src_id
+            && self.kind == kind
+            && self.stride == stride
+            && self.src.as_raw() == src.as_raw()
     }
 
     pub(crate) fn records(&self) -> u32 {
@@ -547,10 +587,10 @@ impl GatherSet {
             return Some(slot);
         }
         let slot = self.slots.len() as u32;
-        if slot >= GATHER_MOST {
+        if slot >= self.most {
             return None;
         }
-        // SAFETY: `self.table` holds `GATHER_MOST` u32 entries.
+        // SAFETY: `self.table` holds `self.most` u32 entries.
         unsafe { (self.table as *mut u32).add(slot as usize).write_volatile(offset) };
         self.slots.insert(offset, slot);
         Some(slot)
@@ -559,6 +599,37 @@ impl GatherSet {
     pub(crate) fn into_scratch(self) -> ID3D12Resource {
         self.scratch
     }
+}
+
+/// The slots of a run's set ([`gather_runs`]): a pass of four groups.
+pub(crate) const RUN_MOST: u32 = 256;
+
+/// Whether records are also gathered by runs inside a list after `gather_close`
+/// (`VICTORY_INDIRECT_GATHER_RUNS=0` disables it).
+pub(crate) fn gather_runs() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_GATHER_RUNS").is_none_or(|v| v != "0"))
+}
+
+/// Records in `l`, where it stands, the clamp pass for a run's set `set`.
+pub(crate) fn record_run(
+    l: &ID3D12GraphicsCommandList,
+    set: &GatherSet,
+    before: D3D12_RESOURCE_STATES,
+    budget: u64,
+) -> bool {
+    let Some(c) = clamp() else {
+        return false;
+    };
+    record_gather_as(
+        c,
+        l,
+        (&set.scratch, before),
+        budget,
+        &set.src,
+        set.table_gpu,
+        (set.kind, set.stride, RUN_MOST),
+    )
 }
 
 pub(crate) fn gatherable(src_gpu: u64, offset: u64, (kind, stride): (u32, u32)) -> Option<u32> {
@@ -576,14 +647,16 @@ pub(crate) fn gatherable(src_gpu: u64, offset: u64, (kind, stride): (u32, u32)) 
         .filter(|o| o.checked_add(stride).is_some())
 }
 
-/// Gathers a single scattered indirect record for `list`'s prelude to clamp in
-/// one batched pass instead of a serialized compute dispatch + UAV barrier per draw.
+/// Gathers a single scattered indirect record for `list`'s prelude or current
+/// run to clamp in one batched pass instead of a serialized dispatch per draw.
+/// The third return value is `true` if a clamp pass was recorded inline now
+/// (requiring compute root/pipeline cache invalidation).
 pub(crate) fn gather(
     list: &HostList,
     (src, src_id): (&ID3D12Resource, u64),
     offset: u64,
     spec: (u32, u32),
-) -> Option<(ID3D12Resource, u64)> {
+) -> Option<(ID3D12Resource, u64, bool)> {
     clamp()?;
     // SAFETY: a live D3D12 buffer resource.
     let offset = gatherable(unsafe { src.GetGPUVirtualAddress() }, offset, spec)?;

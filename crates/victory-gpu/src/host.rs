@@ -752,6 +752,8 @@ struct Gather {
     sets: Vec<crate::indirect::GatherSet>,
     budget: Option<ID3D12Resource>,
     spare: Vec<ID3D12Resource>,
+    runs: Vec<crate::indirect::GatherSet>,
+    run_spare: Vec<(ID3D12Resource, bool)>,
 }
 
 const GATHER_SETS: usize = 8;
@@ -2114,15 +2116,24 @@ impl HostList {
 
     pub(crate) fn close(&self) {
         // Gathered indirect scratch buffers leave INDIRECT_ARGUMENT back to
-        // COMMON at list end so the next recording's prelude starts from COMMON.
-        for set in self
-            .gather
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .sets
-            .iter()
-            .filter(|s| s.records() > 0)
+        // COMMON at list end so the next recording starts from COMMON.
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
         {
+            let Gather { runs, run_spare, .. } = &mut *gather;
+            run_spare.extend(runs.drain(..).map(|set| (set.into_scratch(), true)));
+            for (scratch, readable) in run_spare.iter_mut().filter(|s| s.1) {
+                // SAFETY: an open list and a live buffer left in INDIRECT_ARGUMENT.
+                unsafe {
+                    self.list.ResourceBarrier(&[transition(
+                        scratch,
+                        D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
+                }
+                *readable = false;
+            }
+        }
+        for set in gather.sets.iter().filter(|s| s.records() > 0) {
             // SAFETY: an open list and a live scratch buffer left in INDIRECT_ARGUMENT
             // by this list's prelude.
             unsafe {
@@ -2133,6 +2144,7 @@ impl HostList {
                 )]);
             }
         }
+        drop(gather);
         // The host closes no list with queries running; their title ends,
         // in a later list, are dropped (`end_query`).
         for (heap, kind, index, _) in self.queries.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
@@ -2191,6 +2203,8 @@ impl HostList {
                 closed,
                 sets,
                 spare,
+                runs,
+                run_spare,
                 ..
             } = &mut *gather;
             *closed = false;
@@ -2198,6 +2212,11 @@ impl HostList {
                 if spare.len() < GATHER_SETS {
                     spare.push(set.into_scratch());
                 }
+            }
+            run_spare.extend(runs.drain(..).map(|set| (set.into_scratch(), false)));
+            run_spare.truncate(GATHER_SETS);
+            for spare in run_spare.iter_mut() {
+                spare.1 = false;
             }
         }
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -2620,25 +2639,82 @@ impl HostList {
     /// Stops gathering single-record indirect draws for this list's prelude:
     /// a command just recorded may write argument memory.
     pub(crate) fn gather_close(&self) {
-        self.gather.lock().unwrap_or_else(|e| e.into_inner()).closed = true;
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        gather.closed = true;
+        let Gather { runs, run_spare, .. } = &mut *gather;
+        run_spare.extend(runs.drain(..).map(|set| (set.into_scratch(), true)));
+    }
+
+    fn gather_run_slot(
+        &self,
+        src: &ID3D12Resource,
+        src_id: u64,
+        offset: u32,
+        (kind, stride): (u32, u32),
+    ) -> Option<(ID3D12Resource, u64, bool)> {
+        let budget = self.budget()?;
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        for set in gather
+            .runs
+            .iter_mut()
+            .filter(|s| s.is_of(src, src_id, (kind, stride)))
+        {
+            if let Some(slot) = set.slot(offset) {
+                return Some((set.scratch.clone(), u64::from(slot) * u64::from(stride), false));
+            }
+        }
+        let (scratch, readable) = match gather.run_spare.pop() {
+            Some(spare) => spare,
+            None => {
+                let scratch = host()?.uav_buffer(
+                    u64::from(crate::indirect::RUN_MOST) * u64::from(crate::indirect::GATHER_STRIDE),
+                )?;
+                name(&scratch, || "indirect arguments, gathered by runs".to_owned());
+                (scratch, false)
+            }
+        };
+        let Some(table) = self.scratch(u64::from(crate::indirect::RUN_MOST) * 4) else {
+            gather.run_spare.push((scratch, readable));
+            return None;
+        };
+        let mut set =
+            crate::indirect::GatherSet::new_run(src.clone(), src_id, (kind, stride), scratch, table);
+        let before = if readable {
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+        } else {
+            D3D12_RESOURCE_STATE_COMMON
+        };
+        if !crate::indirect::record_run(&self.list, &set, before, budget) {
+            gather.run_spare.push((set.into_scratch(), readable));
+            return None;
+        }
+        let slot = set.slot(offset)?;
+        let scratch = set.scratch.clone();
+        gather.runs.push(set);
+        Some((scratch, u64::from(slot) * u64::from(stride), true))
     }
 
     /// Assigns a slot for the scattered record at `offset` in `src` (`src_id`)
-    /// to be clamped once per list in `prelude`.
+    /// to be clamped once per list in `prelude` (or by draw-run after `gather_close`).
     pub(crate) fn gather_slot(
         &self,
         src: &ID3D12Resource,
         src_id: u64,
         offset: u32,
         (kind, stride): (u32, u32),
-    ) -> Option<(ID3D12Resource, u64)> {
+    ) -> Option<(ID3D12Resource, u64, bool)> {
         let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
         if gather.closed {
+            if crate::indirect::gather_runs() {
+                drop(gather);
+                return self.gather_run_slot(src, src_id, offset, (kind, stride));
+            }
             return None;
         }
-        let found = gather.sets.iter().position(|s| {
-            s.src_id == src_id && s.kind == kind && s.stride == stride && s.src.as_raw() == src.as_raw()
-        });
+        let found = gather
+            .sets
+            .iter()
+            .position(|s| s.is_of(src, src_id, (kind, stride)));
         let at = match found {
             Some(at) => at,
             None => {
@@ -2683,6 +2759,7 @@ impl HostList {
         Some((
             gather.sets[at].scratch.clone(),
             u64::from(slot) * u64::from(stride),
+            false,
         ))
     }
 
