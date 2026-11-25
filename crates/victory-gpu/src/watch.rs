@@ -30,7 +30,7 @@
 //! to).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-64-MiB-region epoch table. Incremented for only the region(s) touched
@@ -96,19 +96,19 @@ pub(crate) const PAGE: usize = 64 << 10;
 const KERNEL_PAGE: usize = 4096;
 
 struct Journal {
-    /// Numbers the askings; 0 is "never".
-    asked: u64,
     /// Page number → the asking that last found it written.
     written: BTreeMap<usize, u64>,
-    /// Room for the kernel's answer.
-    found: Vec<usize>,
 }
 
-static JOURNAL: Mutex<Journal> = Mutex::new(Journal {
-    asked: 0,
+static ASKED: AtomicU64 = AtomicU64::new(0);
+
+static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
     written: BTreeMap::new(),
-    found: Vec::new(),
 });
+
+/// Serializes `GetWriteWatch(WRITE_WATCH_FLAG_RESET)` with recording its
+/// cleared pages into `JOURNAL` so concurrent askers cannot miss a reset.
+static WRITE_WATCH_LOCK: Mutex<()> = Mutex::new(());
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
@@ -119,52 +119,74 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
-    let mut count = (last - first) * PAGE / KERNEL_PAGE;
-    j.found.resize(count.max(j.found.len()), 0);
-    let mut granularity = 0;
+    let needed = (last - first) * PAGE / KERNEL_PAGE;
+    thread_local! {
+        static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let ww = WRITE_WATCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
-        GetWriteWatch(
-            WRITE_WATCH_FLAG_RESET,
-            (first * PAGE) as *const _,
-            (last - first) * PAGE,
-            j.found.as_mut_ptr().cast(),
-            &mut count,
-            &mut granularity,
-        )
-    } != 0;
-    let guarded = if failed {
-        count = 0;
+    let (failed, pages): (bool, Vec<usize>) = FOUND.with(|cell| {
+        let mut found = cell.borrow_mut();
+        if found.len() < needed {
+            found.resize(needed, 0);
+        }
+        let mut count = needed;
+        let mut granularity = 0;
+        // SAFETY: the answer buffer holds at least `count` entries.
+        let failed = unsafe {
+            GetWriteWatch(
+                WRITE_WATCH_FLAG_RESET,
+                (first * PAGE) as *const _,
+                (last - first) * PAGE,
+                found.as_mut_ptr().cast(),
+                &mut count,
+                &mut granularity,
+            )
+        } != 0;
+        if failed {
+            (true, Vec::new())
+        } else {
+            (false, found[..count].iter().map(|&at| at / PAGE).collect())
+        }
+    });
+    if failed {
+        drop(ww);
         if !guarded {
             return None;
         }
-        guard(first * PAGE, last * PAGE)?
-    } else {
-        Vec::new()
-    };
+        return writes_guarded(start, end);
+    }
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
     }
-    j.asked += 1;
-    let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    let now = ASKED.fetch_add(1, Ordering::AcqRel) + 1;
+    if pages.is_empty() {
+        drop(ww);
+        let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+        return Some((
+            now,
+            j.written
+                .range(first..last)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
+        ));
+    }
+    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
+    for page in pages {
         j.written.insert(page, now);
     }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    let out = j
+        .written
+        .range(first..last)
+        .map(|(&p, &w)| (p, w))
+        .collect();
+    drop(j);
+    drop(ww);
+    Some((now, out))
 }
 
 /// Same as [`writes`] for memory already known to be guarded `MEM_MAPPED`
@@ -175,16 +197,24 @@ pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usiz
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let guarded = guard(first * PAGE, last * PAGE)?;
-    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-    let j = &mut *j;
     #[cfg(feature = "diagnostics")]
     {
         use crate::copystat::{C, add};
         add(C::Watches, 1);
         add(C::WatchUs, started.elapsed().as_micros() as u64);
     }
-    j.asked += 1;
-    let now = j.asked;
+    let now = ASKED.fetch_add(1, Ordering::AcqRel) + 1;
+    if guarded.is_empty() {
+        let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
+        return Some((
+            now,
+            j.written
+                .range(first..last)
+                .map(|(&p, &w)| (p, w))
+                .collect(),
+        ));
+    }
+    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
     for page in guarded {
         j.written.insert(page, now);
     }
@@ -225,7 +255,7 @@ struct Guards {
     pins: Vec<(usize, usize, std::time::Instant)>,
 }
 
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
+static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     holes: BTreeSet::new(),
@@ -418,7 +448,7 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
         }
     }
     if !others.is_empty() {
-        let mut g = guards();
+        let mut g = guards_mut();
         for a in others {
             open_here(&mut g, a, a + BLOCK);
         }
@@ -432,8 +462,12 @@ pub fn title_memory_view_gone(at: usize, len: usize) {
     }
 }
 
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    GUARDS.lock().unwrap_or_else(|e| e.into_inner())
+fn guards_read() -> std::sync::RwLockReadGuard<'static, Guards> {
+    GUARDS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn guards_mut() -> std::sync::RwLockWriteGuard<'static, Guards> {
+    GUARDS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// For view memory: the pages of `[start, end)`'s blocks written since
@@ -441,10 +475,18 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // Fast path: if [first, last) is already covered by prior guards, walk only
-    // the dirty/pinned/re-opened blocks in `g.dirty` (O(log N + k)).
+    // Shared read-lock fast path: 97%+ of checks on covered spans have no
+    // dirty/pinned blocks and complete with zero lock contention across workers.
     {
-        let mut g = guards();
+        let g = guards_read();
+        if g.is_covered(first, last) && g.dirty.range(first..last).next().is_none() {
+            return Some(Vec::new());
+        }
+    }
+    // Write-lock fast path: if [first, last) is already covered, walk only the
+    // dirty/pinned/re-opened blocks in `g.dirty` (O(log N + k)).
+    {
+        let mut g = guards_mut();
         if g.is_covered(first, last) {
             if !g.pins.is_empty() {
                 let now = std::time::Instant::now();
@@ -499,7 +541,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     };
     let check_each = probe != start;
     install();
-    let mut g = guards();
+    let mut g = guards_mut();
     if !g.pins.is_empty() {
         let now = std::time::Instant::now();
         g.pins.retain(|&(_, _, until)| until > now);
@@ -765,7 +807,7 @@ pub fn writing(at: usize, len: usize) {
         return;
     }
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
-    let mut g = guards();
+    let mut g = guards_mut();
     if !g.pins.is_empty() {
         let now = std::time::Instant::now();
         g.pins.retain(|&(_, _, until)| until > now);
@@ -806,7 +848,13 @@ pub(crate) fn open_for_sync_write(at: usize, len: usize) {
         return;
     }
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
-    let mut g = guards();
+    {
+        let g = guards_read();
+        if g.protected.range(first..last).next().is_none() {
+            return;
+        }
+    }
+    let mut g = guards_mut();
     if g.protected.range(first..last).next().is_some() {
         open(&mut g, at, at + len);
     }
@@ -821,7 +869,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     }
     let end = at.saturating_add(len);
     {
-        let mut g = guards();
+        let mut g = guards_mut();
         let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
         let blocks: Vec<usize> = g
             .protected
@@ -890,9 +938,8 @@ pub fn title_memory_written(at: usize, len: usize) {
         // arrived kept what the memory held then for good (meshes read as
         // zeros: walls, floors and bodies missing, others each launch).
         {
-            let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
-            j.asked += 1;
-            let now = j.asked;
+            let now = ASKED.fetch_add(1, Ordering::AcqRel) + 1;
+            let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
             for page in at / PAGE..(at + len).div_ceil(PAGE) {
                 j.written.insert(page, now);
             }
@@ -905,7 +952,7 @@ pub fn title_memory_written(at: usize, len: usize) {
 /// made it read-write). Called both by our own VEH handler and by
 /// `host::safe_copy`'s VEH handler on write faults.
 pub(crate) fn try_open_guarded(at: usize) -> bool {
-    let mut g = guards();
+    let mut g = guards_mut();
     if open(&mut g, at, at + 1) {
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::GuardFaults, 1);
