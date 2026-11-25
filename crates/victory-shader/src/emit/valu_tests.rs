@@ -1841,3 +1841,34 @@ fn scalars_read_after_a_divergent_loop_ask_for_the_console_wave_size() {
     assert_eq!(range(&divergent), (64, 64));
     assert_eq!(range(&uniform), (0, u32::MAX));
 }
+
+#[test]
+fn a_half_written_mask_tests_its_high_dword() {
+    // s_mov_b32 s12, 0; s_mov_b32 s13, -1 | 0;
+    // v_mbcnt_lo_u32_b32 v1, -1, 0; v_cndmask_b32 v1, 0, -1, s[12:13];
+    // v_mov_b32 v0, v1
+    let variant = |s13: u8| {
+        let [c, d] = vop3(0x101, 1, 0x80, 0x1C1, sgpr(12));
+        lower_test_shader(
+            &NativeProgram {
+                wave64: true,
+                vgprs: 16,
+                ..valu_program(&[
+                    s_mov_b32(12, 0x80),
+                    s_mov_b32(13, s13),
+                    0xD765_0001,
+                    0x0001_00C1,
+                    c,
+                    d,
+                    vop1(0x001, 0, vgpr(1)),
+                ])
+            },
+            &[],
+        )
+    };
+    let (neg, zero) = (variant(0xC1), variant(0x80));
+    assert_ne!(
+        neg.dxil, zero.dxil,
+        "lanes 32-63 read the mask's high dword"
+    );
+}
