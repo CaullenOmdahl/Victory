@@ -700,7 +700,7 @@ pub(crate) struct HostList {
     queries: Mutex<Vec<(ID3D12QueryHeap, D3D12_QUERY_TYPE, u32, bool)>>,
     /// The work its indirect executions may still do (`indirect`): a
     /// shader-writable word, zeroed when the list is submitted.
-    budget: OnceLock<Option<(ID3D12Resource, usize)>>,
+    budget: OnceLock<Option<Budget>>,
     /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
     /// grown to the largest indirect execution recorded on the list.
     indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
@@ -777,6 +777,18 @@ impl Drop for HostList {
 unsafe impl Send for HostList {}
 // SAFETY: as above.
 unsafe impl Sync for HostList {}
+
+enum Budget {
+    Card(ID3D12Resource),
+    Shared(ID3D12Resource, usize),
+}
+
+/// Whether indirect-work budgets live in device-local VRAM (`VICTORY_INDIRECT_CARD_BUDGET=0`
+/// falls back to mapped upload memory).
+fn card_budget() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_CARD_BUDGET").is_none_or(|v| v != "0"))
+}
 
 /// A marker's text and the host range its command reads (diagnostics).
 #[cfg(feature = "diagnostics")]
@@ -2179,7 +2191,11 @@ impl HostList {
             .collect();
         let gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
         let gathered = gather.sets.iter().any(|s| s.records() > 0);
-        if uploads.is_empty() && post_barriers.is_empty() && !gathered {
+        let card_budget = match self.budget.get().and_then(|o| o.as_ref()) {
+            Some(Budget::Card(b)) if self.deferred().budget_zeroed => Some(b.clone()),
+            _ => None,
+        };
+        if uploads.is_empty() && post_barriers.is_empty() && !gathered && card_budget.is_none() {
             return None;
         }
         let (allocator, list) = &self.prelude;
@@ -2196,6 +2212,26 @@ impl HostList {
                 }
                 if !post_barriers.is_empty() {
                     list.ResourceBarrier(&post_barriers);
+                }
+                if let Some(budget_buf) = &card_budget
+                    && let Ok(l2) = list.cast::<ID3D12GraphicsCommandList2>()
+                {
+                    let at = budget_buf.GetGPUVirtualAddress();
+                    let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+                        Dest: at + offset,
+                        Value: 0,
+                    });
+                    list.ResourceBarrier(&[transition(
+                        budget_buf,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                    )]);
+                    l2.WriteBufferImmediate(zeros.len() as u32, zeros.as_ptr(), None);
+                    list.ResourceBarrier(&[transition(
+                        budget_buf,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_COMMON,
+                    )]);
                 }
                 if gathered {
                     let filled = match &gather.budget {
@@ -2753,25 +2789,42 @@ impl HostList {
         Some(made)
     }
 
-    /// The host address of the list's indirect-work budget, zeroed at each
+    /// The GPU address of the list's indirect-work budget, zeroed at each
     /// submission of the list from the first use after a reset on.
     pub(crate) fn budget(&self) -> Option<u64> {
-        let (buffer, data) = self
+        let budget = self
             .budget
             .get_or_init(|| {
-                let (b, d) = host()?.shared_buffer(256)?;
-                Some((b, d as usize))
+                let h = host()?;
+                if card_budget() && self.list.cast::<ID3D12GraphicsCommandList2>().is_ok() {
+                    let b = h.uav_buffer(256)?;
+                    name(&b, || "indirect budget".to_owned());
+                    Some(Budget::Card(b))
+                } else {
+                    let (b, d) = h.shared_buffer(256)?;
+                    Some(Budget::Shared(b, d as usize))
+                }
             })
             .as_ref()?;
-        let mut deferred = self.deferred();
-        if !deferred.budget_zeroed {
-            deferred.budget_zeroed = true;
-            let at = *data;
-            // SAFETY: the list's own mapped word, written before it runs.
-            deferred
-                .copies
-                .push(Step::Host(Box::new(move || unsafe { (at as *mut u32).write_volatile(0) })));
-        }
+        let buffer = match budget {
+            Budget::Card(b) => {
+                let mut deferred = self.deferred();
+                deferred.budget_zeroed = true;
+                b
+            }
+            Budget::Shared(b, data) => {
+                let mut deferred = self.deferred();
+                if !deferred.budget_zeroed {
+                    deferred.budget_zeroed = true;
+                    let at = *data;
+                    // SAFETY: the list's own mapped words, zeroed before it runs.
+                    deferred.copies.push(Step::Host(Box::new(move || unsafe {
+                        std::ptr::write_bytes(at as *mut u8, 0, 12);
+                    })));
+                }
+                b
+            }
+        };
         // SAFETY: a live buffer.
         Some(unsafe { buffer.GetGPUVirtualAddress() })
     }

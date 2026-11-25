@@ -44,34 +44,44 @@ RWByteAddressBuffer dst_args : register(u0);
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
+// Vertices or indices per instance from which a draw record runs empty.
+static const uint MOST_DRAW = 1u << 23;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+// Coalesce each 64-thread workgroup into a single atomic budget update.
+groupshared uint costs[64];
+groupshared uint fits[64];
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
+void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint eff_count = records;
     if ((has_count & 1u) != 0) {
         eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    if (id.x >= eff_count) return;
+    bool active = id.x < eff_count;
     uint src_at = args_offset + id.x * stride;
     // Gathered records (`has_count & 4`): each thread fetches its record
     // offset from the upload table bound to `count_buf`.
     [branch]
-    if ((has_count & 4u) != 0) {
+    if (active && (has_count & 4u) != 0) {
         src_at = count_buf.Load(count_offset + id.x * 4u);
     }
     uint dst_at = id.x * stride;
-    uint cost;
+    uint cost = 0;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
-    if (kind <= 1) {
+    if (active && kind <= 1) {
         // Draws: vertex or index count, then instances.
         uint count = min(src_args.Load(src_at), 1u << 24);
         uint instances = min(src_args.Load(src_at + 4), (1u << 26) / max(count, 1u));
         cost = count * instances;
+        if (count >= MOST_DRAW) {
+            count = 0;
+            instances = 0;
+            cost = 0;
+        }
         draw_counts = uint2(count, instances);
-    } else if (kind == 2) {
+    } else if (active && kind == 2) {
         uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
@@ -79,30 +89,50 @@ void main(uint3 id : SV_DispatchThreadID) {
         }
         cost = g.x * g.y * g.z * 64u;
         groups = g;
-    } else {
+    } else if (active) {
         // Mesh dispatches: the console's are one-dimensional.
         uint3 g = src_args.Load3(src_at);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128u;
         groups = g;
     }
-    bool over = false;
-    if (cost > 0) {
+    costs[gi] = cost;
+    GroupMemoryBarrierWithGroupSync();
+    uint first = id.x - gi;
+    uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
+    if (gi == 0 && n > 0) {
         uint before;
         budget.InterlockedOr(0, 0, before);
-        // Bounded retries: an unbounded loop of atomics is a GPU hang if
-        // contention never settles; a record that gives up runs empty.
         bool settled = false;
         [allow_uav_condition]
         for (uint tries = 0; tries < 256 && before < BUDGET; tries++) {
-            uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
+            uint next = before;
+            for (uint j = 0; j < n; j++) {
+                uint c = costs[j];
+                if (c > 0 && next < BUDGET) {
+                    next = (BUDGET - next <= c) ? BUDGET : (next + c);
+                }
+            }
+            if (next == before) { settled = true; break; }
             uint prev;
             budget.InterlockedCompareExchange(0, before, next, prev);
             if (prev == before) { settled = true; break; }
             before = prev;
         }
-        over = !settled || before >= BUDGET || BUDGET - before < cost;
+        uint at = before;
+        for (uint k = 0; k < n; k++) {
+            uint c = costs[k];
+            uint fit = 1;
+            if (c > 0) {
+                fit = (settled && at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
+                at = (at >= BUDGET || BUDGET - at <= c) ? BUDGET : (at + c);
+            }
+            fits[k] = fit;
+        }
     }
+    GroupMemoryBarrierWithGroupSync();
+    if (!active) return;
+    bool over = fits[gi] == 0;
     if (kind <= 1) {
         if (over) {
             draw_counts = uint2(0, 0);
@@ -1169,8 +1199,8 @@ void main() {
         let mut initial_src = vec![0u8; total_bytes];
         for i in 0..RECORDS as usize {
             let words: [u32; 6] = [
-                u32::MAX,                    // IndexCount -> clamps to 1 << 24
-                u32::MAX,                    // InstanceCount -> clamps to 4 (cost = 1 << 26)
+                1 << 22,                     // IndexCount (< MOST_DRAW)
+                u32::MAX,                    // InstanceCount -> clamps to 16 (cost = 1 << 26)
                 1000 + i as u32,             // StartIndexLocation
                 (-200i32 + i as i32) as u32, // BaseVertexLocation
                 5000 + i as u32,             // StartInstanceLocation
@@ -1239,7 +1269,7 @@ void main() {
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
-            if rec[0] == (1 << 24) && rec[1] == 4 {
+            if rec[0] == (1 << 22) && rec[1] == 16 {
                 kept += 1;
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
@@ -1419,5 +1449,71 @@ void main() {
             unsafe { std::slice::from_raw_parts(src_ptr.cast_const(), total) },
             &src[..]
         );
+    }
+
+    #[test]
+    fn warp_most_draw_empties_oversized_records_without_charging_budget() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_DRAW: u32 = 0;
+        const STRIDE: u32 = 16;
+        const RECORDS: u32 = 4;
+        let total = (STRIDE * RECORDS) as usize;
+        let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+        let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+        let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
+        let dst_buf = warp.default_uav(total as u64);
+
+        let inputs: [[u32; 4]; 4] = [
+            [1 << 23, 1, 0, 0],   // exactly MOST_DRAW -> zeroed
+            [u32::MAX, 2, 1, 1],  // >= MOST_DRAW -> zeroed
+            [1024, 3, 2, 4],      // small valid draw -> kept (cost = 3072)
+            [1 << 24, 1, 3, 5],   // >= MOST_DRAW -> zeroed
+        ];
+        // SAFETY: mapped buffers.
+        unsafe {
+            for (i, w) in inputs.iter().enumerate() {
+                for (k, val) in w.iter().enumerate() {
+                    (src_ptr as *mut u32).add(i * 4 + k).write(*val);
+                }
+            }
+            (budget_ptr as *mut u32).write_volatile(0);
+            std::ptr::write_bytes(readback_ptr, 0xCC, total);
+        }
+        assert!(record_clamp(
+            &warp.clamp,
+            &warp.list,
+            &dst_buf,
+            budget_gpu,
+            (&src_buf, 0),
+            None,
+            (KIND_DRAW, STRIDE, RECORDS),
+        ));
+        done_on(&warp.list, &dst_buf);
+        // SAFETY: open list.
+        unsafe {
+            warp.list.ResourceBarrier(&[transition(
+                &dst_buf,
+                D3D12_RESOURCE_STATE_COMMON,
+                D3D12_RESOURCE_STATE_COPY_SOURCE,
+            )]);
+            warp.list
+                .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
+        }
+        warp.submit_and_wait();
+
+        // SAFETY: finished work; mapped buffers.
+        let (spent, out) = unsafe {
+            (
+                (budget_ptr as *const u32).read_volatile(),
+                std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), 16).to_vec(),
+            )
+        };
+        assert_eq!(spent, 1024 * 3);
+        assert_eq!(&out[0..2], &[0, 0]);
+        assert_eq!(&out[4..6], &[0, 0]);
+        assert_eq!(&out[8..12], &[1024, 3, 2, 4]);
+        assert_eq!(&out[12..14], &[0, 0]);
     }
 }
