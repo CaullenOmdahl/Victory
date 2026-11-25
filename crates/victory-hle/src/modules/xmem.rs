@@ -1067,9 +1067,12 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    if n == 0 {
+        return address;
+    }
     let base = address as usize;
     let mut physical = physical();
-    if n > 0 && !pages.is_null() {
+    if !pages.is_null() {
         // SAFETY: the title passes `n` page numbers.
         let pages = unsafe { std::slice::from_raw_parts(pages, n) };
         if map_whole(&mut physical, base, pages) {
@@ -1106,8 +1109,9 @@ pub extern "system" fn XMemMapPhysicalPages(
     address
 }
 
-/// Reservations this long at most are shown whole.
-const WHOLE: usize = 1 << 30;
+/// Reservations in this size range are eligible to be mapped whole.
+const MIN_WHOLE_RESERVATION: usize = 4 * MIB;
+const MAX_WHOLE_RESERVATION: usize = 1 << 30;
 
 /// The host GPU uses a run of title memory in place only where one view
 /// shows all of it, and Grand Theft Auto VI maps its 185 MB GPU heap from
@@ -1138,11 +1142,11 @@ fn map_whole(physical: &mut Physical, base: usize, pages: &[usize]) -> bool {
             else {
                 return false;
             };
-            if len <= WHOLE {
-                tracing::debug!(at = format_args!("{at:#x}"), len, section = first.section.size, views = ?physical.views.range(..at + len).next_back().map(|(v, (n, _))| (*v, *n)), "whole?");
+            if !(MIN_WHOLE_RESERVATION..=MAX_WHOLE_RESERVATION).contains(&len) {
+                return false;
             }
-            if len > WHOLE
-                || len != first.section.size
+            tracing::debug!(at = format_args!("{at:#x}"), len, section = first.section.size, views = ?physical.views.range(..at + len).next_back().map(|(v, (n, _))| (*v, *n)), "whole?");
+            if len != first.section.size
                 || physical.views.range(..at + len).next_back().is_some_and(|(v, (n, _))| v + n > at)
                 || physical.whole.iter().any(|w| Arc::ptr_eq(&w.2, &first.section))
             {
@@ -1246,6 +1250,9 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// VI maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+    if len == 0 {
+        return true;
+    }
     let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
     if in_whole(&physical, to, len) {
