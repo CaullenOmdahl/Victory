@@ -11102,7 +11102,9 @@ impl<'a> Lower<'a> {
                 60
             };
             let mut cs = vec![fu; 4];
-            for (k, slot) in cs.iter_mut().enumerate().take(coords) {
+            // CalculateLOD takes only spatial coordinates, even on a texture array.
+            let coord_count = if op == 81 { spatial } else { coords };
+            for (k, slot) in cs.iter_mut().enumerate().take(coord_count) {
                 *slot = float(self, coord_at(k))?;
             }
             let face = cs[2];

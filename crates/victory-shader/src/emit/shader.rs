@@ -443,8 +443,38 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
+    /// Aligns unused components in packed pixel-shader input registers to the
+    /// interpolation mode used by active siblings in the same register.
+    fn align_packed_pixel_inputs(&mut self) {
+        if !self.pixel {
+            return;
+        }
+        // Reading a per-vertex value with attributeAtVertex needs a
+        // constant input, even when the source declaration was smooth.
+        // D3D requires all components packed into the same register to
+        // share a mode, including the ones the shader never reads.
+        for index in 0..self.inputs.len() {
+            let unused = &self.inputs[index];
+            if unused.kind != 0 || unused.usage != 0 || unused.row.is_none() {
+                continue;
+            }
+            let mut modes = self
+                .inputs
+                .iter()
+                .filter(|e| e.row == unused.row && e.usage != 0)
+                .map(|e| e.interp);
+            if let Some(mode) = modes.next()
+                && (mode == 1 || unused.comp == 9)
+                && modes.all(|other| other == mode)
+            {
+                self.inputs[index].interp = mode;
+            }
+        }
+    }
+
     /// The finished container.
     pub fn finish(mut self) -> Vec<u8> {
+        self.align_packed_pixel_inputs();
         let compute = self.threads.is_some() && self.mesh.is_none() && !self.rectangles;
         if !self.root_uavs.is_empty() && !self.pixel && !compute {
             self.flags |= flags::UAVS_EVERY_STAGE;
@@ -936,5 +966,44 @@ mod tests {
         assert_eq!(finish_with_root_uav(true, None, false, true) & 0x4, 0);
         assert_eq!(finish_with_root_uav(false, Some([64, 1, 1]), false, true) & 0x4, 0);
         assert_eq!(finish_with_root_uav(false, None, false, false) & 0x4, 0);
+    }
+
+    #[test]
+    fn unused_packed_input_matches_used_sibling_interp_mode() {
+        use super::super::container::SigElement;
+        let mut s = Shader::new(true);
+        s.inputs = vec![
+            SigElement {
+                name: "TEXCOORD".into(),
+                index: 0,
+                kind: 0,
+                comp: 9,
+                interp: 2, // linear originally
+                cols: 2,
+                row: Some(0),
+                col: 0,
+                usage: 0, // unused
+                half: false,
+            },
+            SigElement {
+                name: "NORMAL".into(),
+                index: 0,
+                kind: 0,
+                comp: 9,
+                interp: 1, // constant for attributeAtVertex
+                cols: 2,
+                row: Some(0),
+                col: 2,
+                usage: 3, // used
+                half: false,
+            },
+        ];
+        let b = s.entry;
+        s.m.terminate(b, Term::Ret);
+        s.align_packed_pixel_inputs();
+        assert_eq!(s.inputs[0].interp, 1);
+        assert_eq!(s.inputs[1].interp, 1);
+        let dxil = s.finish();
+        assert!(!dxil.is_empty());
     }
 }

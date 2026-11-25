@@ -319,7 +319,7 @@ impl Staging {
         {
             return (0, false);
         }
-        if !committed(self.memory, size) {
+        if !any_mapped(self.memory, size) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
                 memory = ?self.memory,
@@ -582,6 +582,48 @@ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
         p = info.BaseAddress as usize + info.RegionSize;
     }
     true
+}
+
+/// Whether any byte of `[at, at + len)` is committed readable memory
+/// (partially-streamed sparse textures may have only lower or interior mips
+/// mapped while higher mips are still streaming).
+fn any_mapped(at: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
+    };
+    if len == 0 {
+        return false;
+    }
+    let start = at as usize;
+    let end = start.saturating_add(len);
+    if crate::shadow::in_place(start as u64, end as u64) {
+        return true;
+    }
+    if !cfg!(test) {
+        let mut byte = [0u8; 1];
+        if crate::host::read_into(at, &mut byte) {
+            return true;
+        }
+    }
+    let mut p = start;
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 || info.RegionSize == 0 {
+            return false;
+        }
+        if info.State == MEM_COMMIT && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 {
+            return true;
+        }
+        let next = (info.BaseAddress as usize).saturating_add(info.RegionSize);
+        if next <= p {
+            return false;
+        }
+        p = next;
+    }
+    false
 }
 
 /// The staging state of a title texture, made on first use.
@@ -1063,6 +1105,27 @@ mod tests {
             "host-written textures must not queue CPU-to-GPU uploads"
         );
         forget(fake_resource as usize);
+    }
+
+    #[test]
+    fn a_texture_with_only_interior_pages_is_detected_by_any_mapped() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE,
+            VirtualAlloc, VirtualFree,
+        };
+        const BLOCK: usize = 64 << 10;
+        // SAFETY: private reservation owned exclusively by this test.
+        unsafe {
+            let base = VirtualAlloc(std::ptr::null(), 5 * BLOCK, MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
+            assert!(!base.is_null());
+            let middle = base.add(2 * BLOCK);
+            assert_eq!(VirtualAlloc(middle.cast(), BLOCK, MEM_COMMIT, PAGE_READWRITE), middle.cast());
+            assert!(super::any_mapped(base, 5 * BLOCK));
+            assert!(!super::any_mapped(base, 2 * BLOCK));
+            assert_ne!(VirtualFree(middle.cast(), BLOCK, MEM_DECOMMIT), 0);
+            assert!(!super::any_mapped(base, 5 * BLOCK));
+            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
+        }
     }
 }
 
