@@ -1563,7 +1563,7 @@ impl Host {
             for rb in &list.deferred().readbacks {
                 let written = if rb.dst_pitch == rb.row_bytes && rb.src_pitch == rb.row_bytes {
                     let bytes = rb.row_bytes * rb.lines;
-                    crate::watch::writing(rb.dst, bytes);
+                    crate::watch::open_for_sync_write(rb.dst, bytes);
                     write_mapped(rb.dst as *mut u8, rb.src as *const u8, bytes);
                     bytes
                 } else {
@@ -1571,7 +1571,7 @@ impl Host {
                     for line in 0..rb.lines {
                         let to = rb.dst + line * rb.dst_pitch;
                         let from = rb.src + line * rb.src_pitch;
-                        crate::watch::writing(to, rb.row_bytes);
+                        crate::watch::open_for_sync_write(to, rb.row_bytes);
                         write_mapped(to as *mut u8, from as *const u8, rb.row_bytes);
                         n += rb.row_bytes;
                     }
@@ -3032,8 +3032,8 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         return;
     }
     if title_dst {
-        // The kernel writes the destination: it must not be guarded.
-        crate::watch::writing(dst as usize, len);
+        // Our synchronous copy writes the destination: open any guarded blocks without pinning.
+        crate::watch::open_for_sync_write(dst as usize, len);
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();

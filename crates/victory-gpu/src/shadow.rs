@@ -345,7 +345,7 @@ impl Shadow {
                 if let Some((dirty_start, dirty_end)) = dirty_span {
                     let dirty_len = dirty_end - dirty_start;
                     if mode != 1 {
-                        crate::watch::writing(title_addr + dirty_start, dirty_len);
+                        crate::watch::open_for_sync_write(title_addr + dirty_start, dirty_len);
                     }
                     crate::host::write_mapped(
                         (title_addr + dirty_start) as *mut u8,
@@ -600,7 +600,7 @@ impl Shadow {
                         {
                             let dirty_len = dirty_end - dirty_start;
                             if mode != 1 {
-                                crate::watch::writing(start + at + dirty_start, dirty_len);
+                                crate::watch::open_for_sync_write(start + at + dirty_start, dirty_len);
                             }
                             crate::host::write_mapped(
                                 (start + at + dirty_start) as *mut u8,
@@ -1113,14 +1113,26 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
         return None;
     }
     let device = DEVICE.get_or_init(|| {
-        // Diagnostics: copies, as without this.
-        let on = std::env::var_os("VICTORY_COPY_MEMORY").is_none();
+        // Under Wine/Proton, vkd3d-proton's host-memory import can accept
+        // OpenExistingHeapFromAddress1 while the GPU reads zeroes; default to
+        // copies there unless VICTORY_IN_PLACE=1 opts back in.
+        let on_wine = {
+            use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+            // SAFETY: querying ntdll for Wine's version export.
+            unsafe {
+                let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+                !ntdll.is_null()
+                    && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
+            }
+        };
+        let on = std::env::var_os("VICTORY_COPY_MEMORY").is_none()
+            && (!on_wine || std::env::var_os("VICTORY_IN_PLACE").is_some());
         let device: Option<ID3D12Device13> = if on {
             host().and_then(|h| h.device.cast().ok())
         } else {
             None
         };
-        tracing::info!(on = device.is_some(), "title memory used in place by the host GPU");
+        tracing::info!(on = device.is_some(), on_wine, "title memory used in place by the host GPU");
         device
     });
     let device = device.as_ref()?;
@@ -1822,32 +1834,61 @@ pub(crate) fn declare(list: &HostList, address: u64, len: u64) {
     root.refresh(list, address, end - address);
 }
 
-/// Maps tiles of a sparse buffer (`first`, then each the next) to heaps.
+/// Maps tiles of a sparse buffer (`first`, then each the next) to heaps,
+/// batched per heap with contiguous runs coalesced.
 fn map_tiles(buffer: &ID3D12Resource, tiles: &[(u32, Tile)]) {
     use windows::Win32::Graphics::Direct3D12::*;
+    if tiles.is_empty() {
+        return;
+    }
     let Some(host) = host() else { return };
-    let pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> =
+        std::collections::BTreeMap::new();
     for &(at, tile) in tiles {
-        let coordinate = D3D12_TILED_RESOURCE_COORDINATE {
-            X: at,
-            ..Default::default()
-        };
-        let region = D3D12_TILE_REGION_SIZE {
-            NumTiles: 1,
-            ..Default::default()
-        };
-        // SAFETY: a live sparse buffer and heap, tiles inside both.
+        by_heap.entry(tile.heap).or_default().push((at, tile.offset));
+    }
+    let pool = TILES.lock().unwrap_or_else(|e| e.into_inner());
+    for (heap_idx, mut list) in by_heap {
+        list.sort_unstable();
+        let mut coords = Vec::with_capacity(list.len());
+        let mut regions = Vec::with_capacity(list.len());
+        let mut flags = Vec::with_capacity(list.len());
+        let mut offsets = Vec::with_capacity(list.len());
+        let mut counts = Vec::with_capacity(list.len());
+        let mut i = 0;
+        while i < list.len() {
+            let (at0, off0) = list[i];
+            let mut run = 1u32;
+            while i + (run as usize) < list.len()
+                && list[i + (run as usize)] == (at0 + run, off0 + run)
+            {
+                run += 1;
+            }
+            coords.push(D3D12_TILED_RESOURCE_COORDINATE {
+                X: at0,
+                ..Default::default()
+            });
+            regions.push(D3D12_TILE_REGION_SIZE {
+                NumTiles: run,
+                ..Default::default()
+            });
+            flags.push(D3D12_TILE_RANGE_FLAG_NONE);
+            offsets.push(off0);
+            counts.push(run);
+            i += run as usize;
+        }
+        // SAFETY: a live sparse buffer and heap, coalesced tile runs inside both.
         unsafe {
             host.queue().UpdateTileMappings(
                 buffer,
-                1,
-                Some(&coordinate),
-                Some(&region),
-                &pool.heaps[tile.heap].0,
-                1,
-                Some(&D3D12_TILE_RANGE_FLAG_NONE),
-                Some(&tile.offset),
-                Some(&1),
+                coords.len() as u32,
+                Some(coords.as_ptr()),
+                Some(regions.as_ptr()),
+                &pool.heaps[heap_idx].0,
+                counts.len() as u32,
+                Some(flags.as_ptr()),
+                Some(offsets.as_ptr()),
+                Some(counts.as_ptr()),
                 D3D12_TILE_MAPPING_FLAG_NONE,
             );
         }
@@ -1989,7 +2030,7 @@ impl Shadow {
         // (tile, the start of its view) of tiles without a snapshot yet.
         let new: Vec<(u32, usize)> = views
             .iter()
-            .map(|&(at, data, _)| (((at - start) / PAGE) as u32, data & !(PAGE - 1)))
+            .map(|&(at, data, _)| (((at - start) / PAGE) as u32, data - at % PAGE))
             .filter(|(tile, _)| !before.contains_key(tile))
             .collect();
         if new.is_empty() {
@@ -2053,7 +2094,7 @@ impl Shadow {
                 }
                 if let Some((dirty_start, dirty_end)) = merge_gpu_writes_mut(&mut buf[..n], host, old) {
                     let dirty_len = dirty_end - dirty_start;
-                    crate::watch::writing(at + dirty_start, dirty_len);
+                    crate::watch::open_for_sync_write(at + dirty_start, dirty_len);
                     crate::host::write_mapped(
                         (at + dirty_start) as *mut u8,
                         buf[dirty_start..].as_ptr(),

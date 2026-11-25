@@ -39,8 +39,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// While a span's region epoch stays unchanged, any range already guarded and
 /// copied at that epoch cannot have been modified by the title — and
 /// `copy_back` on one buffer no longer invalidates clean spans in other regions.
-const REGION_SHIFT: usize = 26; // 64 MiB per bucket
-const REGION_BUCKETS: usize = 1024;
+const REGION_SHIFT: usize = 20; // 1 MiB per bucket
+const REGION_BUCKETS: usize = 16384;
 static REGION_EPOCHS: [AtomicU64; REGION_BUCKETS] =
     [const { AtomicU64::new(1) }; REGION_BUCKETS];
 
@@ -208,6 +208,12 @@ struct Guards {
     /// Unmapped blocks (`VirtualProtect` failed) within guarded ranges;
     /// cleared by [`title_memory_remapped`] when the runtime maps them.
     holes: BTreeSet<usize>,
+    /// Disjoint `[lo, hi)` block intervals already probed and covered by
+    /// guards; cleared on remap by [`title_memory_remapped`].
+    covered: BTreeMap<usize, usize>,
+    /// Blocks in `covered` (or opened/pinned/aliased) that are not clean
+    /// and not holes, so the fast path touches only dirty blocks.
+    dirty: BTreeSet<usize>,
     /// Blocks whose page was guarded together with its other views (those
     /// views' blocks are in it too): a write to one opens them all.
     aliased: BTreeSet<usize>,
@@ -223,6 +229,8 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     protected: BTreeSet::new(),
     clean: BTreeSet::new(),
     holes: BTreeSet::new(),
+    covered: BTreeMap::new(),
+    dirty: BTreeSet::new(),
     aliased: BTreeSet::new(),
     pins: Vec::new(),
 });
@@ -234,6 +242,84 @@ impl Guards {
     /// Whether `block` is left writable for a kernel write.
     fn pinned(&self, block: usize) -> bool {
         self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
+    }
+
+    /// Whether every block in `[first, last)` is already inside a covered interval.
+    fn is_covered(&self, first: usize, last: usize) -> bool {
+        if first >= last {
+            return true;
+        }
+        self.covered
+            .range(..=first)
+            .next_back()
+            .is_some_and(|(_, &hi)| hi >= last)
+    }
+
+    /// Records `[first, last)` in `covered`, coalescing overlapping or adjacent intervals.
+    fn mark_covered(&mut self, first: usize, last: usize) {
+        use std::ops::Bound::{Excluded, Included};
+        if first >= last {
+            return;
+        }
+        let mut lo = first;
+        let mut hi = last;
+        let mut to_remove = Vec::new();
+        if let Some((&k, &v)) = self.covered.range(..=first).next_back()
+            && v >= first
+        {
+            lo = k;
+            hi = hi.max(v);
+            to_remove.push(k);
+        }
+        for (&k, &v) in self.covered.range((Excluded(first), Included(last))) {
+            hi = hi.max(v);
+            to_remove.push(k);
+        }
+        for k in to_remove {
+            self.covered.remove(&k);
+        }
+        self.covered.insert(lo, hi);
+    }
+
+    /// Subtracts `[first, last)` from `covered` and clears `dirty` entries in that span.
+    fn uncover(&mut self, first: usize, last: usize) -> bool {
+        if first >= last {
+            return false;
+        }
+        let mut removed = false;
+        let dirty: Vec<usize> = self.dirty.range(first..last).copied().collect();
+        if !dirty.is_empty() {
+            removed = true;
+            for b in dirty {
+                self.dirty.remove(&b);
+            }
+        }
+        let mut to_remove = Vec::new();
+        let mut to_insert = Vec::new();
+        if let Some((&k, &v)) = self.covered.range(..first).next_back()
+            && v > first
+        {
+            removed = true;
+            to_remove.push(k);
+            to_insert.push((k, first));
+            if v > last {
+                to_insert.push((last, v));
+            }
+        }
+        for (&k, &v) in self.covered.range(first..last) {
+            removed = true;
+            to_remove.push(k);
+            if v > last {
+                to_insert.push((last, v));
+            }
+        }
+        for k in to_remove {
+            self.covered.remove(&k);
+        }
+        for (k, v) in to_insert {
+            self.covered.insert(k, v);
+        }
+        removed
     }
 }
 
@@ -355,27 +441,50 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
-    // Fast path: if we already guard or recorded a hole at `first`, we already
-    // know this is a mapped view and can skip `QueryVirtualMemoryInformation`.
+    // Fast path: if [first, last) is already covered by prior guards, walk only
+    // the dirty/pinned/re-opened blocks in `g.dirty` (O(log N + k)).
     {
         let mut g = guards();
-        if g.protected.contains(&first) || g.holes.contains(&first) {
+        if g.is_covered(first, last) {
+            if !g.pins.is_empty() {
+                let now = std::time::Instant::now();
+                g.pins.retain(|&(_, _, until)| until > now);
+            }
+            let dirty: Vec<usize> = g.dirty.range(first..last).copied().collect();
+            if dirty.is_empty() {
+                return Some(Vec::new());
+            }
             let mut written = Vec::new();
-            let mut run: Option<usize> = None;
-            for block in first..=last {
-                let open = block < last && !g.clean.contains(&block) && !g.holes.contains(&block);
-                if open {
-                    if g.protected.contains(&block) {
-                        g.clean.insert(block);
-                        written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
-                    } else {
-                        run.get_or_insert(block);
-                        continue;
+            let mut run: Option<(usize, usize)> = None;
+            for block in dirty {
+                if !g.pins.is_empty() && g.pinned(block) {
+                    if let Some((r_from, r_to)) = run.take() {
+                        protect(&mut g, r_from, r_to, &mut written);
+                    }
+                    written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                    bump_region_epochs(block * BLOCK, (block + 1) * BLOCK);
+                } else if g.holes.contains(&block) || g.clean.contains(&block) {
+                    g.dirty.remove(&block);
+                } else if g.protected.contains(&block) {
+                    if let Some((r_from, r_to)) = run.take() {
+                        protect(&mut g, r_from, r_to, &mut written);
+                    }
+                    g.clean.insert(block);
+                    g.dirty.remove(&block);
+                    written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                } else {
+                    match run {
+                        Some((r_from, r_to)) if r_to == block => run = Some((r_from, block + 1)),
+                        Some((r_from, r_to)) => {
+                            protect(&mut g, r_from, r_to, &mut written);
+                            run = Some((block, block + 1));
+                        }
+                        None => run = Some((block, block + 1)),
                     }
                 }
-                if let Some(from) = run.take() {
-                    protect(&mut g, from, block, &mut written);
-                }
+            }
+            if let Some((r_from, r_to)) = run {
+                protect(&mut g, r_from, r_to, &mut written);
             }
             return Some(written);
         }
@@ -398,20 +507,27 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
     for block in first..=last {
-        let open = block < last
-            && !g.clean.contains(&block)
-            && !g.holes.contains(&block)
-            && (!check_each || mapped(block * BLOCK));
+        if block < last && check_each && !mapped(block * BLOCK) {
+            if let Some(from) = run.take() {
+                protect(&mut g, from, block, &mut written);
+            }
+            g.holes.insert(block);
+            g.dirty.remove(&block);
+            continue;
+        }
+        let open = block < last && !g.clean.contains(&block) && !g.holes.contains(&block);
         if open {
-            if g.pinned(block) {
+            if !g.pins.is_empty() && g.pinned(block) {
                 // The kernel may be writing it: left writable, reported
                 // written at every check until the pin ends.
+                g.dirty.insert(block);
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
                 // No range holding it is clean meanwhile (`region_epoch`).
                 bump_region_epochs(block * BLOCK, (block + 1) * BLOCK);
             } else if g.protected.contains(&block) {
                 // Written through the runtime, still read-only.
                 g.clean.insert(block);
+                g.dirty.remove(&block);
                 written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
             } else {
                 run.get_or_insert(block);
@@ -422,6 +538,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             protect(&mut g, from, block, &mut written);
         }
     }
+    g.mark_covered(first, last);
     Some(written)
 }
 
@@ -516,8 +633,11 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
         }
     };
     let note = |g: &mut Guards, written: &mut Vec<usize>, from: usize, to: usize| {
-        g.protected.extend(from..to);
-        g.clean.extend(from..to);
+        for block in from..to {
+            g.protected.insert(block);
+            g.clean.insert(block);
+            g.dirty.remove(&block);
+        }
         written.extend(from * BLOCK / PAGE..to * BLOCK / PAGE);
     };
     if set(from, to) {
@@ -528,6 +648,7 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
                 note(g, written, block, block + 1);
             } else {
                 g.holes.insert(block);
+                g.dirty.remove(&block);
             }
         }
     }
@@ -557,6 +678,7 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
                 // SAFETY: title view memory; only its protection changes.
                 if unsafe { VirtualProtect(at as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
                     g.protected.insert(alias);
+                    g.dirty.insert(alias);
                 }
             }
         }
@@ -598,6 +720,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     for &block in &blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
+        g.dirty.insert(block);
     }
     // Runs of blocks next to each other in one call (fewer kernel
     // transitions and TLB shootdowns). One call cannot span two views: the
@@ -643,9 +766,16 @@ pub fn writing(at: usize, len: usize) {
     }
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
     let mut g = guards();
+    if !g.pins.is_empty() {
+        let now = std::time::Instant::now();
+        g.pins.retain(|&(_, _, until)| until > now);
+    }
     let until = std::time::Instant::now() + PIN;
     g.pins.push((first, last, until));
     open(&mut g, at, at + len);
+    for block in first..last {
+        g.dirty.insert(block);
+    }
     if !view_guard() {
         return;
     }
@@ -657,11 +787,28 @@ pub fn writing(at: usize, len: usize) {
             continue;
         }
         for alias in shown {
-            if alias / BLOCK != block {
-                g.pins.push((alias / BLOCK, alias / BLOCK + 1, until));
+            let ab = alias / BLOCK;
+            if ab != block {
+                g.pins.push((ab, ab + 1, until));
                 open_here(&mut g, alias, alias + BLOCK);
+                g.dirty.insert(ab);
             }
         }
+    }
+}
+
+/// Before our own synchronous write into title memory `[at, at + len)`:
+/// opens any guarded blocks (and their guarded aliases) without leaving a
+/// multi-second async-I/O pin behind, since the write finishes before the
+/// caller returns.
+pub(crate) fn open_for_sync_write(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
+    let mut g = guards();
+    if g.protected.range(first..last).next().is_some() {
+        open(&mut g, at, at + len);
     }
 }
 
@@ -675,17 +822,19 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     let end = at.saturating_add(len);
     {
         let mut g = guards();
+        let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
         let blocks: Vec<usize> = g
             .protected
-            .range(at / BLOCK..end.div_ceil(BLOCK))
+            .range(first..last)
             .copied()
             .collect();
         let holes: Vec<usize> = g
             .holes
-            .range(at / BLOCK..end.div_ceil(BLOCK))
+            .range(first..last)
             .copied()
             .collect();
-        let changed = !holes.is_empty() || !blocks.is_empty();
+        let uncovered = g.uncover(first, last);
+        let changed = uncovered || !holes.is_empty() || !blocks.is_empty();
         for block in holes {
             g.holes.remove(&block);
         }
@@ -1058,5 +1207,28 @@ mod tests {
         // SAFETY: our view.
         unsafe { UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }) };
         title_memory_remapped(view, 2 * BLOCK);
+    }
+
+    /// `open_for_sync_write` opens guarded blocks without pinning them: the
+    /// next `guard` check reports only the opened block and immediately
+    /// re-protects it so the check after that sees nothing changed.
+    #[test]
+    fn sync_write_opens_without_two_second_pin() {
+        let (guarded, other) = two_views();
+        let pages = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
+        assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(vec![pages(guarded, 0), pages(guarded, 1)]));
+        assert_eq!(guard(other, other + 2 * BLOCK), Some(vec![pages(other, 0), pages(other, 1)]));
+        assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(other, other + 2 * BLOCK), Some(Vec::new()));
+
+        open_for_sync_write(guarded + BLOCK, 64);
+        // SAFETY: synchronous write into block 1 now succeeds without taking a VEH fault.
+        unsafe { ((guarded + BLOCK + 16) as *mut u8).write(42) };
+        assert_eq!(guard(other, other + 2 * BLOCK), Some(vec![pages(other, 1)]));
+        assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(vec![pages(guarded, 1)]));
+        // Without a 2-second pin, block 1 is guarded and clean immediately again.
+        assert_eq!(guard(guarded, guarded + 2 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(other, other + 2 * BLOCK), Some(Vec::new()));
+        drop_views(&[guarded, other]);
     }
 }
