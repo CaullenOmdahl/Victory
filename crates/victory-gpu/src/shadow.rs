@@ -1110,6 +1110,13 @@ fn run_of(from: u64, to: u64) -> Option<(u64, u64)> {
     {
         return None;
     }
+    if !cfg!(test)
+        && on_wine()
+        && end - start < 64 << 20
+        && std::env::var_os("VICTORY_IN_PLACE_SMALL").is_none()
+    {
+        return None;
+    }
     (start <= from && end >= to).then_some((start, end))
 }
 
@@ -1134,7 +1141,12 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     let device = DEVICE.get_or_init(|| {
         let on_wine = on_wine();
-        let on = std::env::var_os("VICTORY_COPY_MEMORY").is_none();
+        // On discrete GPUs under Wine/Proton (`vkd3d-proton` + RADV),
+        // `OpenExistingHeapFromAddress1` backs GPU reads with host RAM over PCIe,
+        // slowing GPU execution ~15-20x (~8-12 s vs ~0.36 s). Keep disabled by
+        // default unless `VICTORY_IN_PLACE_WINE=1` is set.
+        let wine_allowed = !on_wine || std::env::var_os("VICTORY_IN_PLACE_WINE").is_some();
+        let on = wine_allowed && std::env::var_os("VICTORY_COPY_MEMORY").is_none();
         let device: Option<ID3D12Device13> = if on {
             host().and_then(|h| h.device.cast().ok())
         } else {

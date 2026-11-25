@@ -285,6 +285,23 @@ pub extern "system" fn TerminateProcess(process: *mut c_void, code: u32) -> i32 
     host::terminate_process(process, code)
 }
 
+/// Forwards `VirtualFree` and notifies GPU tracking before title memory is
+/// freed or decommitted so stale in-place heaps or placed textures cannot fault.
+pub extern "system" fn VirtualFree(address: *mut c_void, size: usize, free_type: u32) -> i32 {
+    host::virtual_free(address, size, free_type)
+}
+
+/// Forwards `VirtualProtect` and notifies GPU tracking before title memory loses
+/// read/write accessibility.
+pub extern "system" fn VirtualProtect(
+    address: *const c_void,
+    size: usize,
+    new_protect: u32,
+    old_protect: *mut u32,
+) -> i32 {
+    host::virtual_protect(address, size, new_protect, old_protect)
+}
+
 /// The pseudo handle of one of our modules: its address, never a real image.
 fn handle(m: &HleModule) -> *mut c_void {
     m as *const HleModule as *mut c_void
@@ -359,6 +376,7 @@ pub(crate) fn module() -> HleModule {
             "kernel32.dll",
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
+            "api-ms-win-core-memory-*",
             "api-ms-win-core-processthreads-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
@@ -384,6 +402,8 @@ pub(crate) fn module() -> HleModule {
             hle_export!(_invalid_parameter_noinfo_noreturn),
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
+            hle_export!(VirtualFree),
+            hle_export!(VirtualProtect),
         ],
     }
 }
@@ -488,6 +508,52 @@ mod host {
         unsafe { TerminateProcess(process, code) }
     }
 
+    pub(super) fn virtual_free(address: *mut c_void, size: usize, free_type: u32) -> i32 {
+        use windows_sys::Win32::System::Memory::{
+            MEM_DECOMMIT, MEM_RELEASE, MEMORY_BASIC_INFORMATION, VirtualFree, VirtualQuery,
+        };
+        let addr = address as usize;
+        if addr != 0 && (addr >> 40) == 0 && (free_type & (MEM_DECOMMIT | MEM_RELEASE)) != 0 {
+            let mut span = size;
+            if span == 0 {
+                // SAFETY: querying our own virtual address space into a local struct.
+                let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+                // SAFETY: valid local buffer.
+                if unsafe { VirtualQuery(address, &mut info, size_of_val(&info)) }
+                    == size_of_val(&info)
+                {
+                    span = info.RegionSize;
+                }
+            }
+            if span != 0 {
+                victory_gpu::title_memory_remapped(addr, span);
+            }
+        }
+        // SAFETY: see above.
+        unsafe { VirtualFree(address, size, free_type) }
+    }
+
+    pub(super) fn virtual_protect(
+        address: *const c_void,
+        size: usize,
+        new_protect: u32,
+        old_protect: *mut u32,
+    ) -> i32 {
+        use windows_sys::Win32::System::Memory::{
+            PAGE_GUARD, PAGE_NOACCESS, VirtualProtect,
+        };
+        let addr = address as usize;
+        if addr != 0
+            && size != 0
+            && (addr >> 40) == 0
+            && ((new_protect & 0xff) == PAGE_NOACCESS || (new_protect & PAGE_GUARD) != 0)
+        {
+            victory_gpu::title_memory_remapped(addr, size);
+        }
+        // SAFETY: see above.
+        unsafe { VirtualProtect(address, size, new_protect, old_protect) }
+    }
+
     pub(super) fn set_unhandled_exception_filter(filter: extern "system" fn(*const c_void) -> i32) {
         // SAFETY: our filter takes the exception pointers as an opaque pointer.
         unsafe {
@@ -581,6 +647,19 @@ mod host {
 
     pub(super) fn terminate_process(_: *mut c_void, code: u32) -> i32 {
         std::process::exit(code as i32)
+    }
+
+    pub(super) fn virtual_free(_: *mut c_void, _: usize, _: u32) -> i32 {
+        0
+    }
+
+    pub(super) fn virtual_protect(
+        _: *const c_void,
+        _: usize,
+        _: u32,
+        _: *mut u32,
+    ) -> i32 {
+        0
     }
 
     pub(super) fn set_unhandled_exception_filter(_: extern "system" fn(*const c_void) -> i32) {}
