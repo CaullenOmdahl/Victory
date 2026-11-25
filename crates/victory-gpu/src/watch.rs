@@ -33,24 +33,36 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Per-64-MiB-region epoch table. Incremented for only the region(s) touched
-/// whenever a guarded block is opened (VEH guard fault or `writing`),
-/// remapped (`title_memory_remapped`), or rewritten (`title_memory_written`).
-/// While a span's region epoch stays unchanged, any range already guarded and
-/// copied at that epoch cannot have been modified by the title — and
-/// `copy_back` on one buffer no longer invalidates clean spans in other regions.
-const REGION_SHIFT: usize = 20; // 1 MiB per bucket
-const REGION_BUCKETS: usize = 16384;
+/// Per-block (64 KiB) epoch table (or `VICTORY_EPOCH_SHIFT=26` for 64 MiB).
+/// Incremented for only the block(s) touched whenever a guarded block is
+/// opened (VEH guard fault or `writing`), remapped (`title_memory_remapped`),
+/// or rewritten (`title_memory_written`). While a span's region epoch stays
+/// unchanged, any range already guarded and copied at that epoch cannot have
+/// been modified by the title — and `copy_back` on one buffer no longer
+/// invalidates clean spans in other blocks.
+const REGION_BUCKETS: usize = 1 << 20; // 64 GiB of 64 KiB blocks before two share a bucket
 static REGION_EPOCHS: [AtomicU64; REGION_BUCKETS] =
     [const { AtomicU64::new(1) }; REGION_BUCKETS];
+
+#[inline]
+fn region_shift() -> usize {
+    static SHIFT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SHIFT.get_or_init(|| {
+        std::env::var("VICTORY_EPOCH_SHIFT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(16, |s| s.clamp(16, 30))
+    })
+}
 
 #[inline]
 fn bump_region_epochs(start: usize, end: usize) {
     if start >= end {
         return;
     }
-    let first = start >> REGION_SHIFT;
-    let last = (end - 1) >> REGION_SHIFT;
+    let shift = region_shift();
+    let first = start >> shift;
+    let last = (end - 1) >> shift;
     let count = last - first + 1;
     if count >= REGION_BUCKETS {
         for slot in &REGION_EPOCHS {
@@ -68,8 +80,9 @@ pub(crate) fn region_epoch(start: usize, end: usize) -> u64 {
     if start >= end {
         return 0;
     }
-    let first = start >> REGION_SHIFT;
-    let last = (end - 1) >> REGION_SHIFT;
+    let shift = region_shift();
+    let first = start >> shift;
+    let last = (end - 1) >> shift;
     let count = last - first + 1;
     let mut hash = 0u64;
     if count >= REGION_BUCKETS {
@@ -293,6 +306,32 @@ impl Guards {
     /// Whether `block` is left writable for a kernel write.
     fn pinned(&self, block: usize) -> bool {
         self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
+    }
+
+    /// Removes block range `[from, to)` from active pins, splitting any pin
+    /// that extends past it so neighboring blocks stay pinned. Returns
+    /// whether any pin overlapped `[from, to)`.
+    fn drop_pins(&mut self, from: usize, to: usize) -> bool {
+        if self.pins.is_empty() || from >= to {
+            return false;
+        }
+        let mut changed = false;
+        let mut kept = Vec::with_capacity(self.pins.len());
+        for (p_from, p_to, until) in self.pins.drain(..) {
+            if p_to <= from || p_from >= to {
+                kept.push((p_from, p_to, until));
+            } else {
+                changed = true;
+                if p_from < from {
+                    kept.push((p_from, from, until));
+                }
+                if p_to > to {
+                    kept.push((to, p_to, until));
+                }
+            }
+        }
+        self.pins = kept;
+        changed
     }
 
     /// Whether every block in `[first, last)` is already inside a covered interval.
@@ -911,7 +950,8 @@ pub fn title_memory_remapped(at: usize, len: usize) {
             .copied()
             .collect();
         let uncovered = g.uncover(first, last);
-        let changed = uncovered || !holes.is_empty() || !blocks.is_empty();
+        let dropped_pins = g.drop_pins(first, last);
+        let changed = uncovered || !holes.is_empty() || !blocks.is_empty() || dropped_pins;
         for block in holes {
             g.holes.remove(&block);
         }
@@ -935,7 +975,7 @@ pub fn title_memory_remapped(at: usize, len: usize) {
                 )
             };
         }
-        let aliased: Vec<usize> = g.aliased.range(at / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+        let aliased: Vec<usize> = g.aliased.range(first..last).copied().collect();
         for block in aliased {
             g.aliased.remove(&block);
         }
@@ -1169,6 +1209,124 @@ mod tests {
             )
         };
         drop_views(&[guarded]);
+    }
+
+    /// A write changes the epoch of the ranges that hold its block and of no
+    /// other: the block beside it stays known clean.
+    #[test]
+    fn a_write_changes_the_epoch_of_its_block_alone() {
+        let (one, two) = two_views();
+        assert!(guard(one, one + 2 * BLOCK).is_some());
+        let first = region_epoch(one, one + BLOCK);
+        let second = region_epoch(one + BLOCK, one + 2 * BLOCK);
+        let both = region_epoch(one, one + 2 * BLOCK);
+        let part = region_epoch(one + BLOCK + 4096, one + BLOCK + 8192);
+        // SAFETY: the view's second block; the handler opens it on the fault.
+        unsafe { ((one + BLOCK + 8) as *mut u8).write(3) };
+        assert_eq!(region_epoch(one, one + BLOCK), first, "the block beside it");
+        assert_ne!(region_epoch(one + BLOCK, one + 2 * BLOCK), second);
+        assert_ne!(region_epoch(one, one + 2 * BLOCK), both);
+        assert_ne!(region_epoch(one + BLOCK + 4096, one + BLOCK + 8192), part);
+        drop_views(&[one, two]);
+    }
+
+    /// `Guards::drop_pins` removes only the remapped blocks from active pins,
+    /// splitting partially overlapping pins and leaving disjoint ones intact.
+    #[test]
+    fn remapping_drops_overlapping_pins_and_keeps_adjacent_ones() {
+        let until = std::time::Instant::now() + PIN;
+        let mut g = Guards {
+            protected: BTreeSet::new(),
+            clean: BTreeSet::new(),
+            holes: BTreeSet::new(),
+            covered: BTreeMap::new(),
+            dirty: BTreeSet::new(),
+            aliased: BTreeSet::new(),
+            pins: vec![
+                (10, 12, until),
+                (14, 18, until),
+                (17, 19, until),
+                (19, 23, until),
+                (15, 22, until),
+                (25, 27, until),
+            ],
+        };
+        assert!(!g.drop_pins(30, 32));
+        assert!(g.drop_pins(16, 20));
+        assert_eq!(
+            g.pins,
+            vec![
+                (10, 12, until),
+                (14, 16, until),
+                (20, 23, until),
+                (15, 16, until),
+                (20, 22, until),
+                (25, 27, until),
+            ]
+        );
+        for b in 16..20 {
+            assert!(!g.pinned(b), "remapped block {b} must not stay pinned");
+        }
+        assert!(g.pinned(15));
+        assert!(g.pinned(20));
+    }
+
+    /// Unmapping and remapping a view clears any `writing()` pin on its blocks,
+    /// so a later view mapped at the same address is guarded cleanly instead
+    /// of inheriting the stale pin.
+    #[test]
+    fn remapped_view_does_not_inherit_pins_from_earlier_writing() {
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile,
+        };
+        // SAFETY: a pagefile section of two blocks, mapped read-write.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            (section, view)
+        };
+        assert_ne!(view, 0);
+        assert!(guard(view, view + 2 * BLOCK).is_some());
+        writing(view + 100, 13);
+        assert!(guards_read().pinned(view / BLOCK));
+
+        // SAFETY: our view.
+        unsafe {
+            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view as *mut _,
+            });
+        }
+        title_memory_remapped(view, 2 * BLOCK);
+        assert!(
+            !guards_read().pinned(view / BLOCK),
+            "pin must not outlive title_memory_remapped"
+        );
+
+        // SAFETY: same live pagefile section, mapped read-write.
+        let view2 = unsafe { MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize };
+        assert_ne!(view2, 0);
+        assert_eq!(
+            guard(view2, view2 + 2 * BLOCK),
+            Some((view2 / PAGE..(view2 + 2 * BLOCK) / PAGE).collect())
+        );
+        assert_eq!(guard(view2, view2 + 2 * BLOCK), Some(Vec::new()));
+
+        // SAFETY: our view and section handle.
+        unsafe {
+            UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: view2 as *mut _,
+            });
+            windows_sys::Win32::Foundation::CloseHandle(section);
+        }
+        title_memory_remapped(view2, 2 * BLOCK);
     }
 
     #[test]
