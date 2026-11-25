@@ -22,7 +22,7 @@
 //! for screen passes) are guesses; another pass the title runs only once
 //! and whose pipeline takes longer is lost.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -37,6 +37,10 @@ pub(crate) struct Pending {
     made: OnceLock<Option<HostPipeline>>,
     /// Its worker was lost to it: it will not be made.
     lost: AtomicBool,
+    /// When a worker began it ([`stuck`]).
+    begun: OnceLock<Instant>,
+    /// Whether a replacement worker was started for it ([`stuck`]).
+    replaced: AtomicBool,
     /// A pass over the screen (see [`GraphicsState::screen_pass`]).
     screen: bool,
     /// What identifies it across runs (shader containers and state), and
@@ -66,12 +70,15 @@ impl Pending {
             queued: AtomicBool::new(false),
             made: OnceLock::new(),
             lost: AtomicBool::new(false),
+            begun: OnceLock::new(),
+            replaced: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
+        let _ = self.begun.set(Instant::now());
         // Not `get_or_init`: a worker lost in it would leave it locked.
         let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
         let _ = self.made.set(made);
@@ -81,12 +88,60 @@ impl Pending {
     }
 }
 
+/// How long a pipeline may be in the making before it counts as stuck
+/// (`VICTORY_PIPELINE_STUCK_S`, 15 s by default).
+fn stuck_after() -> Duration {
+    #[cfg(test)]
+    return Duration::from_millis(50);
+    #[cfg(not(test))]
+    {
+        static AFTER: OnceLock<Duration> = OnceLock::new();
+        *AFTER.get_or_init(|| {
+            Duration::from_secs(
+                std::env::var("VICTORY_PIPELINE_STUCK_S")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(15),
+            )
+        })
+    }
+}
+
+/// Stack of each pipeline worker: room for the driver's shader compiler
+/// (reserved address space; committed only as used).
+const PIPELINE_STACK: usize = 64 << 20;
+
+static NEXT_REPLACEMENT: AtomicUsize = AtomicUsize::new(200);
+
+/// Whether `p`'s worker began making it longer ago than [`stuck_after`]
+/// and has not returned: stop waiting for it and spawn a replacement worker.
+fn stuck(p: &Pending) -> bool {
+    let Some(begun) = p.begun.get() else {
+        return false;
+    };
+    if p.made.get().is_some() || p.lost.load(Ordering::Relaxed) || begun.elapsed() < stuck_after() {
+        return false;
+    }
+    if !p.replaced.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            shaders = ?p.shaders,
+            seconds = stuck_after().as_secs(),
+            "a host pipeline's compile has not come back: not waiting for it and spawning a replacement worker"
+        );
+        if WORKERS_RUNNING.load(Ordering::Relaxed) > 0 {
+            worker(NEXT_REPLACEMENT.fetch_add(1, Ordering::Relaxed), p.screen);
+        }
+    }
+    true
+}
+
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
 /// not translate, else "refused" or "being made"; `None` if it has one.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
+        None if stuck(p) => Some(format!("stuck {:?}", p.shaders)),
         None => Some("being made".into()),
         Some(None) => {
             let failed: Vec<String> = p
@@ -141,7 +196,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     if p.made.get().is_none() {
         start(p);
-        if p.lost.load(Ordering::Relaxed) {
+        if p.lost.load(Ordering::Relaxed) || stuck(p) {
             return None;
         }
         // Also with a world's worth queued: passes the title runs only once
@@ -174,7 +229,7 @@ fn wait(p: &Pending, frame: u64) {
     static WAITED_US: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
     let kind = usize::from(p.screen);
     let budget = [wait_budget(), SCREEN_BUDGET][kind];
-    if budget.is_zero() {
+    if budget.is_zero() || stuck(p) {
         return;
     }
     let waited = &WAITED_US[kind];
@@ -185,7 +240,7 @@ fn wait(p: &Pending, frame: u64) {
     let started = Instant::now();
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() {
+    while p.made.get().is_none() && !stuck(p) {
         let rest = left.saturating_sub(started.elapsed());
         if rest.is_zero() {
             break;
@@ -199,6 +254,8 @@ fn wait(p: &Pending, frame: u64) {
 static RECEIVER: [OnceLock<Mutex<std::sync::mpsc::Receiver<Arc<Pending>>>>; 2] =
     [const { OnceLock::new() }; 2];
 
+static WORKERS_RUNNING: AtomicUsize = AtomicUsize::new(0);
+
 /// What the workers (by thread) are making.
 static AT_WORK: Mutex<Vec<(u32, Arc<Pending>)>> = Mutex::new(Vec::new());
 
@@ -206,7 +263,9 @@ static AT_WORK: Mutex<Vec<(u32, Arc<Pending>)>> = Mutex::new(Vec::new());
 fn worker(i: usize, screen: bool) {
     let spawned = std::thread::Builder::new()
         .name(format!("victory-pipelines-{i}"))
+        .stack_size(PIPELINE_STACK)
         .spawn(move || {
+            WORKERS_RUNNING.fetch_add(1, Ordering::Relaxed);
             // Below the title's own threads (loading, recording).
             // SAFETY: a plain call on our own thread.
             unsafe {
@@ -313,5 +372,23 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn a_stuck_pipeline_is_not_waited_for_and_its_worker_is_replaced() {
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        p.queued.store(true, Ordering::Relaxed);
+        let _ = p.begun.set(Instant::now());
+        WORKERS_RUNNING.store(1, Ordering::Relaxed);
+        assert!(!stuck(&p));
+        std::thread::sleep(stuck_after() + Duration::from_millis(20));
+        let before = NEXT_REPLACEMENT.load(Ordering::Relaxed);
+        let started = Instant::now();
+        assert!(ready(&p).is_none());
+        assert!(started.elapsed() < Duration::from_millis(100), "waited for a stuck pipeline");
+        assert_eq!(NEXT_REPLACEMENT.load(Ordering::Relaxed), before + 1);
+        assert!(stuck(&p));
+        assert_eq!(NEXT_REPLACEMENT.load(Ordering::Relaxed), before + 1);
+        assert!(p.made.get().is_none());
     }
 }

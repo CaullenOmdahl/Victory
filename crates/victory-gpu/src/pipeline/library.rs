@@ -138,7 +138,27 @@ fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     } else {
         tracing::info!("no host pipeline library yet; starting an empty one");
     }
-    let library = match make(&[]) {
+    // An empty library is asked for with a null blob. An empty Rust slice
+    // has a dangling, non-null pointer; Windows only looks at the length,
+    // but D3D12 on Linux (vkd3d-proton) refuses a non-null blob of length 0
+    // with E_INVALIDARG, so no pipeline was ever kept there.
+    let empty = || -> windows::core::Result<ID3D12PipelineLibrary1> {
+        let mut out = std::ptr::null_mut();
+        // SAFETY: the method's own arguments; a null blob of length 0 makes
+        // an empty library written to `out`.
+        unsafe {
+            (Interface::vtable(device).CreatePipelineLibrary)(
+                Interface::as_raw(device),
+                std::ptr::null(),
+                0,
+                &ID3D12PipelineLibrary::IID,
+                &mut out,
+            )
+            .ok()?;
+            ID3D12PipelineLibrary::from_raw(out).cast()
+        }
+    };
+    let library = match empty() {
         Ok(library) => library,
         Err(e) => {
             tracing::info!(error = %e, "the host makes no pipeline library");
