@@ -115,7 +115,28 @@ static WRITE_WATCH_LOCK: Mutex<()> = Mutex::new(());
 /// this asking's number, which is higher than any in the list but those the
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
+/// Whether `start` lies inside a block the guards already hold (read-only
+/// or a known unmapped hole): asking `GetWriteWatch` on mapped view memory
+/// always fails, so callers skip the lock and kernel syscall.
+fn known_view(start: usize) -> bool {
+    static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let ask = *ASK.get_or_init(|| {
+        ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
+            .iter()
+            .any(|n| std::env::var_os(n).is_some_and(|v| v == "1"))
+    });
+    if ask {
+        return false;
+    }
+    let g = guards_read();
+    let first = start / BLOCK;
+    g.protected.contains(&first) || g.holes.contains(&first)
+}
+
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    if guarded && known_view(start) {
+        return writes_guarded(start, end);
+    }
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
