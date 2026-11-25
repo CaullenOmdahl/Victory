@@ -2970,31 +2970,168 @@ impl Early {
     }
 }
 
-/// Runs `f` on pieces of `list`, of `least` items or more, on some threads.
-pub(crate) fn in_parallel<T: Sync>(list: &[T], least: usize, f: impl Fn(&[T]) + Sync) {
-    const THREADS: usize = 6;
+/// Persistent worker pool backing [`in_parallel`], avoiding per-submission OS
+/// thread creation/teardown overhead under Wine.
+struct Pool {
+    dispatch: std::sync::Mutex<()>,
+    shared: &'static PoolShared,
+    threads: usize,
+}
+
+struct PoolShared {
+    state: std::sync::Mutex<PoolState>,
+    wake: std::sync::Condvar,
+    done: std::sync::Condvar,
+}
+
+struct PoolState {
+    epoch: u64,
+    job: Option<PoolJob>,
+}
+
+#[derive(Clone, Copy)]
+struct PoolJob {
+    run: unsafe fn(*const (), usize, usize),
+    ctx: *const (),
+    len: usize,
+    piece: usize,
+    next: *const std::sync::atomic::AtomicUsize,
+    remaining: *const std::sync::atomic::AtomicUsize,
+}
+
+// SAFETY: `PoolJob` is only visible while `in_parallel` blocks on the caller
+// thread until `remaining` reaches zero, and `T`/`F` inside `ctx` are `Sync`.
+unsafe impl Send for PoolJob {}
+
+impl PoolShared {
+    fn execute_chunks(&self, job: PoolJob) {
+        // SAFETY: `job.next` points to the live stack `AtomicUsize` on the
+        // calling thread until `remaining` hits zero.
+        let next = unsafe { &*job.next };
+        loop {
+            let from = next.fetch_add(job.piece, Ordering::Relaxed);
+            if from >= job.len {
+                break;
+            }
+            let to = (from + job.piece).min(job.len);
+            // SAFETY: `job.ctx` is the live `Ctx` on the caller's stack and
+            // `[from..to]` is within `list.len()`.
+            unsafe { (job.run)(job.ctx, from, to) };
+        }
+    }
+}
+
+fn pool() -> &'static Pool {
+    static POOL: OnceLock<Pool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let total = std::thread::available_parallelism()
+            .map_or(6, |n| n.get().saturating_sub(2).clamp(4, 20));
+        let shared: &'static PoolShared = Box::leak(Box::new(PoolShared {
+            state: std::sync::Mutex::new(PoolState { epoch: 0, job: None }),
+            wake: std::sync::Condvar::new(),
+            done: std::sync::Condvar::new(),
+        }));
+        let mut spawned = 0usize;
+        for i in 0..total.saturating_sub(1) {
+            if std::thread::Builder::new()
+                .name(format!("victory-pool-{i}"))
+                .spawn(move || {
+                    struct FinishGuard {
+                        shared: &'static PoolShared,
+                        remaining: *const std::sync::atomic::AtomicUsize,
+                    }
+                    impl Drop for FinishGuard {
+                        fn drop(&mut self) {
+                            // SAFETY: caller keeps `remaining` live until it drops to 0.
+                            let rem = unsafe { &*self.remaining };
+                            if rem.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                let _held =
+                                    self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                                self.shared.done.notify_one();
+                            }
+                        }
+                    }
+                    let mut seen_epoch = 0u64;
+                    let mut guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        while guard.epoch == seen_epoch || guard.job.is_none() {
+                            guard = shared.wake.wait(guard).unwrap_or_else(|e| e.into_inner());
+                        }
+                        seen_epoch = guard.epoch;
+                        let Some(job) = guard.job else { continue };
+                        drop(guard);
+                        let _done = FinishGuard {
+                            shared,
+                            remaining: job.remaining,
+                        };
+                        shared.execute_chunks(job);
+                        drop(_done);
+                        guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    }
+                })
+                .is_ok()
+            {
+                spawned += 1;
+            }
+        }
+        Pool {
+            dispatch: std::sync::Mutex::new(()),
+            shared,
+            threads: spawned + 1,
+        }
+    })
+}
+
+/// Runs `f` on pieces of `list`, of `least` items or more, on a persistent worker pool.
+pub(crate) fn in_parallel<T: Sync, F: Fn(&[T]) + Sync>(list: &[T], least: usize, f: F) {
     if list.len() <= least {
         return f(list);
     }
-    // Small pieces, taken in turn: they are not equally long to do.
-    let piece = (list.len() / (THREADS * 8)).max(least);
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let work = || {
-        loop {
-            let from = next.fetch_add(piece, Ordering::Relaxed);
-            if from >= list.len() {
-                break;
-            }
-            f(&list[from..(from + piece).min(list.len())]);
-        }
+    let pool = pool();
+    if pool.threads <= 1 {
+        return f(list);
+    }
+    let Ok(_dispatch_guard) = pool.dispatch.try_lock() else {
+        // Nested or concurrent `in_parallel` call: run inline instead of spawning or deadlocking.
+        return f(list);
     };
-    let threads = THREADS.min(list.len().div_ceil(piece));
-    std::thread::scope(|s| {
-        for _ in 1..threads {
-            s.spawn(work);
-        }
-        work();
-    });
+    let bg_workers = pool.threads - 1;
+    let piece = (list.len() / (pool.threads * 4)).max(least);
+    if list.len() <= piece {
+        return f(list);
+    }
+    struct Ctx<'a, T, F> {
+        list: &'a [T],
+        f: &'a F,
+    }
+    unsafe fn trampoline<T, F: Fn(&[T]) + Sync>(ctx: *const (), from: usize, to: usize) {
+        // SAFETY: `ctx` is a valid `&Ctx<T, F>` live on the caller's stack until all workers finish.
+        let ctx = unsafe { &*ctx.cast::<Ctx<'_, T, F>>() };
+        (ctx.f)(&ctx.list[from..to]);
+    }
+    let ctx = Ctx { list, f: &f };
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let remaining = std::sync::atomic::AtomicUsize::new(bg_workers);
+    let job = PoolJob {
+        run: trampoline::<T, F>,
+        ctx: (&raw const ctx).cast(),
+        len: list.len(),
+        piece,
+        next: &raw const next,
+        remaining: &raw const remaining,
+    };
+    {
+        let mut state = pool.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.job = Some(job);
+        state.epoch = state.epoch.wrapping_add(1);
+        pool.shared.wake.notify_all();
+    }
+    pool.shared.execute_chunks(job);
+    let mut state = pool.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+    while remaining.load(Ordering::Acquire) != 0 {
+        state = pool.shared.done.wait(state).unwrap_or_else(|e| e.into_inner());
+    }
+    state.job = None;
 }
 
 /// Brings `[from, from + len)` of a host copy up to date now.
@@ -4331,6 +4468,32 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
 
         // SAFETY: our reservation.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn persistent_in_parallel_runs_small_large_and_nested_batches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let items: Vec<AtomicUsize> = (0..1024).map(|_| AtomicUsize::new(0)).collect();
+        super::in_parallel(&items[..4], 8, |chunk| {
+            for cell in chunk {
+                cell.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        assert!(items[..4].iter().all(|c| c.load(Ordering::Relaxed) == 1));
+        assert!(items[4..].iter().all(|c| c.load(Ordering::Relaxed) == 0));
+
+        for c in &items {
+            c.store(0, Ordering::Relaxed);
+        }
+        super::in_parallel(&items, 4, |chunk| {
+            // Nested call must execute inline without deadlocking.
+            super::in_parallel(chunk, 1, |inner| {
+                for cell in inner {
+                    cell.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+        });
+        assert!(items.iter().all(|c| c.load(Ordering::Relaxed) == 1));
     }
 }
 

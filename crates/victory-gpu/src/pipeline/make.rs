@@ -265,7 +265,7 @@ fn queue(p: Arc<Pending>) {
         let workers = if screen {
             2
         } else {
-            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+            std::thread::available_parallelism().map_or(2, |n| (n.get() * 3 / 4).clamp(2, 16))
         };
         for i in 0..workers {
             worker(i + if screen { 50 } else { 0 }, screen);
