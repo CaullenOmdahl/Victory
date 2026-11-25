@@ -36,6 +36,12 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
+/// Short hex key identifying this build's shader translation (respecting
+/// `VICTORY_SHADER_BUILD_OF` in diagnostic builds).
+pub(crate) fn build_key() -> String {
+    blake3::Hash::from(*build()).to_hex()[..16].to_owned()
+}
+
 /// What identifies this build: the BLAKE3 of our executable file and of
 /// the translation settings it runs with (the loop limit, which a
 /// diagnostics build can change at run time).

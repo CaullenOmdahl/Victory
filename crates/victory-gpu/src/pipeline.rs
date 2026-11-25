@@ -174,25 +174,31 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         Some(other) => (other, blake3::hash(other)),
         None => (bytes, full),
     };
+    let key = *full.as_bytes();
+    {
+        let shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = shaders.as_ref().and_then(|map| map.get(&key)) {
+            return existing.clone();
+        }
+    }
+    let candidate = Arc::new(Shader {
+        stage,
+        hash: full.to_hex()[..16].to_owned(),
+        container: bytes.to_vec(),
+        #[cfg(windows)]
+        hair: hair_strands(bytes),
+        #[cfg(windows)]
+        resolves_light: bytes
+            .windows(crate::ambient::PROGRAM.len())
+            .any(|w| w == crate::ambient::PROGRAM),
+        #[cfg(windows)]
+        translated: OnceLock::new(),
+    });
     let mut shaders = SHADERS.lock().unwrap_or_else(|e| e.into_inner());
     shaders
         .get_or_insert_with(HashMap::new)
-        .entry(*full.as_bytes())
-        .or_insert_with(|| {
-            Arc::new(Shader {
-                stage,
-                hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
-                #[cfg(windows)]
-                hair: hair_strands(bytes),
-                #[cfg(windows)]
-                resolves_light: bytes
-                    .windows(crate::ambient::PROGRAM.len())
-                    .any(|w| w == crate::ambient::PROGRAM),
-                #[cfg(windows)]
-                translated: OnceLock::new(),
-            })
-        })
+        .entry(key)
+        .or_insert(candidate)
         .clone()
 }
 
@@ -819,6 +825,15 @@ mod tests {
                 (1, 28)
             );
         }
+    }
+
+    #[test]
+    fn shader_reuses_cached_entry() {
+        let bytes = b"unique-shader-container-for-dedup-test";
+        let a = shader("pixel", bytes);
+        let b = shader("pixel", bytes);
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(a.hash, blake3::hash(bytes).to_hex()[..16]);
     }
 }
 
