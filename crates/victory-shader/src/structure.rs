@@ -400,6 +400,33 @@ pub struct Structured {
     pub others: HashMap<Value, Bool>,
 }
 
+impl Structured {
+    /// Branches no lane takes one way of (their condition is a constant),
+    /// as (block, the successor every lane goes to).
+    pub fn one_way(&self) -> Vec<(usize, usize)> {
+        self.exits
+            .iter()
+            .enumerate()
+            .filter_map(|(b, e)| match *e {
+                LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } if taken != not_taken => {
+                    if when == Bool::TRUE {
+                        Some((b, taken))
+                    } else if when == Bool::FALSE {
+                        Some((b, not_taken))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
+}
+
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
     run(Lanes::new(program, false)?)
@@ -1201,6 +1228,37 @@ mod tests {
 
     fn guarded(s: &Structured) -> usize {
         s.guards.iter().flatten().filter(|g| g.is_some()).count()
+    }
+
+    #[test]
+    fn a_branch_no_lane_takes_is_cut() {
+        let p = build(
+            &[
+                0xBE88_037E, // s_mov_b32 s8, exec_lo
+                0x876A_087E, // s_and_b32 vcc_lo, exec_lo, s8
+                0xBF86_0002, // s_cbranch_vccz -> 20
+                0x7E02_0281, // v_mov_b32 v1, 1
+                S_ENDPGM,
+                0x7E04_0280, // 20: v_mov_b32 v2, 0
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let fork = p
+            .blocks
+            .iter()
+            .position(|b| matches!(b.exit, Exit::Branch { .. }))
+            .unwrap();
+        let Exit::Branch { taken, not_taken } = p.blocks[fork].exit else {
+            unreachable!()
+        };
+        assert_eq!(s.one_way(), [(fork, not_taken)]);
+        let q = ir::retarget(&p, &s.one_way()).unwrap();
+        assert_eq!(q.blocks[fork].exit, Exit::Jump(not_taken));
+        assert!(q.blocks[taken].insts.is_empty());
+        assert!(!ir::reverse_postorder(&q.blocks).contains(&taken));
+        assert!(structure(&q).unwrap().one_way().is_empty());
     }
 
     #[test]

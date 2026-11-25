@@ -98,6 +98,8 @@ mod rectangle;
 mod opcode_audit;
 #[cfg(all(test, windows))]
 mod opcode_tests;
+#[cfg(test)]
+mod prune_tests;
 mod sampler;
 #[cfg(all(test, windows))]
 mod scratch_tests;
@@ -418,7 +420,103 @@ pub fn emit(
     res: &resource::Resources,
     target: Target,
 ) -> Result<HostShader, ShaderError> {
-    let original = emit_program(c, native, p, st, io, res, target);
+    let original = emit_program(c, native, p, st, io, res, target, true);
+    // Pruned only where the program lowers as it is, unthreaded: what the
+    // console flow check below looks at is then the program emitted.
+    if original.is_ok()
+        && let Some(made) = emit_without_dead_branches(c, native, p, st, io, res, target)
+    {
+        return Ok(made);
+    }
+    thread_unsupported(original, c, native, p, st, res, target, true)
+}
+
+/// [`emit`] of the program without its branches no lane takes one way of,
+/// in the per-lane form; `None` where that does not apply or fails, and the
+/// program is emitted as it is.
+///
+/// The structure pass proves many branch conditions constant per lane (the
+/// console compiler's scalar mask tests, `vccz` on EXEC and a mask every
+/// lane has). Lowered as they are they become `br i1 true` or `false`, and
+/// the code behind the other way stays in the DXIL for the host's compiler
+/// to remove. In Grand Theft Auto VI's `CS_ScreenProbes_ActivateRays` that
+/// is four fifths of the blocks, and the AMD compiler grew past 20 GB on
+/// it; `CS_ScreenProbes_ActivateProbes`, with a larger dead share, compiles
+/// in seconds, so the size is not all that compiler stumbles on. Left as
+/// they are:
+///
+/// * branches whose way every lane takes is a loop's back edge: a lane the
+///   iteration limit stops ([`lower::LOOP_LIMIT`]) leaves the loop through
+///   the other way, where a jump back would leave the program;
+/// * programs that ask for the console flow ([`lower::CONSOLE_FLOW`]),
+///   as they are or pruned: it runs blocks no lane reaches. [`emit`] calls
+///   this only where the program lowers unthreaded, so the check of the
+///   program as it is covers what [`emit`] emits otherwise; the pruned form
+///   is emitted without the console flow, and where it asks for it (code
+///   that kept it per lane, such as a permutation, was dead) it is not
+///   emitted.
+fn emit_without_dead_branches(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    target: Target,
+) -> Option<HostShader> {
+    let mut rank = vec![usize::MAX; p.blocks.len()];
+    for (n, b) in ir::reverse_postorder(&p.blocks).into_iter().enumerate() {
+        rank[b] = n;
+    }
+    let jumps: Vec<_> = st
+        .one_way()
+        .into_iter()
+        .filter(|&(b, to)| rank[to] > rank[b])
+        .collect();
+    if jumps.is_empty()
+        || lower_parts(c, native, p, st, io, res, target)
+            .is_ok_and(|parts| lower::wants_console_flow(&parts))
+    {
+        return None;
+    }
+    let mut q = ir::retarget(p, &jumps).ok()?;
+    crate::sgpr_spill::forward(&mut q);
+    let st = structure::structure(&q).ok()?;
+    let io = io::raise(&q, native).ok()?;
+    let res = resource::track_with(&q, &native.layout, native.stage, res.addresses).ok()?;
+    emit_threaded(c, native, &q, &st, &io, &res, target, false).ok()
+}
+
+/// [`emit`] as is, or with edges threaded where that alone fails;
+/// `console` allows the console flow.
+#[allow(clippy::too_many_arguments)]
+fn emit_threaded(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    target: Target,
+    console: bool,
+) -> Result<HostShader, ShaderError> {
+    let original = emit_program(c, native, p, st, io, res, target, console);
+    thread_unsupported(original, c, native, p, st, res, target, console)
+}
+
+/// `original`, [`emit_program`] of the program, or where that is
+/// unsupported the program with edges threaded.
+#[allow(clippy::too_many_arguments)]
+fn thread_unsupported(
+    original: Result<HostShader, ShaderError>,
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    res: &resource::Resources,
+    target: Target,
+    console: bool,
+) -> Result<HostShader, ShaderError> {
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
     if !matches!(original, Err(ShaderError::Unsupported { .. })) {
@@ -434,18 +532,20 @@ pub fn emit(
     let st = structure::structure(&p)?;
     let io = io::raise(&p, native)?;
     let res = resource::track_with(&p, &native.layout, native.stage, res.addresses)?;
-    emit_program(c, native, &p, &st, &io, &res, target)
+    emit_program(c, native, &p, &st, &io, &res, target, console)
 }
 
-fn emit_program(
-    c: &Container,
-    native: &NativeProgram,
-    p: &ir::Program,
-    st: &structure::Structured,
-    io: &io::Io,
-    res: &resource::Resources,
+/// What [`lower::lower`] takes for the program: its signatures with the
+/// interpolation modes the host declares.
+fn lower_parts<'a>(
+    c: &Container<'a>,
+    native: &'a NativeProgram,
+    p: &'a ir::Program,
+    st: &'a structure::Structured,
+    io: &'a io::Io,
+    res: &'a resource::Resources,
     target: Target,
-) -> Result<HostShader, ShaderError> {
+) -> Result<lower::Parts<'a>, ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -525,7 +625,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let mut parts = lower::Parts {
+    Ok(lower::Parts {
         psv: c.part(FourCC::PSV0).map(|p| p.data),
         native,
         p,
@@ -539,10 +639,24 @@ fn emit_program(
         target,
         console_cf: false,
         per_lane_only: false,
-    };
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_program(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    target: Target,
+    console: bool,
+) -> Result<HostShader, ShaderError> {
+    let mut parts = lower_parts(c, native, p, st, io, res, target)?;
     let _clamp = ClampGuard::new(target);
     let l = match lower::lower(&parts) {
-        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
+        Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW && console => {
             let console = structure::structure_console(p);
             let lowered = match &console {
                 Ok(console) => {

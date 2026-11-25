@@ -187,6 +187,12 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
     }
 }
 
+/// Whether [`lower`] can ask for the console flow ([`CONSOLE_FLOW`]) for
+/// `parts`: with numeric selects, which ask for it in more programs.
+pub(crate) fn wants_console_flow(parts: &Parts) -> bool {
+    Lower::new(parts, &HashMap::new(), true).wants_console_flow
+}
+
 fn lower_program(parts: &Parts, numeric_selects: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {

@@ -337,6 +337,29 @@ pub(crate) fn thread_edges(
     Ok(rename(blocks, p.wave64, p.vgprs))
 }
 
+/// The program with each `(block, target)` exit made a jump to `target`,
+/// the blocks then unreachable emptied, and SSA form rebuilt.
+pub(crate) fn retarget(p: &Program, jumps: &[(usize, usize)]) -> Result<Program, ShaderError> {
+    let mut blocks = p.blocks.clone();
+    for block in &mut blocks {
+        block.phis.clear();
+    }
+    for &(b, target) in jumps {
+        blocks[b].exit = Exit::Jump(target);
+    }
+    let mut reached = vec![false; blocks.len()];
+    for b in reverse_postorder(&blocks) {
+        reached[b] = true;
+    }
+    for (block, _) in blocks.iter_mut().zip(reached).filter(|(_, r)| !r) {
+        block.insts.clear();
+        block.exit = Exit::End;
+    }
+    link(&mut blocks);
+    split_irreducible(&mut blocks)?;
+    Ok(rename(blocks, p.wave64, p.vgprs))
+}
+
 /// Placeholder before renaming.
 const NONE: Value = Value(u32::MAX);
 /// SGPR codes 0-255, SCC, VGPRs 0-255.
