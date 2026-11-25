@@ -1382,6 +1382,12 @@ impl Host {
         self.reap_completed();
     }
 
+    /// No submission runs while the result lives: its title memory is not
+    /// being read or written (a page remap waits here).
+    pub(crate) fn hold_submissions(&self) -> std::sync::MutexGuard<'_, u64> {
+        self.submitted.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Runs closed lists; waits synchronously when CPU copy-back, readbacks, or
     /// bottom-of-pipe writes require GPU completion, or returns asynchronously
     /// so CPU recording overlaps GPU execution.
@@ -4271,6 +4277,8 @@ impl Meter {
         let [plans_ms, records_ms] =
             [0, 1].map(|i| BINDLESS_US[i].swap(0, Ordering::Relaxed) as f64 / 1e3 / frames);
         let dropped = crate::draw::take_dropped() as f64 / frames;
+        // Outside the submissions: in none of the times above.
+        let waited = crate::pipeline::take_waited_ms() / frames;
         let indirect = crate::list::take_indirect() as f64 / frames;
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
@@ -4289,7 +4297,7 @@ impl Meter {
                  {plans_ms:.1} ms; {gpu:.1} on the GPU; {back_ms:.1} copying back {back_mb:.1} MB; \
                  bindless records {records_ms:.1} ms), {draws:.0} draws/frame, \
                  dropped {dropped:.0} without a host pipeline ({making} being made) and \
-                 {indirect:.0} indirect",
+                 {indirect:.0} indirect; {waited:.1} ms/frame of draws waiting for pipelines",
                 crate::descriptor::host::BACKLOG[0].load(Ordering::Relaxed),
                 crate::descriptor::host::BACKLOG[1].load(Ordering::Relaxed),
                 making = crate::pipeline::making()

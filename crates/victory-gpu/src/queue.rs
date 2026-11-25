@@ -598,6 +598,9 @@ extern "system" fn copy_page_mappings(
 }
 
 fn apply_page_mappings(map: crate::resource::PageMapper, pool: u64, ops: &[PageOp]) {
+    // Not under a submission's reads and writes of title memory.
+    #[cfg(windows)]
+    let _quiet = crate::host::host().map(|h| h.hold_submissions());
     let mut ok = true;
     for &op in ops {
         ok &= match op {
@@ -1060,5 +1063,57 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+
+    /// A page remap waits for the submission running (which holds the
+    /// host's submission lock) instead of unmapping under its reads.
+    #[test]
+    fn page_mappings_wait_for_a_running_submission() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        crate::resource::use_page_mapper(|_, _, _| true);
+        let null = std::ptr::null();
+        let desc = QueueDesc {
+            kind: 0,
+            priority: 0,
+            flags: 0,
+            nodes: 0,
+        };
+        let mut q = null;
+        assert_eq!(create(null, &desc, &QUEUE_IIDS[0], &mut q), S_OK);
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let running = host.hold_submissions();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mapping = {
+            let done = done.clone();
+            let q = q as usize;
+            std::thread::spawn(move || {
+                let range = PageRange {
+                    kind: 3,
+                    start: 0,
+                    count: 1,
+                };
+                let batch = PageBatch {
+                    destination: 0x10000,
+                    count: 1,
+                    ranges: &range,
+                };
+                assert_eq!(
+                    copy_page_mappings(q as This, 1, &batch, 0x20000, 1, 0),
+                    S_OK
+                );
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !done.load(std::sync::atomic::Ordering::SeqCst),
+            "mapped under a running submission"
+        );
+        drop(running);
+        mapping.join().unwrap();
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(release(q), 0);
     }
 }
