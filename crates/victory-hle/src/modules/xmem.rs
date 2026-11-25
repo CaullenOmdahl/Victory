@@ -10,8 +10,8 @@
 use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
@@ -28,6 +28,7 @@ use windows_sys::Win32::System::ProcessStatus::{
     K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION,
     PROCESS_MEMORY_COUNTERS,
 };
+use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::core::BOOL;
 
@@ -356,8 +357,26 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-/// A section handle and its size.
-struct Section(HANDLE, usize);
+/// The top of the console's own title memory: 40 bits (the title's BVH
+/// builder refuses a structure above it, decision 0001). A persistent view
+/// is placed at or above this address so it cannot collide with title allocations.
+const TITLE_MEMORY_CEILING: usize = 1 << 40;
+
+const FREE: u8 = 0;
+const COMMITTING: u8 = 1;
+const COMMITTED: u8 = 2;
+const COMMIT_SPINS: usize = 1 << 14;
+
+/// A section handle, its persistent whole mapping, and per-page commit/write-generation state.
+struct Section {
+    handle: HANDLE,
+    persistent: OnceLock<Option<MappedBase>>,
+    size: usize,
+    commit_state: Box<[AtomicU8]>,
+    generation: Box<[AtomicU32]>,
+    fallback_noted: OnceLock<()>,
+    holding: Mutex<Vec<(usize, usize)>>,
+}
 
 /// Bytes of the physical-page sections alive (reserved; committed as
 /// mapped or written).
@@ -368,11 +387,264 @@ unsafe impl Send for Section {}
 // SAFETY: as above.
 unsafe impl Sync for Section {}
 
+impl Section {
+    fn new(handle: HANDLE, size: usize) -> Section {
+        let pages = size.div_ceil(PAGE);
+        Section {
+            handle,
+            persistent: OnceLock::new(),
+            size,
+            commit_state: (0..pages).map(|_| AtomicU8::new(FREE)).collect(),
+            generation: (0..pages).map(|_| AtomicU32::new(0)).collect(),
+            fallback_noted: OnceLock::new(),
+            holding: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn note_fallback(&self) {
+        if self.fallback_noted.set(()).is_ok() {
+            tracing::warn!(
+                size = self.size,
+                "a commit through the persistent view failed; this section's pages keep a temporary view per write"
+            );
+        }
+    }
+
+    fn hold(&self, from: usize, len: usize) -> bool {
+        if len == 0 {
+            return true;
+        }
+        let mut holding = self.holding.lock().unwrap_or_else(|e| e.into_inner());
+        let end = from.saturating_add(len);
+        if holding
+            .iter()
+            .any(|&(at, bytes)| from < at.saturating_add(bytes) && at < end)
+        {
+            return false;
+        }
+        holding.push((from, len));
+        true
+    }
+
+    fn let_go(&self, from: usize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let mut holding = self.holding.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(held) = holding.iter().position(|&held| held == (from, len)) {
+            holding.swap_remove(held);
+        }
+    }
+
+    fn persistent_ptr(&self) -> Option<*mut u8> {
+        let mapped = self
+            .persistent
+            .get_or_init(|| map_above_title_memory(self.handle, self.size).map(MappedBase));
+        mapped.as_ref().map(|base| base.0)
+    }
+
+    fn committed_all(&self, start: usize, count: usize) -> bool {
+        let Some(end) = start.checked_add(count) else {
+            return false;
+        };
+        end <= self.commit_state.len()
+            && (start..end).all(|page| self.commit_state[page].load(Ordering::Acquire) == COMMITTED)
+    }
+
+    fn mark_committed(&self, start: usize, count: usize) {
+        for page in start..start.saturating_add(count).min(self.commit_state.len()) {
+            self.commit_state[page].store(COMMITTED, Ordering::Release);
+        }
+    }
+
+    fn mark_free(&self, start: usize, count: usize) {
+        for page in start..start.saturating_add(count).min(self.commit_state.len()) {
+            let _ = self.commit_state[page].compare_exchange(
+                COMMITTING,
+                FREE,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+        }
+    }
+
+    /// Bumps the write generation of pages `[first, first + count)` AFTER bytes are written.
+    fn bump_range(&self, first: usize, count: usize) {
+        let Some(end) = first.checked_add(count) else {
+            return;
+        };
+        for page in first..end.min(self.generation.len()) {
+            self.generation[page].fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn generation_of(&self, start: usize, count: usize) -> Option<u64> {
+        let end = start.checked_add(count)?;
+        if end > self.generation.len() {
+            return None;
+        }
+        let mut digest = 0x9e37_79b9_7f4a_7c15u64;
+        for page in start..end {
+            digest = mix64(digest ^ (page as u64).wrapping_mul(0x2545_f491_4f6c_dd1d));
+            digest = mix64(digest ^ u64::from(self.generation[page].load(Ordering::Acquire)));
+        }
+        Some(digest)
+    }
+
+    fn ensure_committed(&self, base: *mut u8, start_page: usize, count: usize) -> bool {
+        let Some(end_page) = start_page.checked_add(count) else {
+            return false;
+        };
+        if !end_page
+            .checked_mul(PAGE)
+            .is_some_and(|end| end <= self.size)
+        {
+            return false;
+        }
+        if self.committed_all(start_page, count) {
+            return true;
+        }
+        for _ in 0..COMMIT_SPINS {
+            if self.committed_all(start_page, count) {
+                return true;
+            }
+            let mut claimed = false;
+            for page in start_page..end_page {
+                if self.commit_state[page]
+                    .compare_exchange(FREE, COMMITTING, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    claimed = true;
+                }
+            }
+            if !claimed {
+                std::hint::spin_loop();
+                continue;
+            }
+            // SAFETY: `[start_page, end_page)` lies inside the section's view.
+            let at = unsafe { base.add(start_page * PAGE) };
+            if !commit(at as usize, count * PAGE) {
+                self.mark_free(start_page, count);
+                return false;
+            }
+            self.mark_committed(start_page, count);
+            return true;
+        }
+        false
+    }
+}
+
+fn mix64(value: u64) -> u64 {
+    let mut x = value;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+fn above_title_memory(at: usize) -> bool {
+    at >= TITLE_MEMORY_CEILING
+}
+
+fn highest_ending_address() -> usize {
+    let mut info = SYSTEM_INFO::default();
+    // SAFETY: `GetSystemInfo` writes only into `info`.
+    unsafe { GetSystemInfo(&mut info) };
+    (info.lpMaximumApplicationAddress as usize).saturating_sub(PAGE)
+}
+
+fn map_above_title_memory(handle: HANDLE, size: usize) -> Option<*mut u8> {
+    let rounded = size.max(PAGE).checked_next_multiple_of(PAGE)?;
+    let mut requirements = MEM_ADDRESS_REQUIREMENTS {
+        LowestStartingAddress: TITLE_MEMORY_CEILING as *mut c_void,
+        HighestEndingAddress: highest_ending_address() as *mut c_void,
+        Alignment: PAGE,
+    };
+    let mut parameter = MEM_EXTENDED_PARAMETER::default();
+    parameter.Anonymous1._bitfield = MemExtendedParameterAddressRequirements as u64;
+    parameter.Anonymous2.Pointer = (&raw mut requirements).cast();
+    // SAFETY: `parameter` points at `requirements`, which outlives the call.
+    let placeholder = unsafe {
+        VirtualAlloc2(
+            GetCurrentProcess(),
+            std::ptr::null(),
+            rounded,
+            MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+            PAGE_NOACCESS,
+            &mut parameter,
+            1,
+        )
+    };
+    if placeholder.is_null() {
+        tracing::warn!(
+            size,
+            error = %std::io::Error::last_os_error(),
+            "reserving a view above the title's own addresses failed; its pages keep a temporary view per write"
+        );
+        return None;
+    }
+    // SAFETY: `placeholder` is replaced in place by a view of our section.
+    let view = unsafe {
+        MapViewOfFile3(
+            handle,
+            GetCurrentProcess(),
+            placeholder,
+            0,
+            rounded,
+            MEM_REPLACE_PLACEHOLDER,
+            PAGE_READWRITE,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    let at = view.Value as usize;
+    if at != placeholder as usize {
+        // SAFETY: the reservation was not replaced, so it is still ours to free.
+        unsafe { VirtualFree(placeholder, 0, MEM_RELEASE) };
+        tracing::warn!(
+            size,
+            error = %std::io::Error::last_os_error(),
+            "mapping a physical-page section whole above the title's addresses failed; its pages keep a temporary view per write"
+        );
+        return None;
+    }
+    if !above_title_memory(at) {
+        // SAFETY: releasing this view also frees its underlying reservation.
+        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, 0) };
+        tracing::warn!(
+            at = format_args!("{at:#x}"),
+            "the host placed a persistent view inside the title's own addresses; its pages keep a temporary view per write"
+        );
+        return None;
+    }
+    Some(at as *mut u8)
+}
+
+struct MappedBase(*mut u8);
+
+// SAFETY: writers through the persistent mapping hold disjoint byte ranges via `Section::hold`.
+unsafe impl Send for MappedBase {}
+// SAFETY: as above.
+unsafe impl Sync for MappedBase {}
+
+impl Drop for MappedBase {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        // SAFETY: our persistent view; views keep the section alive independently.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.0.cast(),
+            });
+        }
+    }
+}
+
 impl Drop for Section {
     fn drop(&mut self) {
-        SECTION_BYTES.fetch_sub(self.1, Ordering::Relaxed);
+        SECTION_BYTES.fetch_sub(self.size, Ordering::Relaxed);
         // SAFETY: our handle; views keep the section alive on their own.
-        unsafe { CloseHandle(self.0) };
+        unsafe { CloseHandle(self.handle) };
     }
 }
 
@@ -455,7 +727,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         "XMemAllocatePhysicalPages"
     );
     SECTION_BYTES.fetch_add(size, Ordering::Relaxed);
-    let section = Arc::new(Section(handle, size));
+    let section = Arc::new(Section::new(handle, size));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -490,22 +762,72 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     1
 }
 
-/// A view of our own on consecutive slices of one section, committed and
-/// writable, unmapped when dropped.
-struct View {
-    at: MEMORY_MAPPED_VIEW_ADDRESS,
-    len: usize,
+pub(crate) fn parse_persistent_views(value: Option<&std::ffi::OsStr>) -> bool {
+    let Some(value) = value else {
+        return false;
+    };
+    let Some(text) = value.to_str() else {
+        return false;
+    };
+    let trimmed = text.trim();
+    trimmed == "1"
+        || trimmed.eq_ignore_ascii_case("true")
+        || trimmed.eq_ignore_ascii_case("yes")
+        || trimmed.eq_ignore_ascii_case("on")
+}
+
+/// Whether pages are written through one persistent view per section
+/// (`VICTORY_XMEM_PERSISTENT_VIEW=1`) instead of mapping/unmapping per write.
+pub(crate) fn persistent_views() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        parse_persistent_views(std::env::var_os("VICTORY_XMEM_PERSISTENT_VIEW").as_deref())
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mapping {
+    Default,
+    Persistent,
+    Temporary,
+}
+
+impl Mapping {
+    fn view(self, slice: &Slice, n: usize) -> Option<View> {
+        let mapping = match self {
+            Mapping::Default if persistent_views() => Mapping::Persistent,
+            Mapping::Default => Mapping::Temporary,
+            forced => forced,
+        };
+        match mapping {
+            Mapping::Persistent => View::persistent(slice, n).or_else(|| View::temporary(slice, n)),
+            Mapping::Temporary | Mapping::Default => View::temporary(slice, n),
+        }
+    }
+}
+
+/// A view of our own on consecutive slices of one section, committed and writable.
+enum View {
+    Temporary {
+        at: MEMORY_MAPPED_VIEW_ADDRESS,
+        len: usize,
+    },
+    Persistent {
+        section: Arc<Section>,
+        ptr: *mut u8,
+        from: usize,
+        len: usize,
+    },
 }
 
 impl View {
-    /// Maps `n` slices from `slice` on.
-    fn map(slice: &Slice, n: usize) -> Option<View> {
+    fn temporary(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
         // SAFETY: slices of a section we own; the view is ours until dropped.
         let at = unsafe {
             MapViewOfFile(
-                slice.section.0,
+                slice.section.handle,
                 FILE_MAP_WRITE,
                 (offset >> 32) as u32,
                 offset as u32,
@@ -515,23 +837,56 @@ impl View {
         if at.Value.is_null() {
             return None;
         }
-        let view = View { at, len };
+        let view = View::Temporary { at, len };
         commit(at.Value as usize, len).then_some(view)
     }
 
-    fn bytes(&mut self) -> &mut [u8] {
-        // SAFETY: the view holds `len` committed read-write bytes, ours
-        // alone while `self` lives (other views of the slices only alias
-        // them, as the console's do).
-        unsafe { std::slice::from_raw_parts_mut(self.at.Value.cast(), self.len) }
+    fn persistent(slice: &Slice, n: usize) -> Option<View> {
+        let base = slice.section.persistent_ptr()?;
+        let len = n.checked_mul(PAGE)?;
+        let from = slice.index * PAGE;
+        if !slice.section.hold(from, len) {
+            return None;
+        }
+        if !slice.section.ensure_committed(base, slice.index, n) {
+            slice.section.let_go(from, len);
+            slice.section.note_fallback();
+            return None;
+        }
+        // SAFETY: `ensure_committed` verified `[slice.index, slice.index + n)` lies inside the section.
+        let ptr = unsafe { base.add(from) };
+        Some(View::Persistent {
+            section: slice.section.clone(),
+            ptr,
+            from,
+            len,
+        })
+    }
+
+    fn bytes_at(&mut self, from: usize, len: usize) -> &mut [u8] {
+        let (ptr, whole) = match self {
+            View::Temporary { at, len } => (at.Value.cast::<u8>(), *len),
+            View::Persistent { ptr, len, .. } => (*ptr, *len),
+        };
+        assert!(
+            from.checked_add(len).is_some_and(|end| end <= whole),
+            "view bytes {from}+{len} past a view of {whole}"
+        );
+        // SAFETY: `[from, from + len)` fits within this view; persistent slices hold disjoint byte ranges.
+        unsafe { std::slice::from_raw_parts_mut(ptr.add(from), len) }
     }
 }
 
 impl Drop for View {
     fn drop(&mut self) {
-        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
-        // SAFETY: our view.
-        unsafe { UnmapViewOfFile(self.at) };
+        match self {
+            View::Temporary { at, .. } => {
+                use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+                // SAFETY: our temporary view.
+                unsafe { UnmapViewOfFile(*at) };
+            }
+            View::Persistent { section, from, len, .. } => section.let_go(*from, *len),
+        }
     }
 }
 
@@ -566,19 +921,60 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 /// costs a map, a commit and an unmap (which flushes every core's TLB).
 /// False if a page is unknown or the host fails.
 pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> bool {
+    write_physical_with(Mapping::Default, pages, offset, data)
+}
+
+fn write_physical_with(mapping: Mapping, pages: &[usize], offset: usize, data: &[u8]) -> bool {
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
+        let Some(mut view) = mapping.view(slice, *n) else {
             return false;
         };
         let k = (n * PAGE - within).min(data.len() - done);
-        view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
+        view.bytes_at(within, k).copy_from_slice(&data[done..done + k]);
+        slice
+            .section
+            .bump_range(slice.index + within / PAGE, (within + k).div_ceil(PAGE));
         (within, done) = (0, done + k);
     }
     true
+}
+
+/// Registers [`va_generation_digest`] as the GPU crate's page-generation oracle.
+pub fn register_page_gen_oracle() {
+    victory_gpu::set_page_gen_oracle(va_generation_digest);
+}
+
+/// Folded write generation for `[addr, addr + len)` across mapped physical-page
+/// views, or `None` when any byte lies outside a known `xmem` view.
+pub fn va_generation_digest(addr: usize, len: usize) -> Option<u64> {
+    if len == 0 {
+        return None;
+    }
+    let end = addr.checked_add(len)?;
+    let phys = physical();
+    let mut cursor = addr;
+    let mut digest = 0x517c_c1b7_2722_0a95u64;
+    while cursor < end {
+        let (&base, (vlen, slice)) = phys.views.range(..=cursor).next_back()?;
+        let view_end = base.checked_add(*vlen)?;
+        if view_end <= cursor {
+            return None;
+        }
+        let within = cursor - base;
+        let take = (view_end - cursor).min(end - cursor);
+        let first_page = slice.index + within / PAGE;
+        let page_count = ((within % PAGE) + take).div_ceil(PAGE);
+        let folded = slice.section.generation_of(first_page, page_count)?;
+        digest = mix64(digest ^ (Arc::as_ptr(&slice.section) as usize as u64));
+        digest = mix64(digest ^ (first_page as u64));
+        digest = mix64(digest ^ folded);
+        cursor += take;
+    }
+    Some(digest)
 }
 
 /// DirectStorage filled bytes `[offset, offset + len)` of `pages`: tells the
@@ -614,12 +1010,21 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
+    section: Arc<Section>,
+    first_page: usize,
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        self.section
+            .bump_range(self.first_page, (self.within + self.len).div_ceil(PAGE));
+    }
 }
 
 impl PageWindow {
     pub(crate) fn bytes(&mut self) -> &mut [u8] {
         let (within, len) = (self.within, self.len);
-        &mut self.view.bytes()[within..within + len]
+        self.view.bytes_at(within, len)
     }
 }
 
@@ -629,14 +1034,25 @@ impl PageWindow {
 /// unknown, or a host failure), which `write_physical` then handles or
 /// reports.
 pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<PageWindow> {
+    page_window_with(Mapping::Default, pages, offset, len)
+}
+
+fn page_window_with(
+    mapping: Mapping,
+    pages: &[usize],
+    offset: usize,
+    len: usize,
+) -> Option<PageWindow> {
     let runs = runs(pages, offset, len)?;
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view: mapping.view(slice, *n)?,
         within: offset % PAGE,
         len,
+        section: slice.section.clone(),
+        first_page: slice.index + (offset % PAGE) / PAGE,
     })
 }
 
@@ -719,10 +1135,10 @@ fn map_whole(physical: &mut Physical, base: usize, pages: &[usize]) -> bool {
                 return false;
             };
             if len <= WHOLE {
-                tracing::debug!(at = format_args!("{at:#x}"), len, section = first.section.1, views = ?physical.views.range(..at + len).next_back().map(|(v, (n, _))| (*v, *n)), "whole?");
+                tracing::debug!(at = format_args!("{at:#x}"), len, section = first.section.size, views = ?physical.views.range(..at + len).next_back().map(|(v, (n, _))| (*v, *n)), "whole?");
             }
             if len > WHOLE
-                || len != first.section.1
+                || len != first.section.size
                 || physical.views.range(..at + len).next_back().is_some_and(|(v, (n, _))| v + n > at)
                 || physical.whole.iter().any(|w| Arc::ptr_eq(&w.2, &first.section))
             {
@@ -871,7 +1287,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             base = format_args!("{base:#x}"),
             len,
             index = slice.index,
-            section = slice.section.1,
+            section = slice.section.size,
             "physical pages mapped"
         );
     }
@@ -918,7 +1334,7 @@ fn map_view(base: usize, len: usize, slice: &Slice) -> bool {
     // the section; the host refuses anything that is not that placeholder.
     let view = unsafe {
         MapViewOfFile3(
-            slice.section.0,
+            slice.section.handle,
             GetCurrentProcess(),
             base as *const c_void,
             (slice.index * PAGE) as u64,
@@ -944,7 +1360,12 @@ fn map_view(base: usize, len: usize, slice: &Slice) -> bool {
         return false;
     }
     // The GPU side guards every view of a page together.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    victory_gpu::title_memory_view(
+        base,
+        len,
+        slice.section.handle as usize,
+        (slice.index * PAGE) as u64,
+    );
     true
 }
 
@@ -1423,7 +1844,11 @@ mod tests {
     /// The bytes of one page, through a view of our own.
     fn page_bytes(page: usize) -> Vec<u8> {
         let slice = physical().pages.get(&page).cloned().expect("known page");
-        View::map(&slice, 1).expect("mapped").bytes().to_vec()
+        Mapping::Temporary
+            .view(&slice, 1)
+            .expect("mapped")
+            .bytes_at(0, PAGE)
+            .to_vec()
     }
 
     #[test]
@@ -1626,6 +2051,87 @@ mod tests {
         // Page 0 is a placeholder again: it takes a mapping.
         assert_eq!(XMemMapPhysicalPages(a, 1, pages.as_ptr()), a);
         assert_eq!(XMemMapPhysicalPages(a, 1, std::ptr::null()), a);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    fn slice_of(page: usize) -> Slice {
+        physical().pages.get(&page).cloned().expect("known page")
+    }
+
+    #[test]
+    fn persistent_view_maps_above_the_title_memory_ceiling() {
+        let pages = allocate(2);
+        let section = slice_of(pages[0]).section.clone();
+        let base = section
+            .persistent_ptr()
+            .expect("the host refused a view above 40 bits");
+        assert!(
+            above_title_memory(base as usize),
+            "the persistent view is at {base:p}, inside the title's own addresses"
+        );
+        assert!(!above_title_memory(TITLE_MEMORY_CEILING - PAGE));
+        assert!(above_title_memory(TITLE_MEMORY_CEILING));
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn a_view_slice_covers_only_the_bytes_asked_for() {
+        let pages = allocate(2);
+        let slice = slice_of(pages[0]);
+        for (name, mapping) in [
+            ("temporary", Mapping::Temporary),
+            ("persistent", Mapping::Persistent),
+        ] {
+            let mut view = mapping.view(&slice, 1).expect("one page mapped");
+            assert_eq!(view.bytes_at(5, 3).len(), 3, "{name}: not the whole run");
+            view.bytes_at(5, 3).copy_from_slice(&[1, 2, 3]);
+            drop(view);
+            let page = page_bytes(pages[0]);
+            assert_eq!(&page[5..8], &[1, 2, 3], "{name}");
+            assert_eq!((page[4], page[8]), (0, 0), "{name}: only those bytes");
+        }
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn a_second_overlapping_persistent_view_falls_back_to_a_temporary_one() {
+        let pages = allocate(3);
+        let first = View::persistent(&slice_of(pages[0]), 1).expect("one page");
+        assert!(matches!(first, View::Persistent { .. }));
+        assert!(View::persistent(&slice_of(pages[0]), 1).is_none());
+        let second = Mapping::Persistent
+            .view(&slice_of(pages[0]), 1)
+            .expect("a temporary view");
+        assert!(matches!(second, View::Temporary { .. }));
+        let neighbour = View::persistent(&slice_of(pages[1]), 1).expect("next page");
+        assert!(matches!(neighbour, View::Persistent { .. }));
+        drop(first);
+        let again = View::persistent(&slice_of(pages[0]), 1).expect("free again");
+        assert!(matches!(again, View::Persistent { .. }));
+        drop((second, neighbour, again));
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn va_generation_digest_tracks_mapped_views_and_rejects_gaps() {
+        let pages = allocate(3);
+        let mapped_pages = &pages[..2];
+        let va = XMemVirtualAlloc(std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, 0x04);
+        assert!(!va.is_null());
+        assert_eq!(XMemMapPhysicalPages(va, 2, mapped_pages.as_ptr()), va);
+        let addr = va as usize;
+
+        let d0 = va_generation_digest(addr, 2 * PAGE).expect("mapped view has digest");
+        assert_eq!(va_generation_digest(addr, 2 * PAGE), Some(d0));
+        assert!(write_physical(mapped_pages, 0, &[0xAB; 64]));
+        let d1 = va_generation_digest(addr, 2 * PAGE).expect("still mapped");
+        assert_ne!(d1, d0);
+        assert!(va_generation_digest(addr, 3 * PAGE).is_none());
+        assert!(va_generation_digest(addr, 0).is_none());
+
+        assert_eq!(XMemMapPhysicalPages(va, 2, std::ptr::null()), va);
+        assert!(va_generation_digest(addr, 2 * PAGE).is_none());
+        assert_ne!(unsafe { VirtualFree(va, 0, MEM_RELEASE) }, 0);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 }

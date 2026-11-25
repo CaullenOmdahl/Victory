@@ -61,11 +61,53 @@ pub(crate) struct Staging {
     gpu_uploads: std::sync::atomic::AtomicU64,
 }
 
+/// Returns a folded write-generation digest for `[addr, addr + len)` when the
+/// range is backed by tracked physical-page views, or `None` to fall back to
+/// CPU BLAKE3 hashing.
+pub type PageGenOracle = fn(usize, usize) -> Option<u64>;
+
+static PAGE_GEN_ORACLE: std::sync::OnceLock<PageGenOracle> = std::sync::OnceLock::new();
+
+/// Registers the HLE physical-page generation oracle used when
+/// `VICTORY_TEXTURE_DIRTY_GEN=1` is enabled.
+pub fn set_page_gen_oracle(oracle: PageGenOracle) {
+    let _ = PAGE_GEN_ORACLE.set(oracle);
+}
+
+fn dirty_gen_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_DIRTY_GEN").is_some_and(|v| v == "1"))
+}
+
+fn hash_oracle_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_HASH_ORACLE").is_some_and(|v| v == "1"))
+}
+
+/// Checks `oracle(start, size)` when `enabled` is true. Returns `(matched,
+/// new_digest)` where `matched` is true iff `last.gen_digest == Some(digest)`.
+fn check_gen_digest(
+    last: &Last,
+    start: usize,
+    size: usize,
+    oracle: Option<PageGenOracle>,
+    enabled: bool,
+) -> (bool, Option<u64>) {
+    if !enabled {
+        return (false, None);
+    }
+    let Some(digest) = oracle.and_then(|f| f(start, size)) else {
+        return (false, None);
+    };
+    (last.gen_digest == Some(digest), Some(digest))
+}
+
 /// What a texture's staging buffer holds: the hash of the memory detiled
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
     hash: Option<blake3::Hash>,
+    gen_digest: Option<u64>,
     asked: u64,
     /// How often in a row it had not changed, and the frame to look at it
     /// next in.
@@ -335,6 +377,16 @@ impl Staging {
         {
             return (0, false);
         }
+        let (gen_match, new_digest) = check_gen_digest(
+            last,
+            start,
+            size,
+            PAGE_GEN_ORACLE.get().copied(),
+            dirty_gen_enabled(),
+        );
+        if !rewritten && gen_match && !hash_oracle_enabled() {
+            return (0, false);
+        }
         if !any_mapped(self.memory, size) {
             #[cfg(feature = "diagnostics")]
             tracing::debug!(
@@ -348,7 +400,7 @@ impl Staging {
         // Read through our safe copy: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them.
         with_tiled_copy(self.memory, size, |tiled| {
-            let read = self.changed(last, tiled, rewritten);
+            let read = self.changed(last, tiled, rewritten, new_digest, gen_match);
             last.still = if read.1 { 0 } else { (last.still + 1).min(3) };
             // Not all in the same frame; cap backoff at 4 frames so streamed
             // higher-res mips appear promptly without waiting 16+ seconds.
@@ -363,13 +415,28 @@ impl Staging {
     /// After reading the texture's memory into `tiled`: detiles it unless
     /// its hash is the last one's. Returns the bytes read and whether the
     /// staging buffer got new contents.
-    fn changed(&self, last: &mut Last, tiled: &[u8], told: bool) -> (usize, bool) {
+    fn changed(
+        &self,
+        last: &mut Last,
+        tiled: &[u8],
+        told: bool,
+        new_digest: Option<u64>,
+        gen_match: bool,
+    ) -> (usize, bool) {
         let size = tiled.len();
         let hash = blake3::hash(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
+            last.gen_digest = new_digest;
             return (size, false);
+        }
+        if !told && gen_match && last.hash.is_some() {
+            tracing::warn!(
+                memory = ?self.memory,
+                size,
+                "VICTORY_TEXTURE_HASH_ORACLE: texture bytes changed without a generation bump"
+            );
         }
         #[cfg(feature = "diagnostics")]
         flips::note(self, &hash, tiled, told, last.hash.is_some());
@@ -377,6 +444,7 @@ impl Staging {
             // A texture in use changed: how it was found.
             CHANGED[usize::from(told)].fetch_add(1, Ordering::Relaxed);
         }
+        last.gen_digest = new_digest;
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
@@ -1222,5 +1290,40 @@ mod host_written_tests {
         forget(RESOURCE);
         assert!(!HOST_WRITTEN_ANY.load(Ordering::Acquire));
         assert!(!is_host_written(RESOURCE));
+    }
+
+    #[test]
+    fn dirty_gen_skips_rehash_when_digest_unchanged_and_detiles_when_bumped() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static GEN: AtomicU64 = AtomicU64::new(1);
+        fn oracle(addr: usize, len: usize) -> Option<u64> {
+            if addr == 0 {
+                return None;
+            }
+            Some(GEN.load(Ordering::Relaxed) ^ (len as u64))
+        }
+
+        let mut last = super::Last::default();
+        let (matched, d1) = super::check_gen_digest(&last, 0x1000, 4096, Some(oracle), true);
+        assert!(!matched);
+        assert!(d1.is_some());
+        last.gen_digest = d1;
+
+        let (matched, d2) = super::check_gen_digest(&last, 0x1000, 4096, Some(oracle), true);
+        assert!(matched);
+        assert_eq!(d2, d1);
+
+        GEN.fetch_add(1, Ordering::Relaxed);
+        let (matched, d3) = super::check_gen_digest(&last, 0x1000, 4096, Some(oracle), true);
+        assert!(!matched);
+        assert_ne!(d3, d1);
+
+        let (matched, d4) = super::check_gen_digest(&last, 0, 4096, Some(oracle), true);
+        assert!(!matched);
+        assert!(d4.is_none());
+
+        let (matched, d5) = super::check_gen_digest(&last, 0x1000, 4096, Some(oracle), false);
+        assert!(!matched);
+        assert!(d5.is_none());
     }
 }
