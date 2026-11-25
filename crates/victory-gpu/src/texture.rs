@@ -335,12 +335,12 @@ impl Staging {
             tiled.resize(size, 0);
             crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
             let read = self.changed(last, tiled, rewritten);
-            last.still = if read.1 { 0 } else { (last.still + 1).min(6) };
-            // Not all in the same frame; static textures back off up to 32 frames
-            // (`title_memory_written` resets `still` immediately on streamed writes).
+            last.still = if read.1 { 0 } else { (last.still + 1).min(3) };
+            // Not all in the same frame; cap backoff at 4 frames so streamed
+            // higher-res mips appear promptly without waiting 16+ seconds.
             last.next = match last.still {
                 0 | 1 => 0,
-                k => frame + (1 << (k - 1).min(5)) - (self.memory as u64 >> 16) % 2,
+                k => frame + (1 << (k - 1).min(2)) - (self.memory as u64 >> 16) % 2,
             };
             // As in `with_tiled_copy`: a one-off huge read is not kept.
             if tiled.capacity() > 64 << 20 {
@@ -409,12 +409,14 @@ impl Staging {
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
         #[cfg(feature = "diagnostics")]
-        if tiled.iter().all(|&b| b == 0) {
-            tracing::debug!(
-                memory = ?self.memory,
-                desc = ?self.layout.desc,
-                "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
-            );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            if tiled.iter().all(|&b| b == 0) {
+                tracing::debug!(
+                    memory = ?self.memory,
+                    desc = ?self.layout.desc,
+                    "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
+                );
+            }
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips + self.skip, i as u32 / self.mips);

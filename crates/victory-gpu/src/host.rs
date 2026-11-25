@@ -2651,6 +2651,33 @@ impl HostList {
         for (heap, writes) in &deferred.bindless {
             batch.bindless(heap, *writes);
         }
+        type TexDue = (
+            std::sync::Arc<crate::texture::Staging>,
+            std::sync::Arc<crate::resource::HostTexture>,
+            std::sync::atomic::AtomicBool,
+        );
+        let mut tex_due: Vec<TexDue> = Vec::new();
+        let flush_textures = |tex_due: &mut Vec<TexDue>,
+                              uploads: &mut Vec<(
+                                  std::sync::Arc<crate::texture::Staging>,
+                                  std::sync::Arc<crate::resource::HostTexture>,
+                              )>| {
+            if tex_due.is_empty() {
+                return;
+            }
+            in_parallel(tex_due, 2, |chunk| {
+                for (staging, _, dirty) in chunk {
+                    if staging.refresh() {
+                        dirty.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+            for (staging, copy, dirty) in tex_due.drain(..) {
+                if dirty.into_inner() {
+                    uploads.push((staging, copy));
+                }
+            }
+        };
         let mut copy_bytes = 0u64;
         let mut copy_us = 0u64;
         #[cfg(feature = "diagnostics")]
@@ -2662,6 +2689,7 @@ impl HostList {
         for step in &deferred.copies {
             match step {
                 &Step::Copy(dst, src, len) => {
+                    flush_textures(&mut tex_due, &mut uploads);
                     #[cfg(feature = "diagnostics")]
                     {
                         copy_count += 1;
@@ -2691,6 +2719,9 @@ impl HostList {
                     batch.add(shadow, *address, *len);
                 }
                 Step::Run(work) | Step::Host(work) => {
+                    if matches!(step, Step::Run(_)) {
+                        flush_textures(&mut tex_due, &mut uploads);
+                    }
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
                     if matches!(step, Step::Run(_)) {
@@ -2709,12 +2740,17 @@ impl HostList {
                     shadow.writing(*address, *len);
                 }
                 Step::Texture(staging, copy) => {
-                    if batch.texture_due(staging) && staging.refresh() {
-                        uploads.push((staging.clone(), copy.clone()));
+                    if batch.texture_due(staging) {
+                        tex_due.push((
+                            staging.clone(),
+                            copy.clone(),
+                            std::sync::atomic::AtomicBool::new(false),
+                        ));
                     }
                 }
             }
         }
+        flush_textures(&mut tex_due, &mut uploads);
         if copy_bytes > 0 || copy_us > 0 {
             PREPARING[0].fetch_add(copy_us, Ordering::Relaxed);
             PREPARING[1].fetch_add(copy_bytes, Ordering::Relaxed);
@@ -2902,13 +2938,29 @@ impl Early {
                 used.extend(states.values().map(|s| std::sync::Arc::as_ptr(&s.2) as usize));
             }
         }
+        let due: Vec<(
+            std::sync::Arc<crate::texture::Staging>,
+            std::sync::Arc<crate::resource::HostTexture>,
+            std::sync::atomic::AtomicBool,
+        )> = first
+            .into_iter()
+            .filter(|(staging, copy)| {
+                !used.contains(&(std::sync::Arc::as_ptr(copy) as usize))
+                    && batch.texture_due(staging)
+            })
+            .map(|(staging, copy)| (staging, copy, std::sync::atomic::AtomicBool::new(false)))
+            .collect();
+        in_parallel(&due, 2, |chunk| {
+            for (staging, _, dirty) in chunk {
+                if staging.refresh() {
+                    dirty.store(true, Ordering::Relaxed);
+                }
+            }
+        });
         const COPY_DEST: i32 = D3D12_RESOURCE_STATE_COPY_DEST.0;
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-        for (staging, copy) in first {
-            if used.contains(&(std::sync::Arc::as_ptr(&copy) as usize))
-                || !batch.texture_due(&staging)
-                || !staging.refresh()
-            {
+        for (staging, copy, dirty) in due {
+            if !dirty.into_inner() {
                 continue;
             }
             let real = copy.state.swap(SHADER_RESOURCE, Ordering::Relaxed) as i32;

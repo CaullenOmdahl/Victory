@@ -1,20 +1,39 @@
 //! Console primitive types the host lacks. A rectangle list gives three
-//! corners per rectangle, the second the one between the other two, and
-//! the hardware adds the fourth at `v0 + v2 - v1` (Grand Theft Auto VI's
-//! full-screen rectangles come as top left, bottom left, bottom right); on
-//! the host each rectangle becomes two triangles, with the fourth vertex
-//! made from the other three on the CPU.
+//! corners per rectangle, in any order, and the hardware adds the fourth
+//! opposite the right angle; on the host each rectangle becomes two triangles,
+//! with the fourth vertex made from the other three on the CPU when no
+//! geometry shader does it.
 //!
 //! shortcut: the fourth vertex is computed from vertex inputs, not from
 //! vertex shader outputs as the hardware does; that is the same for vertex
 //! shaders linear in their inputs (blits, 2D quads). Inputs in formats
-//! [`components`] does not know keep the first vertex's value, and so do
+//! [`components`] does not know keep the `va` vertex's value, and so do
 //! components past the end of the vertex (an element that reaches into the
 //! next one, which the layout allows).
 
+/// Corner index (`0`, `1`, or `2`) at the right angle of triangle `p`: the
+/// corner opposite its longest edge, defaulting to `1` on ties or non-finite coords.
+fn right_angle(p: [[f32; 2]; 3]) -> usize {
+    let dist2 = |a: [f32; 2], b: [f32; 2]| {
+        let (dx, dy) = (a[0] - b[0], a[1] - b[1]);
+        dx * dx + dy * dy
+    };
+    let (d0, d1, d2) = (dist2(p[1], p[2]), dist2(p[0], p[2]), dist2(p[0], p[1]));
+    if d0 > d1 && d0 > d2 {
+        0
+    } else if d2 > d1 && d2 > d0 {
+        2
+    } else {
+        1
+    }
+}
+
 /// Expands `rects` rectangles of `stride`-byte vertices from `src` into six
-/// vertices each in `dst`: `(v0, v1, v2)` and `(v0, v2, v3)`, so both
-/// triangles turn the same way. `elements` are (byte offset, format).
+/// vertices each in `dst`: `(v0, v1, v2)` and `(va, vb, v3)`, so both
+/// triangles turn the same way, with the right angle `vc` picked from the
+/// first float element of two or more components (taken as the position;
+/// none: at `v1`), `va` before it, `vb` after it and `v3 = va + vb - vc`.
+/// `elements` are (byte offset, format).
 pub(crate) fn expand_rects(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
     if stride == 12
         && matches!(
@@ -38,20 +57,23 @@ fn expand_position_color(src: &[u8], dst: &mut [u8], elements: &[(u32, u32)]) {
         let [first, middle, last] = *vertices else {
             unreachable!("three vertices per rectangle");
         };
-        let mut position = [0.0f32; 2];
-        let mut finite = true;
-        for (axis, result) in position.iter_mut().enumerate() {
-            let read = |vertex: &[u8; 12]| f32::from_le_bytes(vertex.as_chunks::<4>().0[axis]);
-            let (a, b, c) = (read(&first), read(&middle), read(&last));
-            finite &= a.is_finite() & b.is_finite() & c.is_finite();
-            *result = (a + c) - b;
+        let mut pos = [[0.0f32; 2]; 3];
+        for (slot, vertex) in vertices.iter().enumerate() {
+            for (axis, result) in pos[slot].iter_mut().enumerate() {
+                *result = f32::from_le_bytes(vertex.as_chunks::<4>().0[axis]);
+            }
         }
-        if !finite {
-            // Use the generic calculation for NaNs and infinities, including
-            // the choice of NaN payload when more than one operand is a NaN.
+        let finite = pos.iter().flatten().all(|v| v.is_finite());
+        if !finite || right_angle(pos) != 1 {
+            // Use the generic path for non-finite coordinates or rectangles whose
+            // right angle is not at vertex 1 (e.g. tiled lighting quads).
             expand_rects_generic(rect, out, 12, elements);
             continue;
         }
+        let position = [
+            (pos[0][0] + pos[2][0]) - pos[1][0],
+            (pos[0][1] + pos[2][1]) - pos[1][1],
+        ];
 
         out[..36].copy_from_slice(rect);
         out[36..48].copy_from_slice(&first);
@@ -69,16 +91,31 @@ fn expand_position_color(src: &[u8], dst: &mut [u8], elements: &[(u32, u32)]) {
 }
 
 fn expand_rects_generic(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(u32, u32)]) {
+    if stride == 0 {
+        return;
+    }
     for (rect, out) in src
         .chunks_exact(3 * stride)
         .zip(dst.chunks_exact_mut(6 * stride))
     {
         let v = |i: usize| &rect[i * stride..(i + 1) * stride];
-        for (slot, i) in [0, 1, 2, 0, 2].into_iter().enumerate() {
+        let right = elements
+            .iter()
+            .find_map(|&(offset, format)| {
+                let at = offset as usize;
+                let (n, kind) = components(format)?;
+                let float = matches!(kind, Kind::F32 | Kind::F16);
+                (float && n >= 2 && stride.saturating_sub(at) / kind.bytes() >= 2).then(|| {
+                    right_angle([0, 1, 2].map(|i| [0, 1].map(|k| kind.read(&v(i)[at..], k))))
+                })
+            })
+            .unwrap_or(1);
+        let (a, b) = ((right + 2) % 3, (right + 1) % 3);
+        for (slot, i) in [0, 1, 2, a, b].into_iter().enumerate() {
             out[slot * stride..(slot + 1) * stride].copy_from_slice(v(i));
         }
         let fourth = &mut out[5 * stride..];
-        fourth.copy_from_slice(v(0));
+        fourth.copy_from_slice(v(a));
         for &(offset, format) in elements {
             let at = offset as usize;
             let Some((n, kind)) = components(format) else {
@@ -89,7 +126,7 @@ fn expand_rects_generic(src: &[u8], dst: &mut [u8], stride: usize, elements: &[(
             let inside = stride.saturating_sub(at) / kind.bytes();
             for c in 0..n.min(inside) {
                 let get = |i: usize| kind.read(&v(i)[at..], c);
-                let value = get(0) + get(2) - get(1);
+                let value = get(a) + get(b) - get(right);
                 kind.write(&mut fourth[at..], c, value);
             }
         }
@@ -389,5 +426,44 @@ mod tests {
         assert_eq!(f32_to_half(2f32.powi(-26)), 0x0000);
         assert_eq!(f32_to_half(1.5), 0x3e00);
         assert_eq!(half_to_f32(0x0001), 2f32.powi(-24));
+    }
+
+    /// Tiled lighting's order (top left, bottom left, top right: the right
+    /// angle first) completes at the bottom right, the second triangle
+    /// `(v2, v1, v3)`, preserving winding across both triangles.
+    #[test]
+    fn rectangles_complete_opposite_their_right_angle() {
+        let vertex = |x: f32, y: f32| [x.to_le_bytes(), y.to_le_bytes()].concat();
+        let src = [vertex(0.0, 0.0), vertex(0.0, 1.0), vertex(1.0, 0.0)].concat();
+        let mut dst = vec![0u8; 6 * 8];
+        expand_rects(&src, &mut dst, 8, &[(0, 16)]);
+        assert_eq!(
+            &dst[24..],
+            &[&src[16..24], &src[8..16], &vertex(1.0, 1.0)[..]].concat()[..]
+        );
+        let read = |d: &[u8], i: usize| {
+            let f = |k: usize| {
+                f32::from_le_bytes(d[i * 8 + k * 4..i * 8 + k * 4 + 4].try_into().unwrap())
+            };
+            [f(0), f(1)]
+        };
+        let turn = |d: &[u8], i: usize| {
+            let [a, b, c] = [i, i + 1, i + 2].map(|k| read(d, k));
+            (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+        };
+        assert_eq!(turn(&dst, 0).signum(), turn(&dst, 3).signum());
+
+        // Also test the 12-byte position+color fast path for right angle at v0.
+        let mut src12 = Vec::new();
+        for (x, y, c) in [(0.0f32, 0.0f32, [10u8, 20, 30, 40]), (0.0, 1.0, [20, 40, 60, 80]), (1.0, 0.0, [30, 60, 90, 120])] {
+            src12.extend_from_slice(&vertex(x, y));
+            src12.extend_from_slice(&c);
+        }
+        let mut dst12 = vec![0u8; 6 * 12];
+        expand_rects(&src12, &mut dst12, 12, &[(0, 16), (8, 28)]);
+        assert_eq!(
+            &dst12[60..72],
+            &[1.0f32.to_le_bytes(), 1.0f32.to_le_bytes(), [40, 80, 120, 160]].concat()[..]
+        );
     }
 }
