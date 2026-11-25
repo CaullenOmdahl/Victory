@@ -345,6 +345,10 @@ impl View {
 /// shortcut: views without a resource object (constant buffers, memory
 /// views, samplers) are kept for the run; they are bounded by the title's
 /// memory and sampler states.
+/// Freed view indices kept in the recent journal; a heap that fell further
+/// behind falls back to checking all of its resource-backed slots.
+const FREED_KEPT: usize = 1 << 16;
+
 struct Views {
     /// Each entry's view and generation.
     list: Vec<(View, u32)>,
@@ -352,6 +356,10 @@ struct Views {
     /// Entries naming each resource.
     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
     free: Vec<u32>,
+    /// Recently freed view indices (ring capped at [`FREED_KEPT`]) and the
+    /// total number freed so far.
+    freed: std::collections::VecDeque<u32>,
+    freed_total: u64,
 }
 
 // Read by every list recorder for every descriptor it binds: readers share
@@ -362,6 +370,8 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     index: std::collections::BTreeMap::new(),
     by_resource: std::collections::BTreeMap::new(),
     free: Vec::new(),
+    freed: std::collections::VecDeque::new(),
+    freed_total: 0,
 });
 const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
@@ -411,25 +421,62 @@ fn record(handle: u64, view: View) {
 
 /// The title released `resource`: the views naming it go stale.
 pub(crate) fn forget(resource: usize) {
-    let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
-    let Some(entries) = views.by_resource.remove(&resource) else {
-        return;
+    let any_freed = {
+        let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
+        let Some(entries) = views.by_resource.remove(&resource) else {
+            return;
+        };
+        let mut freed = false;
+        for i in entries {
+            let (view, generation) = views.list[i as usize].clone();
+            // Entries freed through a view's other resource may hold another
+            // view by now.
+            if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
+                continue;
+            }
+            views.index.remove(&view);
+            views.list[i as usize].1 = generation.wrapping_add(1).max(1);
+            // The view's other resource (a counter) keeps a stale entry, which
+            // `forget` of that resource skips.
+            views.free.push(i);
+            if views.freed.len() == FREED_KEPT {
+                views.freed.pop_front();
+            }
+            views.freed.push_back(i);
+            views.freed_total += 1;
+            freed = true;
+        }
+        freed
     };
     #[cfg(windows)]
-    host::bindless_viewed_changed();
-    for i in entries {
-        let (view, generation) = views.list[i as usize].clone();
-        // Entries freed through a view's other resource may hold another
-        // view by now.
-        if views.index.get(&view) != Some(&i) || !view.resources().contains(&resource) {
-            continue;
-        }
-        views.index.remove(&view);
-        views.list[i as usize].1 = generation.wrapping_add(1).max(1);
-        // The view's other resource (a counter) keeps a stale entry, which
-        // `forget` of that resource skips.
-        views.free.push(i);
+    if any_freed {
+        host::bindless_viewed_changed();
     }
+    #[cfg(not(windows))]
+    let _ = any_freed;
+}
+
+/// Total number of resource-backed view entries freed so far.
+#[cfg(windows)]
+fn freed_views_total() -> u64 {
+    VIEWS.read().unwrap_or_else(|e| e.into_inner()).freed_total
+}
+
+/// View indices freed since `seen`, or `None` if more than [`FREED_KEPT`] were
+/// freed since then, together with the current total.
+#[cfg(windows)]
+fn freed_views_since(seen: u64) -> (Option<Vec<u32>>, u64) {
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    let total = views.freed_total;
+    let n = total.saturating_sub(seen) as usize;
+    if n == 0 {
+        return (Some(Vec::new()), total);
+    }
+    if n > views.freed.len() {
+        return (None, total);
+    }
+    let out = views.freed.iter().skip(views.freed.len() - n).copied().collect();
+    (Some(out), total)
 }
 
 /// Of `entries` (slot, (view entry, generation)), those whose view went
@@ -455,6 +502,21 @@ fn view_at(i: u32, generation: u32) -> Option<View> {
     let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let (view, current) = views.list.get(i as usize)?;
     (*current == generation).then(|| view.clone())
+}
+
+/// Resolves a batch of optional `(view_index, generation)` pairs under a
+/// single lock acquisition, writing the results into `out`.
+#[cfg(windows)]
+fn views_at_batch(entries: &[Option<(u32, u32)>], out: &mut Vec<Option<View>>) {
+    out.clear();
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+    for entry in entries {
+        let view = entry.and_then(|(i, generation)| {
+            let (view, current) = views.list.get(i as usize)?;
+            (*current == generation).then(|| view.clone())
+        });
+        out.push(view);
+    }
 }
 
 /// The view recorded at `handle`, if one is (and its resource is alive).

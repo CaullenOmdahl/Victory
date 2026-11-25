@@ -331,9 +331,7 @@ impl Staging {
         }
         // Read through our safe copy: the title may unmap the pages
         // (evicting a texture a big table lists) while we read them.
-        SCRATCH.with_borrow_mut(|tiled| {
-            tiled.resize(size, 0);
-            crate::host::copy_mapped(tiled.as_mut_ptr(), self.memory, size, false);
+        with_tiled_copy(self.memory, size, |tiled| {
             let read = self.changed(last, tiled, rewritten);
             last.still = if read.1 { 0 } else { (last.still + 1).min(3) };
             // Not all in the same frame; cap backoff at 4 frames so streamed
@@ -342,10 +340,6 @@ impl Staging {
                 0 | 1 => 0,
                 k => frame + (1 << (k - 1).min(2)) - (self.memory as u64 >> 16) % 2,
             };
-            // As in `with_tiled_copy`: a one-off huge read is not kept.
-            if tiled.capacity() > 64 << 20 {
-                *tiled = Vec::new();
-            }
             read
         })
     }
@@ -532,7 +526,7 @@ pub(crate) mod flips {
 
 /// Reads a texture for the duration of its detile. Keep the initialized
 /// length so alternating large and small textures do not re-zero the tail.
-fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
+fn with_tiled_copy<T>(memory: *const u8, size: usize, use_copy: impl FnOnce(&[u8]) -> T) -> T {
     SCRATCH.with_borrow_mut(|read| {
         if size > read.len() {
             read.reserve_exact(size - read.len());
@@ -540,13 +534,14 @@ fn with_tiled_copy(memory: *const u8, size: usize, detile: impl FnOnce(&[u8])) {
         }
         let tiled = &mut read[..size];
         crate::host::copy_mapped(tiled.as_mut_ptr(), memory, size, false);
-        detile(tiled);
+        let result = use_copy(tiled);
         // Keep the room for the next texture unless it is far bigger than
         // usual (a one-off, like a whole pool): it is commit charge.
         if read.capacity() > 64 << 20 {
             *read = Vec::new();
         }
-    });
+        result
+    })
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -1134,7 +1129,7 @@ mod read_tests {
     use super::*;
 
     #[test]
-    fn watched_texture_reads_reuse_space_and_expose_only_current_bytes() {
+    fn texture_reads_reuse_space_and_expose_only_current_bytes() {
         #[cfg(feature = "diagnostics")]
         if crate::copystat::mode() == 2 {
             return; // this mode skips all copies
@@ -1144,14 +1139,17 @@ mod read_tests {
         let next = [0x43; 8192];
         let mut allocation = None;
         for source in [&large[..], &small[..], &next[..]] {
-            with_tiled_copy(source.as_ptr(), source.len(), |tiled| {
+            let copied = with_tiled_copy(source.as_ptr(), source.len(), |tiled| {
                 assert_eq!(tiled, source);
                 if let Some(first) = allocation {
                     assert_eq!(tiled.as_ptr(), first);
                 } else {
                     allocation = Some(tiled.as_ptr());
                 }
+                tiled.len()
             });
+            assert_eq!(copied, source.len());
+            SCRATCH.with_borrow(|scratch| assert_eq!(scratch.len(), large.len()));
         }
     }
 

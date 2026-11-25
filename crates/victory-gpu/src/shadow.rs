@@ -2412,18 +2412,23 @@ fn find_copy(address: u64, len: u64) -> Option<Arc<Shadow>> {
         return Some(copy);
     }
     let mut map = buffers();
-    let holding: Vec<((u64, usize), bool)> = map
+    let mut first = None;
+    let mut made = None;
+    for (k, e) in map
         .range(..=(address, usize::MAX))
         .rev()
         .take(64)
         .filter(|(_, e)| e.end >= end)
-        .map(|(k, e)| (*k, e.shadow.is_some()))
-        .collect();
-    let key = holding
-        .iter()
-        .find(|(_, made)| *made)
-        .or(holding.first())
-        .map(|(k, _)| *k);
+    {
+        if first.is_none() {
+            first = Some(*k);
+        }
+        if e.shadow.is_some() {
+            made = Some(*k);
+            break;
+        }
+    }
+    let key = made.or(first);
     let Some(key) = key else {
         drop(map);
         return loose(address, end);
