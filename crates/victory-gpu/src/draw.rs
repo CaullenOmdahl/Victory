@@ -766,6 +766,7 @@ impl State {
         // Vertex buffers the input layout reads.
         let mut views = [D3D12_VERTEX_BUFFER_VIEW::default(); 32];
         let mut count = 0;
+        let mut refreshes = Vec::new();
         for (slot, (view, &v)) in views.iter_mut().zip(&self.vertex).enumerate() {
             if p.slots & 1 << slot == 0 {
                 continue;
@@ -777,7 +778,9 @@ impl State {
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
                 continue;
             };
-            shadow.refresh(list, v.address, u64::from(v.size));
+            if let Some((address, len)) = shadow.refresh_params(v.address, u64::from(v.size)) {
+                refreshes.push((shadow.clone(), address, len));
+            }
             *view = D3D12_VERTEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -795,7 +798,9 @@ impl State {
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
                 return no("no index buffer");
             };
-            shadow.refresh(list, v.address, u64::from(v.size));
+            if let Some((address, len)) = shadow.refresh_params(v.address, u64::from(v.size)) {
+                refreshes.push((shadow.clone(), address, len));
+            }
             let view = D3D12_INDEX_BUFFER_VIEW {
                 BufferLocation: shadow.gpu(v.address),
                 SizeInBytes: v.size,
@@ -803,6 +808,9 @@ impl State {
             };
             // SAFETY: an open list; the view names a live host buffer.
             unsafe { l.IASetIndexBuffer(Some(&view)) };
+        }
+        if !refreshes.is_empty() {
+            list.defer_refreshes(&refreshes);
         }
         const RENDER_TARGET: u32 = 0x4;
         const DEPTH_WRITE: u32 = 0x10;

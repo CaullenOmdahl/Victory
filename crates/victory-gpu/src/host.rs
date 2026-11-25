@@ -637,6 +637,36 @@ mod tests {
             desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0,
         );
     }
+
+    #[test]
+    fn defer_refreshes_matches_one_call_per_range() {
+        let Some(host) = host() else { return };
+        let Ok(one) = host.new_list() else { return };
+        let Ok(batched) = host.new_list() else { return };
+        let Some(shadow) = crate::shadow::find(0x1000, 0x100) else {
+            return;
+        };
+        let ranges = [
+            (shadow.clone(), 0x1000usize, 0x100usize),
+            (shadow.clone(), 0x1100, 0x100),
+            (shadow.clone(), 0x1000, 0x100),
+        ];
+        for (shadow, address, len) in &ranges {
+            one.defer_refresh(shadow, *address, *len);
+        }
+        batched.defer_refreshes(&ranges);
+        let one = one.deferred();
+        let batched = batched.deferred();
+        assert_eq!(one.copies.len(), 2);
+        assert_eq!(batched.copies.len(), 2);
+        for (a, b) in one.copies.iter().zip(&batched.copies) {
+            let (Step::Refresh(a, aa, al), Step::Refresh(b, ba, bl)) = (a, b) else {
+                panic!("only refreshes were deferred");
+            };
+            assert_eq!(std::sync::Arc::as_ptr(a), std::sync::Arc::as_ptr(b));
+            assert_eq!((aa, al), (ba, bl));
+        }
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -2346,12 +2376,23 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        self.defer_refreshes(&[(shadow.clone(), address, len)]);
+    }
+
+    /// Brings several ranges up to date when the list is submitted, taking
+    /// the deferred lock once however many buffers a draw uses.
+    pub(crate) fn defer_refreshes(
+        &self,
+        refreshes: &[(std::sync::Arc<crate::shadow::Shadow>, usize, usize)],
+    ) {
         let mut deferred = self.deferred();
-        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
-        if deferred.refreshed.insert(key) {
-            deferred
-                .copies
-                .push(Step::Refresh(shadow.clone(), address, len));
+        for (shadow, address, len) in refreshes {
+            let key = (std::sync::Arc::as_ptr(shadow) as usize, *address, *len);
+            if deferred.refreshed.insert(key) {
+                deferred
+                    .copies
+                    .push(Step::Refresh(shadow.clone(), *address, *len));
+            }
         }
     }
 
@@ -2972,9 +3013,77 @@ impl HostList {
 /// lists of a world submission sample the same textures, and a texture in
 /// physical-page memory is hashed whole each time it is checked. Checked
 /// once, it is checked again only after a step that writes title memory.
+/// Per-shadow sorted, disjoint `[from, to)` refresh spans in a [`Batch`].
+/// Overlapping and touching intervals coalesce; far-apart intervals stay
+/// separate so refreshes do not copy or stall on unrelated gaps.
+const MAX_BATCH_SPANS: usize = 64;
+
+enum Spans {
+    One((usize, usize)),
+    Many(Vec<(usize, usize)>),
+}
+
+impl Spans {
+    fn add(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        match self {
+            Self::One((a, b)) => {
+                if from <= *b && to >= *a {
+                    *a = (*a).min(from);
+                    *b = (*b).max(to);
+                } else {
+                    let v = if to < *a {
+                        vec![(from, to), (*a, *b)]
+                    } else {
+                        vec![(*a, *b), (from, to)]
+                    };
+                    *self = Self::Many(v);
+                }
+            }
+            Self::Many(v) => coalesce_span(v, from, to),
+        }
+    }
+
+    fn as_slice(&self) -> &[(usize, usize)] {
+        match self {
+            Self::One(range) => std::slice::from_ref(range),
+            Self::Many(ranges) => ranges.as_slice(),
+        }
+    }
+}
+
+fn coalesce_span(spans: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    if from >= to {
+        return;
+    }
+    let pos = spans.partition_point(|&(_, end)| end < from);
+    let mut lo = from;
+    let mut hi = to;
+    let mut erase_end = pos;
+    while erase_end < spans.len() && spans[erase_end].0 <= hi {
+        lo = lo.min(spans[erase_end].0);
+        hi = hi.max(spans[erase_end].1);
+        erase_end += 1;
+    }
+    if pos < erase_end {
+        spans[pos] = (lo, hi);
+        spans.drain(pos + 1..erase_end);
+    } else {
+        spans.insert(pos, (lo, hi));
+    }
+    if spans.len() > MAX_BATCH_SPANS
+        && let Some(best) = (0..spans.len() - 1).min_by_key(|&i| spans[i + 1].0 - spans[i].1)
+    {
+        spans[best].1 = spans[best + 1].1;
+        spans.remove(best + 1);
+    }
+}
+
 #[derive(Default)]
 struct Batch {
-    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    refreshes: Vec<(std::sync::Arc<crate::shadow::Shadow>, Spans)>,
     /// The same of sparse copies.
     pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
@@ -2991,7 +3100,9 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
-        let end = address + len;
+        let Some(end) = address.checked_add(len).filter(|&e| e > address) else {
+            return;
+        };
         if shadow.is_sparse() {
             // It stands for far more memory than a list reads.
             self.pieces.push((shadow.clone(), address, end));
@@ -3000,10 +3111,12 @@ impl Batch {
         match self
             .refreshes
             .iter_mut()
-            .find(|(s, ..)| std::sync::Arc::ptr_eq(s, shadow))
+            .find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow))
         {
-            Some((_, from, to)) => (*from, *to) = ((*from).min(address), (*to).max(end)),
-            None => self.refreshes.push((shadow.clone(), address, end)),
+            Some((_, spans)) => spans.add(address, end),
+            None => self
+                .refreshes
+                .push((shadow.clone(), Spans::One((address, end)))),
         }
     }
 
@@ -3033,8 +3146,10 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, from, to) in std::mem::take(&mut self.refreshes) {
-            update(&shadow, from, to - from);
+        for (shadow, spans) in std::mem::take(&mut self.refreshes) {
+            for &(from, to) in spans.as_slice() {
+                update(&shadow, from, to - from);
+            }
         }
         let mut pieces = std::mem::take(&mut self.pieces);
         if pieces.is_empty() {
@@ -4745,6 +4860,42 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             });
         });
         assert!(items.iter().all(|c| c.load(Ordering::Relaxed) == 1));
+    }
+
+    #[test]
+    fn coalesced_spans_keep_disjoint_ranges_separate_and_merge_overlaps() {
+        use super::{MAX_BATCH_SPANS, Spans};
+
+        let mut spans = Spans::One((100, 160));
+        spans.add(110, 140);
+        assert_eq!(spans.as_slice(), &[(100, 160)]);
+        spans.add(160, 200);
+        assert_eq!(spans.as_slice(), &[(100, 200)]);
+        spans.add(80, 120);
+        assert_eq!(spans.as_slice(), &[(80, 200)]);
+        spans.add(300, 300);
+        assert_eq!(spans.as_slice(), &[(80, 200)]);
+
+        spans.add(10, 30);
+        spans.add(500, 560);
+        spans.add(300, 360);
+        assert_eq!(
+            spans.as_slice(),
+            &[(10, 30), (80, 200), (300, 360), (500, 560)]
+        );
+
+        spans.add(200, 300);
+        assert_eq!(spans.as_slice(), &[(10, 30), (80, 360), (500, 560)]);
+
+        let mut bounded = Spans::One((0, 10));
+        for i in 1..MAX_BATCH_SPANS {
+            let start = i * 100;
+            bounded.add(start, start + 10);
+        }
+        assert_eq!(bounded.as_slice().len(), MAX_BATCH_SPANS);
+        bounded.add(120, 125);
+        assert_eq!(bounded.as_slice().len(), MAX_BATCH_SPANS);
+        assert!(bounded.as_slice().contains(&(100, 125)));
     }
 }
 

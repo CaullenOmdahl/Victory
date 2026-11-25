@@ -242,15 +242,31 @@ impl Shadow {
         unsafe { std::slice::from_raw_parts(self.data.add(self.offset(address) as usize), len) }.to_vec()
     }
 
+    #[cfg(test)]
+    pub(crate) fn byte_at(&self, offset: usize) -> u8 {
+        assert!(offset < self.len as usize);
+        // SAFETY: `offset` is bounds-checked inside `self.data` of length `self.len`.
+        unsafe { *self.data.add(offset) }
+    }
+
     /// Brings `len` bytes at `address` up to date when `list` is submitted,
     /// and keeps the copy alive until the list is reset.
     pub(crate) fn refresh(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
-        if self.direct.is_some() {
-
-            return;
+        if let Some((address, len)) = self.refresh_params(address, len) {
+            list.defer_refresh(self, address, len);
         }
-        let len = len.min(self.start + self.len - address);
-        list.defer_refresh(self, address as usize, len as usize);
+    }
+
+    /// The range [`Shadow::refresh`] would bring up to date, for callers that
+    /// collect several buffers and defer them under one lock.
+    pub(crate) fn refresh_params(self: &Arc<Self>, address: u64, len: u64) -> Option<(usize, usize)> {
+        if self.direct.is_some() {
+            return None;
+        }
+        Some((
+            address as usize,
+            len.min(self.start + self.len - address) as usize,
+        ))
     }
 
     fn new(
