@@ -210,7 +210,8 @@ fn packed_integer_dot_products() {
     for (name, bits, signed, implicit) in [
         ("v_dot2_i32_i16", 16, true, false), ("v_dot2_u32_u16", 16, false, false),
         ("v_dot4_i32_i8", 8, true, false), ("v_dot4_u32_u8", 8, false, false),
-        ("v_dot4c_i32_i8", 8, true, true), ("v_dot8_u32_u4", 4, false, false),
+        ("v_dot4c_i32_i8", 8, true, true), ("v_dot8_i32_i4", 4, true, false),
+        ("v_dot8_u32_u4", 4, false, false),
     ] {
         for (clamp, swap) in [(false, false), (true, false), (false, true)] {
             if (implicit && clamp) || (bits != 16 && swap) { continue }
