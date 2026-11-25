@@ -1350,8 +1350,11 @@ impl HostHeap {
         if FAILED[1].load(Ordering::Relaxed) >= WALKS {
             return None;
         }
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..spare).chain(0..*next as usize);
+        // Search from `next` on, then from the start (extending past cursor by
+        // n - 1 so contiguous runs crossing the cursor are not missed).
+        let cursor = *next as usize;
+        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(spare);
+        let starts = (cursor..spare).chain(0..second_end);
         let mut run = 0;
         let mut found = None;
         let mut last = usize::MAX;
@@ -4437,5 +4440,18 @@ void main(uint3 id : SV_DispatchThreadID) {
         desc[10] = 0x1000;
         assert_eq!(buffer_range(&View::Placed(false, resource, desc)), None);
         assert_eq!(buffer_range(&View::Placed(true, resource, desc)), None);
+    }
+
+    #[test]
+    fn a_free_run_across_the_search_start_is_found() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let spare = heap.spare;
+        let a = heap.dynamic(50).unwrap();
+        let b = heap.dynamic(spare - 60).unwrap();
+        assert_eq!((a, b), (4, 4 + 50));
+        heap.release(b + spare - 70, 10);
+        assert_eq!(heap.dynamic(20), Some(4 + spare - 20));
     }
 }

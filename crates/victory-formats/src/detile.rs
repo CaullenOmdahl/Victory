@@ -119,13 +119,18 @@ fn validate_plan<'a>(
     }
     let element_bytes = layout.desc.element_bytes as usize;
     let row_bytes = m.width as usize * element_bytes;
-    let need = (depth as usize - 1)
-        .checked_mul(depth_pitch)
-        .zip((m.height as usize - 1).checked_mul(row_pitch))
-        .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
+    let slice_len = (m.height as usize - 1)
+        .checked_mul(row_pitch)
         .and_then(|offset| offset.checked_add(row_bytes))
         .ok_or(Error::TooSmall)?;
-    if tiled_len < layout.reach(mip) as usize || linear_len < need || row_pitch < row_bytes {
+    if row_pitch < row_bytes || (depth > 1 && depth_pitch < slice_len) {
+        return Err(Error::TooSmall);
+    }
+    let need = (depth as usize - 1)
+        .checked_mul(depth_pitch)
+        .and_then(|offset| offset.checked_add(slice_len))
+        .ok_or(Error::TooSmall)?;
+    if tiled_len < layout.reach(mip) as usize || linear_len < need {
         return Err(Error::TooSmall);
     }
     Ok(CopyPlan {
