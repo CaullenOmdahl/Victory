@@ -205,6 +205,13 @@ pub(crate) fn dispatched() -> u64 {
     DISPATCHED.load(Ordering::Relaxed)
 }
 
+/// Whether single-record scattered indirect draws are gathered for their list's
+/// prelude (`VICTORY_INDIRECT_GATHER=0`: off; on by default).
+fn gathers() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_GATHER").is_none_or(|v| v != "0"))
+}
+
 /// The host address of a root view: its buffer's host copy, or for a
 /// constant buffer not 256-byte aligned there (the console needs 16) a
 /// copy in upload memory.
@@ -978,11 +985,20 @@ impl State {
         true
     }
 
+    /// Whether the shaders of the pipeline currently bound may write memory:
+    /// a draw with them can modify indirect arguments for subsequent draws,
+    /// closing list-prelude indirect gathering (`crate::indirect::gather`).
+    fn may_store(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_none_or(|p| p.stages.iter().any(|s| s.translated().writes_memory))
+    }
+
     /// Runs a dispatch on the host.
     /// With `threads`, `x` counts threads, not groups (the console's
     /// `USE_THREAD_DIMENSIONS`).
     // shortcut: y and z stay groups; such dispatches are one-dimensional.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, threads: bool) {
+        list.gather_close();
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1184,6 +1200,9 @@ impl State {
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
     /// programs are one-dimensional).
     pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
         if x > MAX_GROUPS {
@@ -1505,6 +1524,9 @@ impl State {
         first: u32,
         first_instance: u32,
     ) {
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
         let rects = self.topology == RECTANGLES && !self.draws_rectangles();
@@ -1605,6 +1627,9 @@ impl State {
         base: i32,
         first_instance: u32,
     ) {
+        if self.may_store() {
+            list.gather_close();
+        }
         #[cfg(feature = "diagnostics")]
         self.trace("indexed", indices, first);
         let rects = self.topology == RECTANGLES && !self.draws_rectangles();
@@ -1763,17 +1788,47 @@ impl State {
             s.refresh(list, *at, 4);
         }
         let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+        let rects_indirect =
+            matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES;
+        let may_store = self.may_store();
+        // Fast path (`VICTORY_INDIRECT_GATHER`, on by default): gather single
+        // scattered indirect draw records so `list.prelude` clamps all of them
+        // in one batched dispatch instead of a separate dispatch + UAV barrier
+        // per draw.
+        let gathered = (kind != DISPATCH
+            && max == 1
+            && count.is_none()
+            && !rects_indirect
+            && !may_store
+            && gathers())
+        .then(|| {
+            use windows::core::Interface;
+            let src_id = args.buffer.as_raw() as u64;
+            let slot = crate::indirect::gather(
+                list,
+                (&args.buffer, src_id),
+                args.offset(arguments),
+                (kind, stride),
+            )?;
+            args.refresh(list, arguments, len);
+            Some(slot)
+        })
+        .flatten();
+        if kind == DISPATCH || may_store {
+            list.gather_close();
+        }
         // Draws of a run: clamped in the list before, which the run's first
         // draw opened (`crate::list`), so that nothing of ours comes between
         // the draws.
-        let before = (kind != DISPATCH
+        let before = (gathered.is_none()
+            && kind != DISPATCH
             && match crate::indirect::hoist_mode() {
                 0 | 6 => false,
                 3 => kind == MESH,
                 4 => kind != MESH,
                 _ => true,
             }
-            && !(matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES)
+            && !rects_indirect
             && self.hoists_into(list))
         .then(|| self.hoist.as_ref().map(|h| h.clamps.clone()))
         .flatten()
@@ -1791,8 +1846,8 @@ impl State {
                 (kind, stride, max),
             )
         });
-        let inline = before.is_none();
-        let (bounded, bounded_at) = match before {
+        let inline = gathered.is_none() && before.is_none();
+        let (bounded, bounded_at) = match gathered.or(before) {
             Some(b) => b,
             None => {
                 args.refresh(list, arguments, len);
