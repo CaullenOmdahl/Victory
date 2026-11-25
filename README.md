@@ -14,7 +14,7 @@ Tested on: **CachyOS Linux (`7.3.4-1-cachyos`), Proton (`proton-patched`, `vkd3d
 |------|-------------------------------------|
 | Boot, menus | 22–30 fps |
 | In-world rendering | Renders lit open world, characters, textures, water, sky, and geometry |
-| Frame rate in the world | **1.5–2.1 fps** (`474–669 ms/frame` in `diag` builds; `126–165 ms` on the GPU, down from `752–1,150 ms/frame` / `363–662 ms` GPU baseline) |
+| Frame rate in the world | **1.5–2.1 fps** (`474–669 ms/frame` in settled `diag` runs, `1.7–2.0 fps` / `511.5–593.8 ms/frame` on Loop 26; `126–175 ms` on the GPU, down from `752–1,150 ms/frame` / `363–662 ms` GPU baseline) |
 | Stability | In-world runs complete without `0x887A0005` GPUVM faults once Proton null-buffer guards, remap invalidations, and `USERPTR` gating landed |
 | Memory | ~5.6 GiB commit (~10.9 GiB title private, ~19.9 GiB mapped) |
 
@@ -24,8 +24,8 @@ Tested on: **CachyOS Linux (`7.3.4-1-cachyos`), Proton (`proton-patched`, `vkd3d
   - Gated `OpenExistingHeapFromAddress1` (`direct()`) behind `VICTORY_IN_PLACE_WINE=1` on Wine (`MEM_PRIVATE` round-trips, `MEM_MAPPED` reads zeroes, and host-RAM `USERPTR` slows RX 6800 GPU execution ~20× vs VRAM copies).
   - Added `VirtualFree`/`VirtualProtect`/`XMemFreeDefault` remap invalidation notifications, buffer/view span clamping, null root buffer handling, early-pipeline list save, and 64 MB compiler worker stacks with stuck-compile recovery.
 - **CPU, watch, bindless & GPU speedups:**
-  - Persistent 20-thread `in_parallel` pool and 16 compiler workers; `RwLock` conversion on `GUARDS`, `JOURNAL`, and descriptor `VIEWS`; `64 KiB` per-block region epochs, pin cleanup on remap, 8 MiB guarded chunks, and disjoint `Batch` refresh spans.
-  - Dirty-generation texture hash bypass (`xmem` persistent views), incremental bindless planning, lock-free descriptor heap gets, stack root slots, cached `bind_pipeline`, hoisted & wave-coalesced indirect clamps with device-local budget, DirectStorage cross-queue staging bypass, and thin LTO (`codegen-units = 1`) release builds.
+  - Persistent 20-thread `in_parallel` pool, AVX2/SSE2 256B micro-tile texture detiler with `DetilePool` (`#195`), and 16 compiler workers; `RwLock` conversion on `GUARDS`, `JOURNAL`, and descriptor `VIEWS`; `64 KiB` per-block region epochs, pin cleanup on remap, 8 MiB guarded chunks, and disjoint `Batch` refresh spans.
+  - Dirty-generation texture hash bypass (`xmem` persistent views), incremental bindless planning, lock-free descriptor heap gets, stack root slots, cached `bind_pipeline`, hoisted & wave-coalesced indirect clamps with device-local budget, DirectStorage cross-queue staging bypass and physical-page read deferral on half-full auto-submits, and thin LTO (`codegen-units = 1`) release builds.
 - **Shader & rendering correctness:**
   - Ported upstream normalized buffer exact quotient rounding (`da82e444`), `UAVS_EVERY_STAGE` (`a1a2077a`), right-angle rectangle completion (`8ff79135`), sparse `any_mapped()` texture residency (`921d8d3b`), `CalculateLOD` spatial array fixes & packed pixel inputs (`5f4c3df4`), DXIL dead-code elimination, branch pruning, handle dedup, reachable-only liveness, VOP1/VOP3 CMPX EXEC & divergent-loop Wave64 fixes, and BC7 dictionary entry 0 fix.
 
