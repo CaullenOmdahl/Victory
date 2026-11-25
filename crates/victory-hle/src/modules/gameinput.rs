@@ -1152,13 +1152,26 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
+            let merge_scripted = |_slot: usize, mut pad: PadState| -> PadState {
+                #[cfg(feature = "diagnostics")]
+                if _slot == 0 {
+                    for vk in scripted() {
+                        for &(mapped_vk, bit) in &FALLBACK_BUTTONS {
+                            if mapped_vk == vk {
+                                pad.buttons |= bit;
+                            }
+                        }
+                    }
+                }
+                pad
+            };
             let empty = self.empty_until[slot].is_some_and(|until| Instant::now() < until);
             if !empty {
                 let mut state = XINPUT_STATE::default();
                 // SAFETY: room for the state.
                 if unsafe { XInputGetState(slot as u32, &mut state) } == 0 {
                     self.empty_until[slot] = None;
-                    return Some(convert(&state.Gamepad));
+                    return Some(merge_scripted(slot, convert(&state.Gamepad)));
                 }
                 self.empty_until[slot] = Some(Instant::now() + EMPTY_SLOT_RECHECK);
             }
@@ -1167,15 +1180,18 @@ mod host {
             if slot == 0
                 && let Some(pad) = super::super::dualsense::latest()
             {
-                return Some(PadState {
-                    buttons: pad.buttons,
-                    left_trigger: pad.left_trigger,
-                    right_trigger: pad.right_trigger,
-                    left_x: pad.left_x,
-                    left_y: pad.left_y,
-                    right_x: pad.right_x,
-                    right_y: pad.right_y,
-                });
+                return Some(merge_scripted(
+                    slot,
+                    PadState {
+                        buttons: pad.buttons,
+                        left_trigger: pad.left_trigger,
+                        right_trigger: pad.right_trigger,
+                        left_x: pad.left_x,
+                        left_y: pad.left_y,
+                        right_x: pad.right_x,
+                        right_y: pad.right_y,
+                    },
+                ));
             }
             None
         }

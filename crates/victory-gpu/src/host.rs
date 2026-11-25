@@ -1242,6 +1242,39 @@ impl Host {
         }
     }
 
+    /// The last fence value the host GPU has reached.
+    pub(crate) fn completed_fence(&self) -> u64 {
+        // SAFETY: a plain fence query.
+        unsafe { self.fence.GetCompletedValue() }
+    }
+
+    /// Takes the submission lock, waits for any in-flight GPU work to finish,
+    /// runs `f`, and when `f` reports queue work (`true`) signals the host
+    /// fence so callers can tell when that work has completed on the GPU.
+    ///
+    /// Must not be called from inside [`in_parallel`] while a submission holds
+    /// `self.submitted`.
+    pub(crate) fn drain_and_signal<R>(&self, f: impl FnOnce() -> (R, bool)) -> (R, Option<u64>) {
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.drain_in_flight_locked();
+        let (result, signal) = f();
+        let fence = if signal {
+            *submitted += 1;
+            let fence_val = *submitted;
+            // SAFETY: caller holds `self.submitted`; `self.fence` is ours.
+            match unsafe { self.queue.Signal(&self.fence, fence_val) } {
+                Ok(()) => Some(fence_val),
+                Err(e) => {
+                    tracing::warn!(error = %e, "host sweep fence not signalled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        (result, fence)
+    }
+
     /// Waits for any in-flight async submission while `self.submitted` is already held.
     fn drain_in_flight_locked(&self) {
         let target = self
