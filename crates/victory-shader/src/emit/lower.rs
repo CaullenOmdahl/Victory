@@ -91,6 +91,10 @@ enum Val {
     Missing(Why),
 }
 
+/// A descriptor load's address given by root parameters alone: root
+/// parameter and byte offset.
+type EntryAddress = (usize, u32);
+
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
     /// Bit n: immediate sampler n is used for comparisons.
@@ -104,6 +108,9 @@ pub(crate) struct Lowered {
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
+    /// Heap handles written.
+    #[cfg(test)]
+    pub heap_handles: u32,
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
@@ -495,6 +502,14 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    /// Handles made in the entry block for descriptors at addresses the
+    /// root parameters alone give (table and heap loads with no other
+    /// term), by root parameter, byte offset, dword, sampler heap and
+    /// properties ([`Lower::entry_address`]).
+    entry_handles: HashMap<(EntryAddress, u8, bool, (u32, u32)), V>,
+    /// Handles of descriptors chosen by control flow, made in their join
+    /// block, by the choice (its `Debug` text), sampler heap and properties.
+    join_handles: HashMap<(String, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -1305,6 +1320,8 @@ impl<'a> Lower<'a> {
             exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
+            entry_handles: HashMap::new(),
+            join_handles: HashMap::new(),
             edges: HashMap::new(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
@@ -1946,6 +1963,8 @@ impl<'a> Lower<'a> {
             root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
+            #[cfg(test)]
+            heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
@@ -6930,6 +6949,22 @@ impl<'a> Lower<'a> {
         match src {
             Source::Address => Err("a buffer descriptor made in code"),
             Source::Loaded { load, first } => {
+                if let Some(address) = self.entry_address(*load) {
+                    // The same descriptor wherever it is loaded: the console
+                    // compiler reloads one before every use rather than keep
+                    // it, and one handle made in the entry block serves them
+                    // all.
+                    let key = (address, *first, sampler, props);
+                    if let Some(&h) = self.entry_handles.get(&key) {
+                        return Ok(h);
+                    }
+                    let here = std::mem::replace(&mut self.cur, self.s.entry);
+                    let index = self.entry_heap_index(address, *first, sampler);
+                    let h = self.s.heap_handle(self.cur, index, sampler, false, props);
+                    self.cur = here;
+                    self.entry_handles.insert(key, h);
+                    return Ok(h);
+                }
                 // The element type is part of the key: one UAV read as float
                 // and used atomically needs two handles (an atomic on a float
                 // handle is invalid and crashed the NVIDIA compiler).
@@ -7012,38 +7047,23 @@ impl<'a> Lower<'a> {
             {
                 self.handle(site, arg, sampler, props)
             }
-            Source::Phi { block, args } => {
-                // Each predecessor computes its heap index at its end; the
-                // join picks one with a phi.
+            Source::Phi { block, .. } => {
+                // One handle at the join for every access the choice reaches
+                // (each is in a block the join dominates).
                 let _ = site;
-                let mut incoming = Vec::new();
-                for (&q, arg) in self.x.p.blocks[*block].preds.iter().zip(args) {
-                    if self.block[q].is_none() {
-                        continue;
-                    }
-                    let Some(tail) = self.tail[q] else {
-                        return Err("a descriptor chosen by control flow");
-                    };
-                    let at = self.edges.get(&(q, *block)).copied().unwrap_or(tail);
-                    let here = std::mem::replace(&mut self.cur, at);
-                    let index = match arg {
-                        Source::Loaded { load, first } => self.heap_index(*load, *first, sampler),
-                        Source::Phi { .. } | Source::Select { .. } => self.heap_slot(arg, sampler),
-                        Source::Unset => Ok(self.s.m.i32(0)),
-                        _ => {
-                            if std::env::var_os("VICTORY_WHY").is_some() {
-                                eprintln!("phi of {arg:?}");
-                            }
-                            Err("a descriptor chosen by control flow")
-                        }
-                    };
-                    self.cur = here;
-                    incoming.push((index?, at));
+                let key = (format!("{src:?}"), sampler, props);
+                if let Some(&h) = self.join_handles.get(&key) {
+                    return Ok(h);
                 }
                 let join = self.block[*block].ok_or("a descriptor chosen by control flow")?;
-                let phi = self.s.m.phi(join, self.s.t.i32);
-                self.s.m.set_phi(phi, incoming);
-                Ok(self.s.heap_handle(self.cur, phi, sampler, false, props))
+                let here = std::mem::replace(&mut self.cur, join);
+                let h = self
+                    .heap_slot(src, sampler)
+                    .map(|index| self.s.heap_handle(self.cur, index, sampler, false, props));
+                self.cur = here;
+                let h = h?;
+                self.join_handles.insert(key, h);
+                Ok(h)
             }
             Source::Select { scc, args } => {
                 // The heap index of each choice, picked by SCC (uniform).
@@ -7355,6 +7375,33 @@ impl<'a> Lower<'a> {
         );
         let x = self.s.m.extract(c, res, 0);
         self.as_int(x)
+    }
+
+    /// The address of the descriptor load at `load` when root parameters
+    /// alone give it (a table or a heap, at a fixed offset: resource
+    /// tracking found no other term).
+    fn entry_address(&self, load: Site) -> Option<EntryAddress> {
+        let a = self.scalar.get(&load)?;
+        let root = self.x.native.layout.get(a.param)?.root;
+        let heap = matches!(root, RootType::Table | RootType::ResourceHeap | RootType::SamplerHeap);
+        (a.dynamic.is_none() && heap).then_some((a.param, a.offset))
+    }
+
+    /// [`Lower::heap_index`] of a descriptor at a fixed address
+    /// ([`Lower::entry_address`]), in the entry block.
+    fn entry_heap_index(&mut self, (param, offset): EntryAddress, first: u8, sampler: bool) -> V {
+        let entry = self.s.entry;
+        let base = match self.x.native.layout[param].root {
+            RootType::Table => match self.user(param, 0) {
+                Val::I32(x) => x,
+                _ => unreachable!(),
+            },
+            _ => self.s.m.i32(0),
+        };
+        let k = self.s.m.i32(offset.wrapping_add(4 * u32::from(first)));
+        let addr = self.s.m.bin(entry, Bin::Add, base, k);
+        let shift = self.s.m.i32(if sampler { 4 } else { 5 });
+        self.s.m.bin(entry, Bin::LShr, addr, shift)
     }
 
     /// The heap index of the descriptor at dword `first` of what the scalar
@@ -13738,6 +13785,96 @@ mod tests {
             why(indexed_root_load(0x0010_0000, 0x1181_4FAC)),
             "a buffer indexed by lane"
         );
+    }
+
+    #[test]
+    fn descriptors_reloaded_from_a_root_table_share_one_handle() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0x7E04_02F0, // v_mov_b32 v2, 0.5
+            0x7E06_02F0, // v_mov_b32 v3, 0.5
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF84_0005, // s_cbranch_scc0 -> the reload
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0 (again)
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        let l = lower_with(&words, layout, vec![]).unwrap();
+        assert_eq!(l.heap_handles, 2);
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone())
+                .expect("DXIL validation failed");
+        }
+    }
+
+    #[test]
+    fn descriptors_joined_by_nested_control_flow_lower_to_one_uniform_handle() {
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0A02,
+            0xFA00_0040, // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xBE88_03FF,
+            0x0000_0092, // s_mov_b32 s8, 0x92 (an immediate sampler)
+            0xBE89_0380, // s_mov_b32 s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0xBF84_0003, // s_cbranch_scc0 -> 0x38
+            0xF40C_0302,
+            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBF82_0008, // s_branch -> 0x58
+            0xBF06_8101, // 0x38: s_cmp_eq_u32 s1, 1
+            0xBF84_0003, // s_cbranch_scc0 -> 0x4c
+            0xF40C_0302,
+            0xFA00_0020, // s_load_dwordx8 s[12:19], s[4:5], 0x20
+            0xBF82_0002, // s_branch -> 0x54
+            0xF40C_0302,
+            0xFA00_0000, // 0x4c: s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xBE86_0301, // 0x54: s_mov_b32 s6, s1
+            0x7E04_02F0, // 0x58: v_mov_b32 v2, 0.5
+            0x7E06_02F0, // v_mov_b32 v3, 0.5
+            0x3420_0082, // v_lshlrev_b32 v16, 2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xF09C_0F08,
+            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:SQ_RSRC_IMG_2D
+            0xE070_1000,
+            0x800A_0C10, // buffer_store_dword v12, v16, s[40:43], 0 offen
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::Table, 0, 0), root(RootType::Constants, 1, 1)];
+        let l = lower_with(&words, layout, vec![]).unwrap();
+        assert_eq!(l.nonuniform_handles, 0);
+        #[cfg(windows)]
+        if let Ok(mut v) = super::super::validator::Validator::load(
+            super::super::validator::Validator::default_path().as_deref(),
+        ) {
+            v.validate(&mut l.dxil.clone())
+                .expect("DXIL validation failed");
+        }
     }
 
     #[test]
