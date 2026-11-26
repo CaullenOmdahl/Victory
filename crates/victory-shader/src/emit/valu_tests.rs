@@ -1872,3 +1872,59 @@ fn a_half_written_mask_tests_its_high_dword() {
         "lanes 32-63 read the mask's high dword"
     );
 }
+
+/// A float channel wider than a half is cut toward zero in a d16 load, as
+/// RDNA2 packs it, also where the host's conversion rounds to nearest.
+const D16_FLOATS: [(f32, u32); 12] = [
+    (1.0, 0x3C00),
+    (1.0 + 1.0 / 2048.0, 0x3C00),
+    (1.0 + 3.0 / 2048.0, 0x3C01),
+    (1.0 + 1.9 / 1024.0, 0x3C01),
+    (-1.0 - 3.0 / 2048.0, 0xBC01),
+    (65_504.0, 0x7BFF),
+    (70_000.0, 0x7BFF),
+    (-70_000.0, 0xFBFF),
+    (f32::INFINITY, 0x7C00),
+    (f32::NEG_INFINITY, 0xFC00),
+    (3.9 / 16_777_216.0, 0x0003),
+    (0.9 / 16_777_216.0, 0x0000),
+];
+
+#[test]
+fn tbuffer_d16_loads_cut_32_bit_floats_toward_zero() {
+    let shader = tbuffer_load_of_v1(8, 22);
+    let inputs = D16_FLOATS.map(|(f, _)| [f.to_bits(), 0, 0, 0]);
+    let mut wrong = Vec::new();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let (stored, want) = D16_FLOATS[i];
+        if got & 0xFFFF != want {
+            wrong.push(format!(
+                "{backend}: {stored} = {:#06x}, want {want:#06x}",
+                got & 0xFFFF
+            ));
+        }
+    });
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn the_scc_a_waterfall_loop_leaves_is_false() {
+    let shader = build_valu_cs(&[
+        s_mov_b32(20, 126),                     // s20 = exec_lo
+        s_mov_b32(21, 126),                     // s21 = exec_lo
+        vop1(0x002, 22, vgpr(1)),               // loop: v_readfirstlane_b32 s22, v1
+        0x7C00_0000 | 0xD2 << 17 | 1 << 9 | 22, // v_cmpx_eq_u32 s22, v1
+        0xBE95_4715,                            // s_andn2_wrexec_b32 s21, s21
+        0xBF89_FFFC,                            // s_cbranch_execnz -> loop
+        s_mov_b32(126, 20),                     // exec_lo = s20
+        sop2(0x0A, 23, 1, 2),                   // s_cselect_b32 s23, s1, s2
+        vop1(0x001, 0, sgpr(23)),               // v0 = s23
+    ]);
+    run_cases(
+        &shader,
+        &[[3, 1, 2, 0], [0, 7, 9, 0]],
+        |backend, _, inputs, actual| {
+            assert_eq!(actual, inputs[2], "{backend}");
+        },
+    );
+}
