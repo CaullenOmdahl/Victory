@@ -1,5 +1,5 @@
 //! Large title buffers resident in device-local VRAM (`D3D12_HEAP_TYPE_DEFAULT`)
-//! with GPU-side Wave64 64 KiB page hashing (`CARD_COMPARE`) for copy-back.
+//! with GPU-side Wave64 piece hashing (`CARD_COMPARE`) for copy-back.
 //!
 //! Instead of keeping large buffers (4–75+ MiB) in system RAM (`L0`) over PCIe
 //! and taking multi-megabyte CPU snapshots + CPU diffs every submission:
@@ -10,10 +10,10 @@
 //! - Before a submission (`card_before`), only CPU-modified ranges are uploaded
 //!   via `CopyBufferRegion` and re-hashed on the GPU (if the buffer has hashes).
 //! - At the end of a submission (`card_after`), `CARD_COMPARE` dispatches one
-//!   64-thread workgroup per declared 64 KiB page in VRAM (64 coalesced
-//!   1024-byte bursts per page, 64x less sequential latency than 1 thread/page),
-//!   writing a 4-byte dirty flag per page to a small readback buffer.
-//! - After the fence (`card_back`), ONLY pages flagged dirty are copied from
+//!   64-thread workgroup per declared piece (`VICTORY_CARD_PIECE_KB=4|16|64`,
+//!   default 64 KiB) in VRAM, writing a 4-byte dirty flag per piece to a small
+//!   readback buffer.
+//! - After the fence (`card_back`), ONLY pieces flagged dirty are copied from
 //!   VRAM to a readback buffer and merged into title memory + `staging`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -51,8 +51,8 @@ groupshared uint4 s_acc[64];
 void main(uint3 gid : SV_GroupID, uint tid : SV_GroupIndex) {
     if (gid.x >= pieces) return;
     uint piece = first + gid.x;
-    uint lo = piece * 65536u;
-    uint hi = min(lo + 65536u, size);
+    uint lo = piece * CARD_PIECE_BYTES;
+    uint hi = min(lo + CARD_PIECE_BYTES, size);
 
     uint4 h = uint4(
         0x9E3779B9u ^ (tid * 0x85EBCA6Bu),
@@ -112,27 +112,74 @@ pub(crate) fn enabled() -> bool {
 }
 
 /// `(min_bytes, max_total_bytes)` for card buffers:
-/// `VICTORY_CARD_BUFFERS_MIN_MB` (default 4 MiB) and
-/// `VICTORY_CARD_BUFFERS_MB` (default 2048 MiB).
+/// `VICTORY_CARD_BUFFERS_MIN_KB` or `VICTORY_CARD_BUFFERS_MIN_MB` (default 4 MiB)
+/// and `VICTORY_CARD_BUFFERS_MB` (default `(budget / 4).max(2048 MiB)`).
+fn compute_limits(
+    min_kb_env: Option<u64>,
+    min_mb_env: Option<u64>,
+    max_mb_env: Option<u64>,
+    local_vram_budget: Option<u64>,
+) -> (u64, u64) {
+    let min_bytes = match min_kb_env {
+        Some(kb) => (kb << 10).max(PAGE as u64),
+        None => (min_mb_env.unwrap_or(4) << 20).max(1 << 20),
+    };
+    let max_bytes = match max_mb_env {
+        Some(mb) => mb << 20,
+        None => match local_vram_budget {
+            Some(budget) if budget > 0 => (budget / 4).max(2048 << 20),
+            _ => 2048 << 20,
+        },
+    };
+    (min_bytes, max_bytes)
+}
+
 fn limits() -> (u64, u64) {
     static LIMITS: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
     *LIMITS.get_or_init(|| {
-        let mb = |name: &str, default: u64| {
+        let env_u64 = |name: &str| {
             std::env::var(name)
                 .ok()
                 .and_then(|v| v.trim().parse::<u64>().ok())
-                .unwrap_or(default)
-                << 20
         };
-        (
-            mb("VICTORY_CARD_BUFFERS_MIN_MB", 4).max(1 << 20),
-            mb("VICTORY_CARD_BUFFERS_MB", 2048),
+        let budget = crate::host::video_memory().map(|[(_, budget), _]| budget);
+        compute_limits(
+            env_u64("VICTORY_CARD_BUFFERS_MIN_KB"),
+            env_u64("VICTORY_CARD_BUFFERS_MIN_MB"),
+            env_u64("VICTORY_CARD_BUFFERS_MB"),
+            budget,
         )
     })
 }
 
+/// Configured card-compare piece size in bytes (`VICTORY_CARD_PIECE_KB=4|16|64`,
+/// default 64 KiB [`PAGE`]).
+pub(crate) fn piece_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| match std::env::var("VICTORY_CARD_PIECE_KB").ok().as_deref() {
+        Some("4") => 4 << 10,
+        Some("16") => 16 << 10,
+        _ => PAGE,
+    })
+}
+
+fn card_compare_source(piece_bytes: usize) -> String {
+    format!("#define CARD_PIECE_BYTES {piece_bytes}u\n{CARD_COMPARE_HLSL}")
+}
+
+/// D3D12 max X dispatch group count.
+const MAX_GROUPS: u32 = 65_535;
+
+/// Splits `pieces` pieces into `(offset, count)` chunks within [`MAX_GROUPS`].
+fn card_compare_chunks(pieces: u32) -> impl Iterator<Item = (u32, u32)> {
+    (0..pieces).step_by(MAX_GROUPS as usize).map(move |offset| {
+        let count = (pieces - offset).min(MAX_GROUPS);
+        (offset, count)
+    })
+}
+
 pub(crate) fn hash_table_bytes(size: u64) -> u64 {
-    ((size / PAGE as u64 + 1) * 16).next_multiple_of(256)
+    ((size / piece_bytes() as u64 + 1) * 16).next_multiple_of(256)
 }
 
 /// Per-`Shadow` state when a buffer lives in device-local VRAM (`DEFAULT`).
@@ -269,7 +316,7 @@ impl CardState {
     }
 
     pub(crate) fn total_pieces(&self) -> u32 {
-        (self.size / PAGE as u64) as u32
+        (self.size / piece_bytes() as u64) as u32
     }
 }
 
@@ -292,9 +339,13 @@ fn merge_byte_ranges(ranges: &mut Vec<(usize, usize)>) {
     ranges.truncate(out + 1);
 }
 
-/// Converts byte ranges `[from, to)` into sorted, merged 64 KiB piece runs `(first_piece, count)`.
-fn byte_ranges_to_piece_runs(ranges: &[(usize, usize)], max_pieces: u32) -> Vec<(u32, u32)> {
-    if ranges.is_empty() || max_pieces == 0 {
+/// Converts byte ranges `[from, to)` into sorted, merged piece runs `(first_piece, count)`.
+fn byte_ranges_to_piece_runs(
+    ranges: &[(usize, usize)],
+    max_pieces: u32,
+    piece: usize,
+) -> Vec<(u32, u32)> {
+    if ranges.is_empty() || max_pieces == 0 || piece == 0 {
         return Vec::new();
     }
     let mut spans: Vec<(u32, u32)> = Vec::with_capacity(ranges.len());
@@ -302,8 +353,8 @@ fn byte_ranges_to_piece_runs(ranges: &[(usize, usize)], max_pieces: u32) -> Vec<
         if from >= to {
             continue;
         }
-        let first = (from / PAGE) as u32;
-        let end = (to.div_ceil(PAGE) as u32).min(max_pieces);
+        let first = (from / piece) as u32;
+        let end = (to.div_ceil(piece) as u32).min(max_pieces);
         if first < end {
             spans.push((first, end));
         }
@@ -379,12 +430,13 @@ unsafe impl Send for CardEngine {}
 
 impl CardEngine {
     pub(crate) fn new(host: &Host) -> windows::core::Result<Self> {
+        let source = card_compare_source(piece_bytes());
         let mut code: Option<ID3DBlob> = None;
         // SAFETY: valid HLSL source and entry point.
         unsafe {
             D3DCompile(
-                CARD_COMPARE_HLSL.as_ptr().cast(),
-                CARD_COMPARE_HLSL.len(),
+                source.as_ptr().cast(),
+                source.len(),
                 windows::core::s!("card_compare_wave64"),
                 None,
                 None,
@@ -501,7 +553,8 @@ impl CardEngine {
         Some((rb, ptr as usize))
     }
 
-    /// Dispatches `CARD_COMPARE` for `count` contiguous 64 KiB pieces starting at `first`.
+    /// Dispatches `CARD_COMPARE` for `count` contiguous pieces starting at `first`,
+    /// splitting into `<= 65_535`-group chunks to stay within D3D12 dispatch limits.
     unsafe fn dispatch_hash(
         &self,
         list: &ID3D12GraphicsCommandList,
@@ -517,15 +570,24 @@ impl CardEngine {
         if count == 0 {
             return;
         }
-        let constants = [first, 0u32, size, count, out_at_bytes, compare];
         // SAFETY: caller ensures `list` is open with `root_sig` and `pso` bound
         // and all 3 buffers are live with valid states.
         unsafe {
-            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
             list.SetComputeRootShaderResourceView(1, vram.GetGPUVirtualAddress());
             list.SetComputeRootUnorderedAccessView(2, hashes.GetGPUVirtualAddress());
             list.SetComputeRootUnorderedAccessView(3, differs.GetGPUVirtualAddress());
-            list.Dispatch(count, 1, 1);
+            for (offset, chunk_count) in card_compare_chunks(count) {
+                let constants = [
+                    first + offset,
+                    0u32,
+                    size,
+                    chunk_count,
+                    out_at_bytes + offset * 4,
+                    compare,
+                ];
+                list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                list.Dispatch(chunk_count, 1, 1);
+            }
         }
     }
 
@@ -578,6 +640,7 @@ impl CardEngine {
             }
         }
 
+        let piece = piece_bytes();
         for entry in &mut entries {
             let mut byte_ranges = Vec::with_capacity(entry.declared.len());
             for &(addr, len) in &entry.declared {
@@ -586,7 +649,7 @@ impl CardEngine {
                     byte_ranges.push((from, to));
                 }
             }
-            entry.runs = byte_ranges_to_piece_runs(&byte_ranges, entry.card.total_pieces());
+            entry.runs = byte_ranges_to_piece_runs(&byte_ranges, entry.card.total_pieces(), piece);
             entry.out_start = total_pieces;
             total_pieces += entry.runs.iter().map(|&(_, c)| c).sum::<u32>();
         }
@@ -606,7 +669,7 @@ impl CardEngine {
                     .unwrap_or_else(|e| e.into_inner())
                     .clone()
             {
-                let runs = byte_ranges_to_piece_runs(ranges, card.total_pieces());
+                let runs = byte_ranges_to_piece_runs(ranges, card.total_pieces(), piece);
                 if !runs.is_empty() {
                     rehash_uploads.push((card.clone(), hashes, runs));
                 }
@@ -635,14 +698,19 @@ impl CardEngine {
         // Step A: Copy dirty staging ranges -> VRAM.
         for (card, ranges) in &dirty_cards {
             for &(from, to) in ranges {
+                let from = (from as u64).min(card.size);
+                let to = (to as u64).min(card.size);
+                if from >= to {
+                    continue;
+                }
                 // SAFETY: both buffers cover `[from, to)`; implicit COMMON promotion.
                 unsafe {
                     list.CopyBufferRegion(
                         &card.vram,
-                        from as u64,
+                        from,
                         &card.staging,
-                        from as u64,
-                        (to - from) as u64,
+                        from,
+                        to - from,
                     );
                 }
             }
@@ -828,13 +896,14 @@ impl CardEngine {
             &[]
         };
 
-        // Collect coalesced runs of dirty 64 KiB pieces per entry.
+        // Collect coalesced runs of dirty pieces per entry.
         struct DirtyRun {
             entry_idx: usize,
             first_piece: u32,
             count: u32,
             rb_offset: u64,
         }
+        let piece = piece_bytes() as u64;
         let mut dirty_runs: Vec<DirtyRun> = Vec::new();
         let mut total_bytes = 0u64;
 
@@ -845,12 +914,12 @@ impl CardEngine {
             let mut entry_bytes = 0u64;
             for &(first, count) in &entry.runs {
                 for k in 0..count {
-                    let piece = first + k;
+                    let piece_idx = first + k;
                     if differs.get(out_idx).copied().unwrap_or(0) != 0 {
                         match &mut cur {
-                            Some((s, c)) if *s + *c == piece => *c += 1,
+                            Some((s, c)) if *s + *c == piece_idx => *c += 1,
                             Some((s, c)) => {
-                                let bytes = u64::from(*c) * PAGE as u64;
+                                let bytes = u64::from(*c) * piece;
                                 entry_runs.push(DirtyRun {
                                     entry_idx,
                                     first_piece: *s,
@@ -858,16 +927,16 @@ impl CardEngine {
                                     rb_offset: total_bytes + entry_bytes,
                                 });
                                 entry_bytes += bytes;
-                                cur = Some((piece, 1));
+                                cur = Some((piece_idx, 1));
                             }
-                            None => cur = Some((piece, 1)),
+                            None => cur = Some((piece_idx, 1)),
                         }
                     }
                     out_idx += 1;
                 }
             }
             if let Some((s, c)) = cur {
-                let bytes = u64::from(c) * PAGE as u64;
+                let bytes = u64::from(c) * piece;
                 entry_runs.push(DirtyRun {
                     entry_idx,
                     first_piece: s,
@@ -893,14 +962,21 @@ impl CardEngine {
             if ok {
                 for run in &dirty_runs {
                     let entry = &plan.entries[run.entry_idx];
-                    // SAFETY: `vram` is in COMMON (promotes to COPY_SOURCE, decays to COMMON).
+                    let src_off = u64::from(run.first_piece) * piece;
+                    let copy_bytes = (u64::from(run.count) * piece)
+                        .min(entry.card.size.saturating_sub(src_off));
+                    if copy_bytes == 0 {
+                        continue;
+                    }
+                    // SAFETY: `vram` is in COMMON (promotes to COPY_SOURCE, decays to COMMON);
+                    // `src_off..src_off + copy_bytes` is within `entry.card.size` and `fetch_res`.
                     unsafe {
                         self.fetch_list.CopyBufferRegion(
                             &fetch_res,
                             run.rb_offset,
                             &entry.card.vram,
-                            u64::from(run.first_piece) * PAGE as u64,
-                            u64::from(run.count) * PAGE as u64,
+                            src_off,
+                            copy_bytes,
                         );
                     }
                 }
@@ -994,8 +1070,55 @@ mod tests {
         let runs = byte_ranges_to_piece_runs(
             &[(0, 10), (PAGE - 1, PAGE + 1), (3 * PAGE, 4 * PAGE)],
             8,
+            PAGE,
         );
         assert_eq!(runs, vec![(0, 2), (3, 1)]);
+
+        let small_runs = byte_ranges_to_piece_runs(
+            &[(0, 10), (4095, 4097), (3 * 4096, 4 * 4096)],
+            16,
+            4096,
+        );
+        assert_eq!(small_runs, vec![(0, 2), (3, 1)]);
+    }
+
+    #[test]
+    fn card_compare_chunks_respects_65535_group_limit() {
+        for n in [0, 1, MAX_GROUPS - 1, MAX_GROUPS, MAX_GROUPS + 1, 2 * MAX_GROUPS + 5] {
+            let mut seen = 0u32;
+            for (offset, count) in card_compare_chunks(n) {
+                assert_eq!(offset, seen);
+                assert!((1..=MAX_GROUPS).contains(&count));
+                seen += count;
+            }
+            assert_eq!(seen, n);
+        }
+    }
+
+    #[test]
+    fn compute_limits_scales_with_vram_budget_and_honors_env_overrides() {
+        let mib = 1u64 << 20;
+        let gib = 1u64 << 30;
+        // 8 GiB budget -> stays at 2048 MiB floor, 4 MiB default min.
+        assert_eq!(
+            compute_limits(None, None, None, Some(8 * gib)),
+            (4 * mib, 2048 * mib)
+        );
+        // 16 GiB budget -> auto-scales to 4096 MiB (25% of budget).
+        assert_eq!(
+            compute_limits(None, None, None, Some(16 * gib)),
+            (4 * mib, 4096 * mib)
+        );
+        // Explicit env overrides win.
+        assert_eq!(
+            compute_limits(Some(256), Some(8), Some(1024), Some(16 * gib)),
+            (256 << 10, 1024 * mib)
+        );
+        // Sub-PAGE min_kb clamps up to PAGE (64 KiB).
+        assert_eq!(
+            compute_limits(Some(16), None, None, None),
+            (PAGE as u64, 2048 * mib)
+        );
     }
 
     #[test]
@@ -1006,6 +1129,8 @@ mod tests {
         let mut engine = CardEngine::new(&host).expect("CardEngine should build on WARP");
         let pages = 4usize;
         let size = (pages * PAGE) as u64;
+        let pieces_per_page = PAGE / piece_bytes();
+        let total_pieces = pages * pieces_per_page;
         let mut title = vec![0u8; size as usize];
         for (i, b) in title.iter_mut().enumerate() {
             *b = ((i.wrapping_mul(31) ^ (i >> 8)) & 0xFF) as u8;
@@ -1027,15 +1152,15 @@ mod tests {
         shadow.writing(base, size as usize);
         let (before, plan) = engine.record_before(&host, &[(shadow.clone(), base, size as usize)]);
         assert!(before.is_some(), "initial upload + hash must emit before list");
-        assert_eq!(plan.total_pieces, pages as u32);
+        assert_eq!(plan.total_pieces, total_pieces as u32);
         let after = engine.record_after(&host, &plan).expect("after list");
         host.execute_and_wait_locked(before.unwrap(), &mut submitted);
         host.execute_and_wait_locked(after, &mut submitted);
 
         let differs_1 = unsafe {
-            std::slice::from_raw_parts(engine.differs_rb.1 as *const u32, pages).to_vec()
+            std::slice::from_raw_parts(engine.differs_rb.1 as *const u32, total_pieces).to_vec()
         };
-        assert_eq!(differs_1, vec![0, 0, 0, 0]);
+        assert_eq!(differs_1, vec![0; total_pieces]);
         let written_1 = engine.finish_back(&host, plan, &mut submitted);
         assert_eq!(written_1, 0);
 
@@ -1075,8 +1200,10 @@ mod tests {
             host.execute_and_wait_locked(after2, &mut submitted);
 
             let differs_2 =
-                std::slice::from_raw_parts(engine.differs_rb.1 as *const u32, pages).to_vec();
-            assert_eq!(differs_2, vec![0, 0, 1, 0], "only page 2 should differ");
+                std::slice::from_raw_parts(engine.differs_rb.1 as *const u32, total_pieces).to_vec();
+            let mut expected_differs = vec![0u32; total_pieces];
+            expected_differs[2 * pieces_per_page] = 1;
+            assert_eq!(differs_2, expected_differs, "only the modified piece on page 2 should differ");
             let written_2 = engine.finish_back(&host, plan2, &mut submitted);
             assert_eq!(written_2, 4, "tight dirty span should write exactly 4 GPU bytes");
             assert_eq!(&title[2 * PAGE + 128..2 * PAGE + 132], &gpu_bytes);

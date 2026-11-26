@@ -351,7 +351,7 @@ impl Shadow {
         self.inside(address, len)
     }
 
-    /// Merges GPU-modified 64 KiB pieces (fetched from VRAM into `runs`:
+    /// Merges GPU-modified card pieces (fetched from VRAM into `runs`:
     /// `(first_piece, count, readback_ptr)`) into title memory and `card.staging`.
     /// Returns bytes written to title memory.
     pub(crate) fn merge_card_pieces(
@@ -362,9 +362,10 @@ impl Shadow {
         let start = self.start as usize;
         let shadow_len = self.len as usize;
         let mode = self.watched.load(Ordering::Relaxed);
+        let piece_bytes = crate::card::piece_bytes();
         let mut written = 0usize;
-        let mut title_buf = pooled(PAGE);
-        title_buf.resize(PAGE, 0);
+        let mut title_buf = pooled(piece_bytes);
+        title_buf.resize(piece_bytes, 0);
         let mut synced_pages: Vec<usize> = Vec::new();
         let mut min_addr = usize::MAX;
         let mut max_addr = 0usize;
@@ -372,16 +373,16 @@ impl Shadow {
         for &(first_piece, count, rb_ptr) in runs {
             for k in 0..count {
                 let piece = (first_piece + k) as usize;
-                let off = piece * PAGE;
+                let off = piece * piece_bytes;
                 if off >= shadow_len {
                     break;
                 }
-                let n = PAGE.min(shadow_len - off);
+                let n = piece_bytes.min(shadow_len - off);
                 let title_addr = start + off;
-                // SAFETY: `rb_ptr` holds `count * PAGE` bytes fetched from VRAM;
+                // SAFETY: `rb_ptr` holds `count * piece_bytes` bytes fetched from VRAM;
                 // `self.data` maps `card.staging` of at least `shadow_len` bytes.
                 let gpu_new = unsafe {
-                    std::slice::from_raw_parts((rb_ptr + (k as usize) * PAGE) as *const u8, n)
+                    std::slice::from_raw_parts((rb_ptr + (k as usize) * piece_bytes) as *const u8, n)
                 };
                 let staging_old =
                     unsafe { std::slice::from_raw_parts_mut(self.data.add(off), n) };

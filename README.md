@@ -97,6 +97,11 @@ Speed:
   processor's work, not by the wait.
 - Shader cache entries of another build can be reused
   (`VICTORY_SHADER_BUILD_OF=<executable>`, diagnostics).
+- Large writable buffers resident in VRAM (`card.rs`) auto-scale their total
+  cap from the adapter's local VRAM budget (`budget / 4`, at least 2048 MiB;
+  overridable via `VICTORY_CARD_BUFFERS_MB`, minimum size via
+  `VICTORY_CARD_BUFFERS_MIN_KB` / `VICTORY_CARD_BUFFERS_MIN_MB`, piece hash
+  granularity via `VICTORY_CARD_PIECE_KB=4|16|64`).
 
 Memory the title shows at several addresses:
 - Every view of a guarded physical page is guarded with it, so a write of
