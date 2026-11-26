@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, RwLock};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Per-block (64 KiB) epoch table (or `VICTORY_EPOCH_SHIFT=26` for 64 MiB).
 /// Incremented for only the block(s) touched whenever a guarded block is
@@ -608,44 +608,51 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     }
     let mut written = Vec::new();
     let mut run: Option<usize> = None;
-    for block in first..=last {
+    let mut block = first;
+    while block <= last {
         if block < last && check_each && !mapped(block * BLOCK) {
             if let Some(from) = run.take() {
                 protect(&mut g, from, block, &mut written);
             }
-            g.holes.insert(block);
-            g.dirty.remove(&block);
+            let hole_end = hole_run_end(block, last);
+            for b in block..hole_end {
+                g.holes.insert(b);
+                g.dirty.remove(&b);
+            }
+            block = hole_end;
             continue;
         }
-        let open = block < last && !g.clean.contains(&block) && !g.holes.contains(&block);
+        let current = block;
+        block += 1;
+        let open = current < last && !g.clean.contains(&current) && !g.holes.contains(&current);
         if open {
-            if !g.pins.is_empty() && g.pinned(block) {
+            if !g.pins.is_empty() && g.pinned(current) {
                 if let Some(from) = run.take() {
-                    protect(&mut g, from, block, &mut written);
+                    protect(&mut g, from, current, &mut written);
                 }
                 // The kernel may be writing it: left writable, reported
                 // written at every check until the pin ends.
-                g.dirty.insert(block);
-                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                g.dirty.insert(current);
+                written.extend(current * BLOCK / PAGE..(current + 1) * BLOCK / PAGE);
                 // No range holding it is clean meanwhile (`region_epoch`).
-                bump_region_epochs(block * BLOCK, (block + 1) * BLOCK);
+                bump_region_epochs(current * BLOCK, (current + 1) * BLOCK);
                 continue;
-            } else if g.protected.contains(&block) {
+            } else if g.protected.contains(&current) {
                 if let Some(from) = run.take() {
-                    protect(&mut g, from, block, &mut written);
+                    protect(&mut g, from, current, &mut written);
                 }
                 // Written through the runtime, still read-only.
-                g.clean.insert(block);
-                g.dirty.remove(&block);
-                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+                g.clean.insert(current);
+                g.dirty.remove(&current);
+                written.extend(current * BLOCK / PAGE..(current + 1) * BLOCK / PAGE);
                 continue;
             } else {
-                run.get_or_insert(block);
+                run.get_or_insert(current);
                 continue;
             }
         }
         if let Some(from) = run.take() {
-            protect(&mut g, from, block, &mut written);
+            protect(&mut g, from, current, &mut written);
         }
     }
     g.mark_covered(first, last);
@@ -689,32 +696,39 @@ fn mapped(at: usize) -> bool {
     };
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
-    let mut region = WIN32_MEMORY_REGION_INFORMATION::default();
-    // SAFETY: both queries describe an address without dereferencing it. The
-    // output buffers match their information classes.
-    let queried = unsafe {
-        QueryVirtualMemoryInformation(
-            GetCurrentProcess(),
-            at as *const _,
-            MemoryRegionInfo,
-            (&raw mut region).cast(),
-            size_of_val(&region),
-            std::ptr::null_mut(),
-        )
-    };
-    if queried != 0 {
-        // These are the Windows SDK's named bitfields in declaration order.
-        // windows-sys exposes only the union's raw bits.
-        const PRIVATE: u32 = 1 << 0;
-        const MAPPED_DATA_FILE: u32 = 1 << 1;
-        const MAPPED_IMAGE: u32 = 1 << 2;
-        const MAPPED_PAGE_FILE: u32 = 1 << 3;
-        const MAPPED_PHYSICAL: u32 = 1 << 4;
-        // SAFETY: this union was filled by the successful query above.
-        match unsafe { region.Anonymous.Flags } {
-            MAPPED_DATA_FILE | MAPPED_PAGE_FILE | MAPPED_PHYSICAL => return true,
-            PRIVATE | MAPPED_IMAGE => return false,
-            _ => {}
+    static MEMORY_REGION_INFO_SUPPORTED: AtomicBool = AtomicBool::new(true);
+    if MEMORY_REGION_INFO_SUPPORTED.load(Ordering::Relaxed) {
+        let mut region = WIN32_MEMORY_REGION_INFORMATION::default();
+        // SAFETY: both queries describe an address without dereferencing it. The
+        // output buffers match their information classes.
+        let queried = unsafe {
+            QueryVirtualMemoryInformation(
+                GetCurrentProcess(),
+                at as *const _,
+                MemoryRegionInfo,
+                (&raw mut region).cast(),
+                size_of_val(&region),
+                std::ptr::null_mut(),
+            )
+        };
+        if queried != 0 {
+            // These are the Windows SDK's named bitfields in declaration order.
+            // windows-sys exposes only the union's raw bits.
+            const PRIVATE: u32 = 1 << 0;
+            const MAPPED_DATA_FILE: u32 = 1 << 1;
+            const MAPPED_IMAGE: u32 = 1 << 2;
+            const MAPPED_PAGE_FILE: u32 = 1 << 3;
+            const MAPPED_PHYSICAL: u32 = 1 << 4;
+            // SAFETY: this union was filled by the successful query above.
+            match unsafe { region.Anonymous.Flags } {
+                MAPPED_DATA_FILE | MAPPED_PAGE_FILE | MAPPED_PHYSICAL => return true,
+                PRIVATE | MAPPED_IMAGE => return false,
+                _ => {}
+            }
+        } else {
+            // Wine rejects NtQueryVirtualMemory class 7 on every call; skip it
+            // permanently once it fails and rely on VirtualQuery below.
+            MEMORY_REGION_INFO_SUPPORTED.store(false, Ordering::Relaxed);
         }
     }
     // Unknown flag combinations and failed allocation queries keep the
@@ -723,6 +737,25 @@ fn mapped(at: usize) -> bool {
     // SAFETY: the output buffer has the required layout and size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
     n != 0 && info.Type == MEM_MAPPED
+}
+
+/// End of a non-view hole run starting at `block` (up to `last`), obtained via
+/// a single `VirtualQuery` so large unmapped gaps are crossed per region
+/// instead of once per 64 KiB block.
+fn hole_run_end(block: usize, last: usize) -> usize {
+    use windows_sys::Win32::System::Memory::{
+        MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery,
+    };
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: queries our own address space without dereferencing `block`.
+    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    if n == 0 || info.RegionSize == 0 || info.Type == MEM_MAPPED {
+        return (block + 1).min(last);
+    }
+    (info.BaseAddress as usize)
+        .saturating_add(info.RegionSize)
+        .div_ceil(BLOCK)
+        .clamp(block + 1, last)
 }
 
 /// From `block` on (to `to` at most): the end of the run of blocks whose
@@ -1689,5 +1722,25 @@ mod tests {
         // SAFETY: valid output pointer.
         let queried = unsafe { VirtualQuery((p + BLOCK) as *const _, &mut info, size_of_val(&info)) };
         assert!(queried != 0 && info.State == MEM_FREE);
+    }
+
+    #[test]
+    fn guard_jumps_across_multi_block_hole_runs() {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc, VirtualFree};
+        const CHUNK: usize = 8 * BLOCK;
+        // SAFETY: fresh reserved (unmapped hole) region owned exclusively by this test.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), CHUNK, MEM_RESERVE, PAGE_NOACCESS) } as usize;
+        assert_ne!(p, 0);
+        // `mapped` must report false on reserved/unmapped memory and fall through cleanly.
+        assert!(!mapped(p));
+        // `hole_run_end` spans the entire reserved region in one VirtualQuery call.
+        let first = p / BLOCK;
+        let last = first + 8;
+        assert_eq!(hole_run_end(first, last), last);
+        // `guard` records the hole blocks without error and returns Some(empty).
+        let written = guard(p, p + CHUNK);
+        assert!(written.is_none());
+        // SAFETY: releases our test reservation.
+        assert_ne!(unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) }, 0);
     }
 }

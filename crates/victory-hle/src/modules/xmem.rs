@@ -685,64 +685,97 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn section_cap_pages() -> Option<usize> {
+    static CAP: OnceLock<Option<usize>> = OnceLock::new();
+    *CAP.get_or_init(|| {
+        let mb = std::env::var("VICTORY_SECTION_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&mb| mb > 0)?;
+        Some((mb.saturating_mul(MIB) / PAGE).max(1))
+    })
+}
+
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
 pub extern "system" fn XMemAllocatePhysicalPages(
     flags: u64,
     count: *mut usize,
     pages: *mut usize,
 ) -> BOOL {
+    allocate_physical_pages_with_cap(flags, count, pages, section_cap_pages())
+}
+
+fn allocate_physical_pages_with_cap(
+    flags: u64,
+    count: *mut usize,
+    pages: *mut usize,
+    cap_pages: Option<usize>,
+) -> BOOL {
     if count.is_null() || pages.is_null() {
         return 0;
     }
     // SAFETY: checked non-null.
     let n = unsafe { *count };
-    let Some(size) = n.checked_mul(PAGE).filter(|&s| s > 0) else {
+    if n == 0 || n.checked_mul(PAGE).is_none() {
         return 0;
-    };
-    // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
-    // GiB at once, which a busy host often cannot commit (error 1450).
-    // SAFETY: plain section creation.
-    let handle = unsafe {
-        CreateFileMappingW(
-            INVALID_HANDLE_VALUE,
-            std::ptr::null(),
-            // Under Wine a committed section is a sparse file, free until
-            // touched, and committing a reserved one page by page costs a
-            // wineserver request each that scans every range committed so
-            // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-            (size as u64 >> 32) as u32,
-            size as u32,
-            std::ptr::null(),
-        )
-    };
-    if handle.is_null() {
-        let error = std::io::Error::last_os_error();
-        tracing::warn!(n, %error, "XMemAllocatePhysicalPages failed");
-        // SAFETY: checked non-null.
-        unsafe { count.write(0) };
-        return 0;
+    }
+    let max_chunk = cap_pages.map_or(n, |c| c.max(1));
+    let mut sections: Vec<(Arc<Section>, usize)> = Vec::new();
+    let mut remaining = n;
+    while remaining > 0 {
+        let chunk_pages = remaining.min(max_chunk);
+        let size = chunk_pages * PAGE;
+        // A pagefile-backed section of `size` bytes, its pages committed when
+        // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
+        // GiB at once, which a busy host often cannot commit (error 1450).
+        // SAFETY: plain section creation.
+        let handle = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                // Under Wine a committed section is a sparse file, free until
+                // touched, and committing a reserved one page by page costs a
+                // wineserver request each that scans every range committed so
+                // far: commit it whole there.
+                PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+                (size as u64 >> 32) as u32,
+                size as u32,
+                std::ptr::null(),
+            )
+        };
+        if handle.is_null() {
+            let error = std::io::Error::last_os_error();
+            tracing::warn!(n, chunk_pages, %error, "XMemAllocatePhysicalPages failed");
+            // SAFETY: checked non-null.
+            unsafe { count.write(0) };
+            return 0;
+        }
+        SECTION_BYTES.fetch_add(size, Ordering::Relaxed);
+        sections.push((Arc::new(Section::new(handle, size)), chunk_pages));
+        remaining -= chunk_pages;
     }
     tracing::debug!(
         n,
+        sections = sections.len(),
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    SECTION_BYTES.fetch_add(size, Ordering::Relaxed);
-    let section = Arc::new(Section::new(handle, size));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
-    for index in 0..n {
-        let slice = Slice {
-            section: section.clone(),
-            index,
-        };
-        let number = first + index * FRAMES;
-        physical.pages.insert(number, slice);
-        // SAFETY: the title passes room for `n` page numbers.
-        unsafe { pages.add(index).write(number) };
+    let mut written = 0usize;
+    for (section, chunk_pages) in sections {
+        for index in 0..chunk_pages {
+            let slice = Slice {
+                section: section.clone(),
+                index,
+            };
+            let number = first + written * FRAMES;
+            physical.pages.insert(number, slice);
+            // SAFETY: the title passes room for `n` page numbers.
+            unsafe { pages.add(written).write(number) };
+            written += 1;
+        }
     }
     1
 }
@@ -2206,6 +2239,40 @@ mod tests {
         assert!(va_generation_digest(addr, 2 * PAGE).is_none());
         assert_ne!(unsafe { VirtualFree(va, 0, MEM_RELEASE) }, 0);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn chunked_physical_sections_map_across_section_boundaries() {
+        let mut n = 5usize;
+        let mut pages = vec![0usize; n];
+        assert_eq!(
+            allocate_physical_pages_with_cap(0, &mut n, pages.as_mut_ptr(), Some(2)),
+            1
+        );
+        {
+            let phys = physical();
+            assert_eq!(phys.pages[&pages[0]].index, 0);
+            assert_eq!(phys.pages[&pages[1]].index, 1);
+            assert_eq!(phys.pages[&pages[2]].index, 0);
+            assert_eq!(phys.pages[&pages[3]].index, 1);
+            assert_eq!(phys.pages[&pages[4]].index, 0);
+            assert!(!Arc::ptr_eq(&phys.pages[&pages[1]].section, &phys.pages[&pages[2]].section));
+        }
+        let va = XMemVirtualAlloc(std::ptr::null_mut(), 5 * PAGE, MEM_RESERVE | PAGES_64K, 0, 0x04);
+        assert!(!va.is_null());
+        assert_eq!(XMemMapPhysicalPages(va, 5, pages.as_ptr()), va);
+        // SAFETY: all 5 pages are freshly mapped.
+        unsafe {
+            *(va as *mut u32) = 0x1111_2222;
+            *((va as *mut u8).add(2 * PAGE) as *mut u32) = 0x3333_4444;
+            *((va as *mut u8).add(4 * PAGE) as *mut u32) = 0x5555_6666;
+            assert_eq!(*(va as *const u32), 0x1111_2222);
+            assert_eq!(*((va as *const u8).add(2 * PAGE) as *const u32), 0x3333_4444);
+            assert_eq!(*((va as *const u8).add(4 * PAGE) as *const u32), 0x5555_6666);
+        }
+        assert_eq!(XMemMapPhysicalPages(va, 5, std::ptr::null()), va);
+        assert_ne!(unsafe { VirtualFree(va, 0, MEM_RELEASE) }, 0);
+        assert_eq!(XMemFreePhysicalPages(5, pages.as_ptr()), 1);
     }
 }
 

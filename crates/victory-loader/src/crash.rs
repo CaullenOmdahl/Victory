@@ -419,6 +419,14 @@ unsafe fn sse4a(code: *const u8, xmm: &mut [M128A; 16]) -> Option<usize> {
     Some(len)
 }
 
+fn continue_int3_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("VICTORY_CONTINUE_INT3")
+            .is_some_and(|v| !v.is_empty() && v != "0")
+    })
+}
+
 unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     // SAFETY: the system passes valid exception pointers.
     if unsafe { emulate_amd_only(info) } {
@@ -426,6 +434,25 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     }
     // SAFETY: as above.
     let code = unsafe { (*(*info).ExceptionRecord).ExceptionCode };
+    if code == EXCEPTION_BREAKPOINT && continue_int3_enabled() {
+        // SAFETY: `ContextRecord` is valid for the vectored exception and `Rip` holds the trapping `int3`.
+        let continued = unsafe {
+            let context = &mut *(*info).ContextRecord;
+            if (context.Rip as *const u8).read() == 0xCC {
+                context.Rip += 1;
+                true
+            } else {
+                false
+            }
+        };
+        if continued {
+            static LOGGED: AtomicBool = AtomicBool::new(false);
+            if !LOGGED.swap(true, Ordering::Relaxed) {
+                tracing::warn!("VICTORY_CONTINUE_INT3=1: skipping title int3 breakpoint");
+            }
+            return -1; // EXCEPTION_CONTINUE_EXECUTION
+        }
+    }
     if FATAL.contains(&code) {
         let to_file =
             code == EXCEPTION_BREAKPOINT && LOG_FIRST_CHANCE_BREAKPOINTS.load(Ordering::Relaxed);

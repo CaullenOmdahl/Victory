@@ -98,7 +98,7 @@ pub(crate) struct HostHeap {
 const COUNTS_AT: u32 = victory_shader::emit::OWN_SLOTS;
 
 struct StrideTable {
-    _resource: ID3D12Resource,
+    resource: ID3D12Resource,
     ptr: usize,
     gpu: u64,
     len: u32,
@@ -148,7 +148,7 @@ impl StrideTable {
             res.GetGPUVirtualAddress()
         };
         Some(Self {
-            _resource: resource?,
+            resource: resource?,
             ptr: p as usize,
             gpu,
             len,
@@ -1600,9 +1600,9 @@ impl HostHeap {
         }
     }
 
-    /// GPU virtual address of the per-slot element byte stride table.
-    pub(crate) fn stride_table_gpu(&self) -> Option<u64> {
-        self.strides.as_ref().map(|t| t.gpu)
+    /// GPU virtual address and upload resource of the per-slot element byte stride table.
+    pub(crate) fn stride_table_resource(&self) -> Option<(u64, ID3D12Resource)> {
+        self.strides.as_ref().map(|t| (t.gpu, t.resource.clone()))
     }
 
     /// Makes slot `index` (a dynamic one) a constant buffer view of host
@@ -4103,7 +4103,7 @@ void main() {
         heap.release(first_dyn, heap.spare);
         let strides = heap.strides.as_ref().expect("view heap has a stride table");
         // SAFETY: plain query on a live upload buffer.
-        let stride_bytes = unsafe { strides._resource.GetDesc() }.Width;
+        let stride_bytes = unsafe { strides.resource.GetDesc() }.Width;
         assert!(
             stride_bytes >= u64::from(COUNTS_AT) * 2 * 4,
             "stride table must cover both stride and count halves up to COUNTS_AT"
