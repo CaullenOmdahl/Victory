@@ -1055,7 +1055,6 @@ extern "system" fn resolve(
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
         };
-        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
         use windows::core::Interface;
         const RESOLVE_DEST: u32 = 0x1000;
         const RESOLVE_SOURCE: u32 = 0x2000;
@@ -1067,10 +1066,12 @@ extern "system" fn resolve(
         // SAFETY: an open list and live textures; the region is inside both.
         unsafe {
             let (a, b) = (to.GetDesc(), from.GetDesc());
-            let format = DXGI_FORMAT(format as i32);
-            if (a.Width, a.Height) == (b.Width, b.Height) {
+            let planes = [(b, src_sub), (a, dst_sub)];
+            let stencil = is_stencil_plane(format, planes);
+            let host_format = resolve_format(format, planes);
+            if (a.Width, a.Height) == (b.Width, b.Height) && !stencil {
                 list.list
-                    .ResolveSubresource(to, dst_sub, from, src_sub, format);
+                    .ResolveSubresource(to, dst_sub, from, src_sub, host_format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
                 // The console clips a larger source to the destination.
                 let rect = RECT {
@@ -1087,14 +1088,59 @@ extern "system" fn resolve(
                     from,
                     src_sub,
                     Some(&rect),
-                    format,
-                    D3D12_RESOLVE_MODE_AVERAGE,
+                    host_format,
+                    if stencil {
+                        STENCIL_RESOLVE_MODE
+                    } else {
+                        D3D12_RESOLVE_MODE_AVERAGE
+                    },
                 );
             }
         }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
+}
+
+#[cfg(windows)]
+const STENCIL_RESOLVE_MODE: windows::Win32::Graphics::Direct3D12::D3D12_RESOLVE_MODE =
+    windows::Win32::Graphics::Direct3D12::D3D12_RESOLVE_MODE_MAX;
+
+#[cfg(windows)]
+fn is_depth_plane(desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC, index: u32) -> bool {
+    index < u32::from(desc.MipLevels) * u32::from(desc.DepthOrArraySize)
+}
+
+#[cfg(windows)]
+fn is_stencil_plane(
+    format: u32,
+    subresources: [(windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC, u32); 2],
+) -> bool {
+    format == 120
+        || (format == 118
+            && subresources
+                .into_iter()
+                .all(|(ref desc, index)| !is_depth_plane(desc, index)))
+}
+
+#[cfg(windows)]
+fn resolve_format(
+    format: u32,
+    subresources: [(windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC, u32); 2],
+) -> windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    let mapped = if format == 118
+        && subresources
+            .into_iter()
+            .all(|(ref desc, index)| is_depth_plane(desc, index))
+    {
+        crate::resource::pc_format(119)
+    } else if is_stencil_plane(format, subresources) {
+        crate::resource::pc_format(120)
+    } else {
+        crate::resource::pc_format(format)
+    };
+    DXGI_FORMAT(mapped as i32)
 }
 
 #[repr(C)]
@@ -1645,6 +1691,7 @@ mod state {
     /// The groups a mesh dispatch of `x` × `y` × `z` groups runs: the
     /// title's mesh programs read only the x group id, so `x` (y and z
     /// other than 1 are logged once); none if any dimension is empty.
+    #[cfg(test)]
     pub(super) fn mesh_groups(x: u32, y: u32, z: u32) -> Option<u32> {
         if x == 0 || y == 0 || z == 0 {
             return None;
@@ -1658,8 +1705,8 @@ mod state {
     /// `DispatchMesh(x, y, z)` (the PC method of List6).
     pub(super) extern "system" fn dispatch_mesh(this: This, x: u32, y: u32, z: u32) {
         super::count_draw();
-        if let Some(x) = mesh_groups(x, y, z) {
-            with_state(this, |list, s| s.dispatch_mesh(list, x));
+        if x > 0 && y > 0 && z > 0 {
+            with_state(this, |list, s| s.dispatch_mesh(list, x, y, z));
         }
     }
     /// `DispatchMeshX(x, flags, indirect arguments, payload)`. With an
@@ -1681,7 +1728,7 @@ mod state {
         super::count_draw();
         if indirect == 0 {
             if x != 0 {
-                with_state(this, |list, s| s.dispatch_mesh(list, x));
+                with_state(this, |list, s| s.dispatch_mesh(list, x, 1, 1));
             }
             return;
         }
@@ -2303,4 +2350,27 @@ mod tests {
         unsafe { VirtualFree(page.cast(), 0, MEM_RELEASE) };
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn resolves_select_the_depth_format_only_when_both_subresources_are_depth() {
+        use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC;
+        let src = D3D12_RESOURCE_DESC {
+            MipLevels: 1,
+            DepthOrArraySize: 2,
+            ..Default::default()
+        };
+        let dst = D3D12_RESOURCE_DESC {
+            MipLevels: 3,
+            ..src
+        };
+        let format = |guest, from, to| resolve_format(guest, [(src, from), (dst, to)]).0;
+        assert_eq!(format(118, 1, 5), 46);
+        assert_eq!(format(118, 2, 5), 45);
+        assert_eq!(format(118, 1, 6), 45);
+        assert_eq!(format(119, 1, 5), 46);
+        assert_eq!(format(120, 2, 6), 47);
+        assert_eq!(format(118, 2, 6), 47);
+        assert_eq!(format(120, 0, 0), 47);
+        assert_eq!(format(28, 0, 0), 28);
+    }
 }

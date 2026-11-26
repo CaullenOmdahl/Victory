@@ -1232,14 +1232,14 @@ impl State {
     }
 
     /// Runs a mesh dispatch of `x` groups on the host (the title's mesh
-    /// programs are one-dimensional).
-    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32) {
+    /// Runs a mesh dispatch with the caller's three-dimensional group grid.
+    pub(crate) fn dispatch_mesh(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
         if self.may_store() {
             list.gather_close();
         }
         #[cfg(feature = "diagnostics")]
         self.trace("mesh", x, 0);
-        if x > MAX_GROUPS {
+        if !dispatch_fits(x, y, z) {
             once!(x, "a mesh dispatch past the host's group limit dropped");
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
@@ -1248,11 +1248,11 @@ impl State {
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
-                    list.note_op(|| self.op_text(format!("mesh {x}"), false, false));
+                    list.note_op(|| self.op_text(format!("mesh {x}x{y}x{z}"), false, false));
         #[cfg(feature = "diagnostics")]
-        crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || self.op_text(format!("mesh {x}"), false, true));
+        crate::capture::pass(list, self.targets.first().copied().unwrap_or(0), || self.op_text(format!("mesh {x}x{y}x{z}"), false, true));
                     // SAFETY: an open list with everything set.
-                    unsafe { l6.DispatchMesh(x, 1, 1) };
+                    unsafe { l6.DispatchMesh(x, y, z) };
                     list.count_work();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true

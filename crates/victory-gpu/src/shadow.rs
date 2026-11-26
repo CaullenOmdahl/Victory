@@ -2598,6 +2598,9 @@ pub(crate) fn in_buffer(address: u64, len: u64) -> bool {
 /// for its bytes twice, and the GPU's writes land in one copy), else of
 /// the innermost, made now.
 pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if address == 0 {
+        return None;
+    }
     let end = address.checked_add(len.max(1))?;
     if let Some(window) = direct(address, end) {
         return Some(window);
@@ -3453,5 +3456,10 @@ mod find_cache_tests {
         let committed = BUFFER_GENERATION.load(Ordering::Acquire);
         unregister(resource, start);
         assert_ne!(committed, observed, "the old table still has the current generation");
+    }
+
+    #[test]
+    fn null_address_does_not_allocate_shadow_copy() {
+        assert!(find(0, 1).is_none());
     }
 }
