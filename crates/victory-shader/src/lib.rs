@@ -25,6 +25,9 @@ pub use native::{
     HwStage, NativeProgram, ResourceType, RootParam, RootType, UsedResource, container_programs, native_programs,
 };
 
+/// BLAKE3 hex digest of `victory-shader`'s sources and manifest, used to key on-disk shader and pipeline caches.
+pub const SOURCE_HASH: &str = env!("VICTORY_SHADER_SOURCE_HASH");
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ShaderError {
     #[error("not a DXBC container")]
