@@ -264,6 +264,15 @@ impl Shadow {
         unsafe { std::slice::from_raw_parts(self.data.add(self.offset(address) as usize), len) }.to_vec()
     }
 
+    /// Writes `bytes` into the copy at `address` (test helper simulating a shader write).
+    #[cfg(test)]
+    pub(crate) fn write_host(&self, address: u64, bytes: &[u8]) {
+        let offset = self.offset(address) as usize;
+        assert!(offset.checked_add(bytes.len()).is_some_and(|e| e <= self.len as usize));
+        // SAFETY: `offset..offset + bytes.len()` lies inside `self.data`.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), self.data.add(offset), bytes.len()) };
+    }
+
     #[cfg(test)]
     pub(crate) fn byte_at(&self, offset: usize) -> u8 {
         assert!(offset < self.len as usize);

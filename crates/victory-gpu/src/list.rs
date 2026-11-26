@@ -1291,14 +1291,9 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     if let Some(list) = host_list(this) {
         list.count_write();
         list.count_work();
-    }
-    #[cfg(windows)]
-    if let Some(list) = host_list(this)
-        && dst != 0
-        && src != 0
-    {
-        let len = len as usize;
-        list.defer(move || copy_title_memory(dst as usize, src as usize, len));
+        if dst != 0 && src != 0 {
+            list.defer_copy(dst as *mut u8, src as *const u8, len as usize);
+        }
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
@@ -1308,7 +1303,7 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
 /// kernel, without faulting on unmapped or read-only pages. Disjoint ranges
 /// copy directly in one pass with no temporary buffer; overlapping ranges
 /// stage through a buffer bounded by committed memory for `memmove` order.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn copy_title_memory(dst: usize, src: usize, len: usize) {
     if len == 0 || dst == src {
         return;
@@ -2446,5 +2441,71 @@ mod tests {
             }
         }
         assert_eq!(results, [[E_FAIL, S_OK, E_FAIL, S_OK, E_FAIL, S_OK]; 2]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_memory_copy_past_a_gpu_write_sees_what_it_wrote() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let alloc_page = || {
+            // SAFETY: fresh private allocation of one page for the test.
+            let p = unsafe {
+                VirtualAlloc(
+                    std::ptr::null(),
+                    PAGE,
+                    MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                    PAGE_READWRITE,
+                )
+            } as usize;
+            assert!(p != 0);
+            p
+        };
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let null = std::ptr::null();
+        let mut allocator = null;
+        assert_eq!(
+            create_allocator(null, 0, &ALLOCATOR_IIDS[0], &mut allocator),
+            S_OK
+        );
+        let mut list = null;
+        assert_eq!(
+            create_list(null, 0, 0, allocator, null, &LIST_IIDS[1], &mut list),
+            S_OK
+        );
+        let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
+        let Some(host_list) = host_list(list) else {
+            assert_eq!(release(list), 0);
+            assert_eq!(release(allocator), 0);
+            return;
+        };
+        let pools = [alloc_page(), alloc_page()];
+        // SAFETY: our pool, not guarded yet.
+        unsafe { (pools[0] as *mut u8).write_volatile(0xAA) };
+        crate::shadow::register(pools[0], pools[0] as u64, PAGE as u64);
+        let copy = crate::shadow::find(pools[0] as u64, PAGE as u64).unwrap();
+        copy.refresh(host_list, pools[0] as u64, PAGE as u64);
+        copy.gpu_writes(host_list, pools[0] as u64, PAGE as u64);
+        let c = copy.clone();
+        host_list.defer_host(move || c.write_host(pools[0] as u64, &[0xBB]));
+        copy_memory(list, pools[1] as u64, pools[0] as u64, PAGE as u64, 0);
+        close(list);
+        host.execute(&[host_list]);
+        // SAFETY: a byte of our pool.
+        let at = unsafe { (pools[1] as *const u8).read_volatile() };
+        assert_eq!(at, 0xBB, "the copy sees what the shaders wrote");
+        crate::shadow::unregister(pools[0], pools[0] as u64);
+        drop(copy);
+        for &p in &pools {
+            // SAFETY: allocation from `alloc_page`.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        }
+        assert_eq!(release(list), 0);
+        assert_eq!(release(allocator), 0);
     }
 }

@@ -54,6 +54,8 @@ struct InFlight {
 struct Finish {
     lists: Vec<std::sync::Arc<HostList>>,
     back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    late: Vec<(usize, usize, usize, bool)>,
+    late_refresh: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
 }
 // SAFETY: host lists are free-threaded objects, run by one thread once
 // closed; the rest is ours and locked.
@@ -1131,11 +1133,8 @@ enum Step {
     /// A copy of title memory into the list's own upload memory.
     Fill(usize, usize, usize),
     /// Brings a range (address, bytes) of a buffer's host copy up to date:
-    /// once per submission, whichever lists ask, until a `Copy` or `Run`
-    /// intervenes.
+    /// once per submission, whichever lists ask, until a `Copy` intervenes.
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
-    /// Work that may write title memory.
-    Run(Box<dyn Fn() + Send>),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
     /// Shaders write a range (address, bytes) of a buffer's host copy.
@@ -1406,10 +1405,16 @@ impl Host {
             };
             let Some(mut done) = done else { break };
             last_sub = last_sub.max(done.submission);
-            if let Some(Finish { lists, back }) = done.finish.take() {
+            if let Some(Finish {
+                lists,
+                back,
+                late,
+                late_refresh,
+            }) = done.finish.take()
+            {
                 {
                     let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
-                    self.finish_submission(&runs, back);
+                    self.finish_submission(&runs, back, late, late_refresh);
                 }
                 // Before its lists go: a list that goes with it waits for
                 // this fence, with `submitted` held here.
@@ -1620,7 +1625,7 @@ impl Host {
             for (k, step) in deferred.copies.iter().enumerate() {
                 match step {
                     Step::Refresh(shadow, address, len) => batch.add(shadow, *address, *len),
-                    Step::Copy(..) | Step::Run(_) => filling = false,
+                    Step::Copy(..) => filling = false,
                     &Step::Fill(dst, src, len) if filling => {
                         if owed.iter().any(|&(from, to)| src < to && from < src + len) {
                             filling = false;
@@ -1895,6 +1900,8 @@ impl Host {
                     finish: Some(Finish {
                         lists: keep.map(<[_]>::to_vec).unwrap_or_default(),
                         back: cpu_back,
+                        late: batch.late,
+                        late_refresh: batch.late_refresh,
                     }),
                 });
             return;
@@ -1943,17 +1950,19 @@ impl Host {
             }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
-        self.finish_submission(runs, cpu_back);
+        self.finish_submission(runs, cpu_back, batch.late, batch.late_refresh);
         self.log_messages();
     }
 
     /// After a submission ran: what its shaders wrote goes back into title
-    /// memory, then its read-backs, then the bottom-of-pipe writes that
-    /// tell the title the GPU is done.
+    /// memory, then deferred copies/refreshes touching those writes, then its
+    /// read-backs, then the bottom-of-pipe writes that tell the title the GPU is done.
     fn finish_submission(
         &self,
         runs: &[&HostList],
         back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+        late: Vec<(usize, usize, usize, bool)>,
+        late_refresh: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     ) {
         let copying = std::time::Instant::now();
         if back.len() <= 1 {
@@ -1991,6 +2000,16 @@ impl Host {
                     }
                 });
             }
+        }
+        // Copies kept past the lists' run: what shaders wrote reached title
+        // memory in the copy-backs above, so a deferred copy's source is new
+        // now (and its destination is not overwritten by them).
+        for (dst, src, len, title_dst) in late {
+            copy_mapped(dst as *mut u8, src as *const u8, len, title_dst);
+        }
+        for (shadow, address, len) in late_refresh {
+            let copied = shadow.update(address, len);
+            PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
         }
         for list in runs {
             for rb in &list.deferred().readbacks {
@@ -3353,16 +3372,6 @@ impl HostList {
         self.deferred().textures.insert(key)
     }
 
-    /// Runs `work` when the list is submitted, in order with its copies.
-    /// `work` may write title memory (refreshes after it copy again).
-    pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
-        let mut deferred = self.deferred();
-        deferred.copies.push(Step::Run(Box::new(work)));
-        deferred.refreshed.clear();
-        deferred.gpu_written.clear();
-        deferred.filled.clear();
-    }
-
     /// Queues submission-time materialization and refresh of the bindless
     /// slots in `heap`, once per list; `writes`: the draw's shaders may write
     /// memory, so the slots' unordered access ranges go back to title memory.
@@ -3468,16 +3477,29 @@ impl HostList {
             next += 1;
             match step {
                 &Step::Copy(dst, src, len) => {
-                    flush_textures(&mut tex_due, &mut uploads);
-                    #[cfg(feature = "diagnostics")]
+                    // A source the submission's shaders write is still old here
+                    // (it lands in title memory in the copy-back), and a
+                    // destination they write would lose their bytes to it.
+                    // Either way it runs after copy-backs; earlier deferred
+                    // destinations chain the same way.
+                    if batch.gpu_written(src, len)
+                        || batch.gpu_written(dst, len)
+                        || batch.late_pending(src, len)
+                        || batch.late_pending(dst, len)
                     {
-                        copy_count += 1;
+                        batch.late.push((dst, src, len, true));
+                    } else {
+                        flush_textures(&mut tex_due, &mut uploads);
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            copy_count += 1;
+                        }
+                        let started = std::time::Instant::now();
+                        batch.title_written();
+                        copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                        copy_us += started.elapsed().as_micros() as u64;
+                        copy_bytes += len as u64;
                     }
-                    let started = std::time::Instant::now();
-                    batch.title_written();
-                    copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    copy_us += started.elapsed().as_micros() as u64;
-                    copy_bytes += len as u64;
                 }
                 Step::Fill(..) if k < prefilled => {}
                 &Step::Fill(dst, src, len) if workers < 2 => {
@@ -3511,17 +3533,11 @@ impl HostList {
                         refresh_count += 1;
                         refresh_bytes += *len as u64;
                     }
-                    batch.add(shadow, *address, *len);
+                    batch.add_or_late(shadow, *address, *len);
                 }
-                Step::Run(work) | Step::Host(work) => {
-                    if matches!(step, Step::Run(_)) {
-                        flush_textures(&mut tex_due, &mut uploads);
-                    }
+                Step::Host(work) => {
                     #[cfg(feature = "diagnostics")]
                     let started = std::time::Instant::now();
-                    if matches!(step, Step::Run(_)) {
-                        batch.title_written();
-                    }
                     work();
                     #[cfg(feature = "diagnostics")]
                     {
@@ -3532,6 +3548,10 @@ impl HostList {
                 Step::GpuWrite(shadow, address, len) => {
                     // The shaders start from the title's data.
                     batch.flush();
+                    batch.gpu_write(*address, *len);
+                    // A deferred copy's bytes must not land past a write
+                    // recorded after it: the shader's stay.
+                    batch.clip_late(*address, *len);
                     shadow.writing(*address, *len);
                 }
                 Step::Texture(staging, copy) => {
@@ -3980,6 +4000,16 @@ struct Batch {
     bindless_writes: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Plans made ahead while the previous submission ran.
     ahead: Vec<std::sync::Arc<crate::descriptor::host::BindlessPlan>>,
+    /// Title ranges the submission's shaders are declared to write so far
+    /// `(start, end)`: their results reach title memory in the copy-back
+    /// after the lists run, so a deferred copy touching one waits for it.
+    gpu_writes: Vec<(usize, usize)>,
+    /// Deferred copies kept past the lists' run, in record order (they run
+    /// after copy-backs): `(dst, src, len, title_dst)`.
+    late: Vec<(usize, usize, usize, bool)>,
+    /// Refreshes whose range a deferred copy's destination touches: done
+    /// after the late copies, which is where its bytes are.
+    late_refresh: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
 }
 
 impl Batch {
@@ -4027,6 +4057,72 @@ impl Batch {
     fn title_written(&mut self) {
         self.flush();
         self.textures.clear();
+    }
+
+    /// A range the submission's shaders write (`Step::GpuWrite`), in
+    /// recorded order: a deferred copy touching it sees its bytes only in
+    /// the copy-back.
+    fn gpu_write(&mut self, at: usize, len: usize) {
+        if let Some(end) = at.checked_add(len).filter(|&e| e > at) {
+            self.gpu_writes.push((at, end));
+        }
+    }
+
+    /// Whether `len` title bytes at `at` touch a range this submission's
+    /// shaders write.
+    fn gpu_written(&self, at: usize, len: usize) -> bool {
+        let Some(end) = at.checked_add(len).filter(|&e| e > at) else {
+            return false;
+        };
+        self.gpu_writes.iter().any(|&(a, b)| a < end && at < b)
+    }
+
+    /// Whether `len` bytes at `at` touch a deferred copy's title
+    /// destination so later steps chain after it.
+    fn late_pending(&self, at: usize, len: usize) -> bool {
+        let Some(end) = at.checked_add(len).filter(|&e| e > at) else {
+            return false;
+        };
+        self.late
+            .iter()
+            .any(|&(d, _, l, t)| t && d < end && at < d + l)
+    }
+
+    /// `add`, or deferred past the submission's late copies when overlapping
+    /// a deferred copy's title destination.
+    fn add_or_late(
+        &mut self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        if self.late_pending(address, len) {
+            self.late_refresh.push((shadow.clone(), address, len));
+        } else {
+            self.add(shadow, address, len);
+        }
+    }
+
+    /// Drops the parts of pending deferred copies a write recorded later covers.
+    fn clip_late(&mut self, at: usize, len: usize) {
+        let Some(w1) = at.checked_add(len).filter(|&e| e > at) else {
+            return;
+        };
+        let w0 = at;
+        let mut kept: Vec<(usize, usize, usize, bool)> = Vec::with_capacity(self.late.len());
+        for &(dst, src, l, t) in &self.late {
+            if !t || w1 <= dst || dst + l <= w0 {
+                kept.push((dst, src, l, t));
+                continue;
+            }
+            if dst < w0 {
+                kept.push((dst, src, w0 - dst, t));
+            }
+            if w1 < dst + l {
+                kept.push((w1, src + (w1 - dst), dst + l - w1, t));
+            }
+        }
+        self.late = kept;
     }
 
     fn flush(&mut self) {
@@ -5922,6 +6018,115 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
             }
         }
         list.reset();
+    }
+}
+
+#[cfg(test)]
+mod copy_order {
+    fn pool_page() -> usize {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        // SAFETY: fresh private allocation of one page for the test.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                crate::watch::PAGE,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert!(p != 0);
+        p
+    }
+
+    fn free_page(p: usize) {
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+        // SAFETY: allocation from `pool_page`.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn a_copy_past_a_gpu_write_sees_what_it_wrote() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return;
+        };
+        let pools = [pool_page(), pool_page(), pool_page(), pool_page()];
+        // SAFETY: our pools, not guarded yet.
+        unsafe {
+            (pools[0] as *mut u8).write_volatile(0xAA);
+            (pools[2] as *mut u8).write_volatile(0xCC);
+        }
+        crate::shadow::register(pools[0], pools[0] as u64, PAGE as u64);
+        let copy = crate::shadow::find(pools[0] as u64, PAGE as u64).unwrap();
+        let list = host.new_list().unwrap();
+        copy.refresh(&list, pools[0] as u64, PAGE as u64);
+        copy.gpu_writes(&list, pools[0] as u64, PAGE as u64);
+        let src_copy = copy.clone();
+        list.defer_host(move || src_copy.write_host(pools[0] as u64, &[0xBB]));
+        list.defer_copy(pools[1] as *mut u8, pools[0] as *const u8, PAGE);
+        list.defer_copy(pools[0] as *mut u8, pools[2] as *const u8, PAGE);
+        list.defer_copy(pools[3] as *mut u8, pools[2] as *const u8, PAGE);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: bytes of our pools.
+        let at = |k: usize| unsafe { (pools[k] as *const u8).read_volatile() };
+        assert_eq!(at(1), 0xBB, "the copy sees what the shaders wrote");
+        assert_eq!(at(0), 0xCC, "a copy over the write lands after it");
+        assert_eq!(at(3), 0xCC, "an unrelated copy is copied at once");
+        crate::shadow::unregister(pools[0], pools[0] as u64);
+        drop(copy);
+        for &p in &pools {
+            free_page(p);
+        }
+    }
+
+    #[test]
+    fn deferred_copies_chain_and_a_later_gpu_write_wins() {
+        use crate::watch::PAGE;
+        let Some(host) = super::host() else {
+            return;
+        };
+        let pools = [pool_page(), pool_page(), pool_page(), pool_page(), pool_page()];
+        // SAFETY: our pools, not guarded yet.
+        unsafe {
+            (pools[0] as *mut u8).write_volatile(0xAA);
+            (pools[4] as *mut u8).write_volatile(0x55);
+        }
+        crate::shadow::register(pools[0], pools[0] as u64, PAGE as u64);
+        crate::shadow::register(pools[4], pools[4] as u64, PAGE as u64);
+        let copy0 = crate::shadow::find(pools[0] as u64, PAGE as u64).unwrap();
+        let copy4 = crate::shadow::find(pools[4] as u64, PAGE as u64).unwrap();
+        let list = host.new_list().unwrap();
+        copy0.refresh(&list, pools[0] as u64, PAGE as u64);
+        copy0.gpu_writes(&list, pools[0] as u64, PAGE as u64);
+        let c0 = copy0.clone();
+        list.defer_host(move || c0.write_host(pools[0] as u64, &[0xBB]));
+        list.defer_copy(pools[1] as *mut u8, pools[0] as *const u8, PAGE);
+        list.defer_copy(pools[3] as *mut u8, pools[1] as *const u8, PAGE);
+        list.defer_fill(pools[2] as *mut u8, pools[0] as *const u8, PAGE);
+        list.defer_copy(pools[4] as *mut u8, pools[0] as *const u8, PAGE);
+        copy4.refresh(&list, pools[4] as u64, PAGE as u64);
+        copy4.gpu_writes(&list, pools[4] as u64, PAGE as u64);
+        let c4 = copy4.clone();
+        list.defer_host(move || c4.write_host(pools[4] as u64, &[0xEE]));
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: bytes of our pools.
+        let at = |k: usize| unsafe { (pools[k] as *const u8).read_volatile() };
+        assert_eq!(at(1), 0xBB, "the deferred copy sees the shader's bytes");
+        assert_eq!(at(3), 0xBB, "a chained copy reads the deferred bytes");
+        assert_eq!(at(2), 0xAA, "a fill copies at once: the old source");
+        assert_eq!(at(4), 0xEE, "a later GPU write wins over the deferred copy");
+        crate::shadow::unregister(pools[0], pools[0] as u64);
+        crate::shadow::unregister(pools[4], pools[4] as u64);
+        drop(copy0);
+        drop(copy4);
+        for &p in &pools {
+            free_page(p);
+        }
     }
 }
 
