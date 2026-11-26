@@ -226,7 +226,9 @@ fn gathers() -> bool {
 /// copy in upload memory.
 /// shortcut: a root view has no size; constant buffers are taken as 64 KiB,
 /// other views as 1 MiB (both cut at their buffer's end).
-fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
+/// `writes`: for `kind == 2` (root UAV), whether the shader may write
+/// through it; a root UAV it only reads needs no snapshot and no compare.
+fn root_view(list: &HostList, address: u64, kind: u8, writes: bool) -> Option<u64> {
     let reach = if kind == 0 { 1 << 16 } else { 1 << 20 };
     let shadow = crate::shadow::find_reaching(address, reach)?;
     let mut len = shadow.left(address).min(reach);
@@ -244,7 +246,7 @@ fn root_view(list: &HostList, address: u64, kind: u8) -> Option<u64> {
     let gpu = shadow.gpu(address);
     if kind != 0 || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
-        if kind == 2 {
+        if kind == 2 && writes {
             shadow.gpu_writes(list, address, len);
         }
         return Some(gpu);
@@ -1008,7 +1010,8 @@ impl State {
                         }
                         return no("a root view not set");
                     };
-                    let Some(gpu) = root_view(list, *address, kind) else {
+                    let writes = kind == 2 && stage.written_root_uavs.contains(&slot);
+                    let Some(gpu) = root_view(list, *address, kind, writes) else {
                         once!(
                             slot,
                             kind,

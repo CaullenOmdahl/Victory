@@ -269,6 +269,9 @@ pub struct HostShader {
     /// Root UAVs (raw buffers) the shader reads or writes: `u<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_uavs: Vec<u8>,
+    /// The root UAVs among `root_uavs` the shader may write: what it only
+    /// reads through the others need not go back into title memory.
+    pub written_root_uavs: Vec<u8>,
     /// True when the shader reads the runtime stride table (`t0` in
     /// [`STRIDE_SPACE`]).
     pub stride_table: bool,
@@ -944,6 +947,7 @@ fn emit_program_pruned(
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
+        written_root_uavs: l.written_root_uavs,
         stride_table: l.stride_table,
     })
 }
@@ -1289,6 +1293,7 @@ mod tests {
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
+            written_root_uavs: Vec::new(),
             stride_table: false,
         };
         let file = |var: &str, stage| {
@@ -1301,6 +1306,7 @@ mod tests {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                written_root_uavs: Vec::new(),
                 stride_table: false,
             })
         };
@@ -1935,6 +1941,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2082,6 +2089,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
             };
             let data: Vec<u32> = (0..16).map(|k| 0xC0DE_0000 + k).collect();
@@ -2234,6 +2242,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2401,6 +2410,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
@@ -2559,6 +2569,7 @@ mod tests {
                 root_cbvs: l.root_cbvs,
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
+                written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();

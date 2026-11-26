@@ -170,7 +170,8 @@ fn cached(
     (converter.translate)(container)
 }
 
-const MAGIC: &[u8; 4] = b"VSH2";
+/// Cache entry version (VSH3 adds `written_root_uavs` so older entries re-translate).
+const MAGIC: &[u8; 4] = b"VSH3";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -245,7 +246,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, v);
         }
     }
-    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs] {
+    for slots in [&s.root_cbvs, &s.root_srvs, &s.root_uavs, &s.written_root_uavs] {
         word(&mut out, slots.len() as u32);
         out.extend(slots);
     }
@@ -307,6 +308,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_cbvs = r.list()?;
     let root_srvs = r.list()?;
     let root_uavs = r.list()?;
+    let written_root_uavs = r.list()?;
     let stride_table = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
@@ -317,6 +319,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_cbvs,
         root_srvs,
         root_uavs,
+        written_root_uavs,
         stride_table,
     })
 }
@@ -345,6 +348,7 @@ mod tests {
             root_cbvs: vec![2],
             root_srvs: vec![0, 3],
             root_uavs: vec![4],
+            written_root_uavs: vec![4],
             stride_table: true,
         }
     }

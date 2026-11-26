@@ -491,6 +491,8 @@ pub(crate) struct Stage {
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
     pub(crate) root_uavs: Vec<(u8, u32)>,
+    /// Root UAVs among `root_uavs` the shader may write.
+    pub(crate) written_root_uavs: Vec<u8>,
     /// Root parameter of the runtime stride table (`t0`, [`STRIDE_SPACE`]).
     pub(crate) stride_table: Option<u32>,
 }
@@ -613,6 +615,7 @@ impl HostPipeline {
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
+                written_root_uavs: t.written_root_uavs.clone(),
                 stride_table: None,
             };
             let dwords = t.user_data_dwords();

@@ -112,6 +112,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// Root UAVs among `root_uavs` an operation may write.
+    pub written_root_uavs: Vec<u8>,
     pub stride_table: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
@@ -2193,6 +2195,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let written_root_uavs = std::mem::take(&mut self.s.written_root_uavs);
         let stride_table = self.s.stride_table.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
@@ -2200,6 +2203,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            written_root_uavs,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
