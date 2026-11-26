@@ -138,7 +138,8 @@ AMD:
 Diagnostics (diagnostics builds): `VICTORY_SHADER_PATCH` changes one word of a
 shader's machine code before translation, `VICTORY_SHADER_SWAP` replaces
 shader containers by files, `VICTORY_ALWAYS_COPY=1` refreshes every copy of
-title memory each frame, `VICTORY_GPU_TIMING=1` logs GPU time per pipeline.
+title memory each frame, `VICTORY_GPU_TIMING=1` logs GPU time per pipeline,
+and `VICTORY_LOG_THREADS=1` includes thread IDs and names in tracing output.
 Each is described in a comment where it is read.
 
 ### How it is run here

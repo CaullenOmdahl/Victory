@@ -23,12 +23,15 @@ pub fn init(default_level: &str) {
         .ok()
         .and_then(|v| EnvFilter::try_new(v).ok())
         .unwrap_or_else(|| EnvFilter::new(default_level));
+    let threads = std::env::var_os("VICTORY_LOG_THREADS").is_some_and(|v| v == "1");
     let _ = tracing_subscriber::registry()
         .with(CAP)
         .with(filter)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(true)
+                .with_thread_ids(threads)
+                .with_thread_names(threads)
                 .with_writer(std::io::stderr),
         )
         .try_init();
