@@ -6279,9 +6279,11 @@ impl<'a> Lower<'a> {
             && let Fields::Smem { base, .. } = &inst.fields
         {
             let (h, start, _) = self.made_buffer(inst, base)?;
-            let mut addr = self.s.m.i32(*offset as u32);
+            let mut addr = self.s.m.i32((*offset as u32) & !3);
             if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
                 let so = self.operand(inst, soffset)?;
+                let mask = self.s.m.i32(!3u32);
+                let so = self.s.m.bin(c, Bin::And, so, mask);
                 addr = self.s.m.bin(c, Bin::Add, addr, so);
             }
             let addr = self.s.m.bin(c, Bin::Add, addr, start);
@@ -6292,13 +6294,18 @@ impl<'a> Lower<'a> {
             return Ok(());
         }
         let (base, extra) = self.built_offset(src)?;
-        let offset = &((*offset as u32).wrapping_add(base) as i32);
-        let mut addr = self.s.m.i32(*offset as u32);
+        // AMD RDNA2 ISA Guide (Scalar Memory Operations): address components
+        // are in bytes, with their two LSBs ignored independently before summing.
+        let imm_offset = (*offset as u32) & !3;
+        let total_offset = imm_offset.wrapping_add(base);
+        let mut addr = self.s.m.i32(total_offset);
         if let Some(x) = extra {
             addr = self.s.m.bin(c, Bin::Add, addr, x);
         }
         if !matches!(soffset, Operand::Scalar { code: NULL, .. }) {
             let so = self.operand(inst, soffset)?;
+            let mask = self.s.m.i32(!3u32);
+            let so = self.s.m.bin(c, Bin::And, so, mask);
             addr = self.s.m.bin(c, Bin::Add, addr, so);
         }
         if matches!(src, Source::Built { address, .. } if address.param == CODE) {
@@ -6344,7 +6351,7 @@ impl<'a> Lower<'a> {
             V::Const(_)
                 if matches!(soffset, Operand::Scalar { code: NULL, .. }) && extra.is_none() =>
             {
-                Some(*offset as u32)
+                Some(total_offset)
             }
             _ => None,
         };
@@ -11696,7 +11703,11 @@ impl<'a> Lower<'a> {
                 return Err("an image result");
             };
             for (k, ch) in (0..4u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                let x = if ch == 3 && uav || !present[ch as usize] {
+                let x = if kind == 5 && ch == 2 {
+                    // GCN3 §12.16 / RDNA3 §10.1 / LLPC / RADV / gfx1031:
+                    // cubemap resinfo reports face count (6), not 1.
+                    self.s.m.i32(6)
+                } else if ch == 3 && uav || !present[ch as usize] {
                     one
                 } else {
                     self.s.m.extract(c, d, ch)
@@ -14853,6 +14864,54 @@ mod tests {
         let mut flat = words;
         flat[4] = 0xF038_0308;
         lower_with(&flat, table(), vec![]).unwrap();
+    }
+
+    #[test]
+    fn cube_image_get_resinfo_lowers_with_face_count() {
+        let layout = vec![
+            root(RootType::Table, 0, 0),
+            root(RootType::Table, 1, 1),
+        ];
+        let used = vec![
+            UsedResource {
+                kind: ResourceType::Srv,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 8,
+                user_data: 0,
+                slot: 0,
+            },
+            UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 1,
+                slot: 1,
+            },
+        ];
+        let words = [
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF40C_0202,
+            0xFA00_0000, // s_load_dwordx8 s[8:15], s[4:5], null
+            0xBE86_0301, // s_mov_b32 s6, s1
+            0xBE87_0380, // s_mov_b32 s7, 0
+            0xF408_0403,
+            0xFA00_0000, // s_load_dwordx4 s[16:19], s[6:7], null
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0xF038_0F18,
+            0x0002_0402, // image_get_resinfo v[4:7], v2, s[8:15] dmask:0xf dim:SQ_RSRC_IMG_CUBE
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xE070_1000,
+            0x8004_0600, // buffer_store_dword v6, v0, s[16:19], 0 offen
+            S_ENDPGM,
+        ];
+        lower_with(&words, layout, used).unwrap();
     }
 
     #[test]
