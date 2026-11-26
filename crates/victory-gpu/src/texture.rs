@@ -116,6 +116,46 @@ struct Last {
     /// Subresources (and optional element row ranges) dirtied by the last
     /// refresh; empty means every subresource whole.
     dirty: Vec<(u32, Option<std::ops::Range<u32>>)>,
+    /// Number of content changes observed; textures changing >= 2 times with
+    /// staging size <= `DETILE_CACHE_MAX_TEX` cache up to 4 detiled snapshots.
+    changes: u32,
+    detile_cache: Vec<(blake3::Hash, Vec<u8>)>,
+}
+
+impl Last {
+    fn cache_lookup(&mut self, hash: &blake3::Hash) -> Option<&[u8]> {
+        let pos = self.detile_cache.iter().position(|(h, _)| h == hash)?;
+        let last_idx = self.detile_cache.len() - 1;
+        if pos != last_idx {
+            let entry = self.detile_cache.remove(pos);
+            self.detile_cache.push(entry);
+        }
+        self.detile_cache.last().map(|(_, bytes)| bytes.as_slice())
+    }
+
+    fn cache_store(&mut self, hash: blake3::Hash, bytes: &[u8]) {
+        if bytes.len() > DETILE_CACHE_MAX_TEX {
+            return;
+        }
+        if self.detile_cache.len() >= DETILE_CACHE_SLOTS {
+            let (_, evicted) = self.detile_cache.remove(0);
+            DETILE_CACHE_BYTES.fetch_sub(evicted.len() as u64, Ordering::Relaxed);
+        }
+        let size = bytes.len() as u64;
+        if DETILE_CACHE_BYTES.load(Ordering::Relaxed).saturating_add(size) <= DETILE_CACHE_BUDGET {
+            DETILE_CACHE_BYTES.fetch_add(size, Ordering::Relaxed);
+            self.detile_cache.push((hash, bytes.to_vec()));
+        }
+    }
+}
+
+impl Drop for Last {
+    fn drop(&mut self) {
+        let freed: u64 = self.detile_cache.iter().map(|(_, v)| v.len() as u64).sum();
+        if freed > 0 {
+            DETILE_CACHE_BYTES.fetch_sub(freed, Ordering::Relaxed);
+        }
+    }
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -137,6 +177,14 @@ impl Drop for Staging {
 pub(crate) static CHANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
+
+const DETILE_CACHE_BUDGET: u64 = 32 << 20;
+const DETILE_CACHE_MAX_TEX: usize = 1 << 20;
+const DETILE_CACHE_SLOTS: usize = 4;
+static DETILE_CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "diagnostics")]
+#[allow(dead_code)]
+static DETILE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 
 /// Bytes of the staging buffers in [`STAGING`]. They live in upload heaps,
 /// that is in host memory counted against the commit limit, one the size
@@ -494,7 +542,21 @@ impl Staging {
         }
         last.gen_digest = new_digest;
         last.dirty.clear();
-        self.detile(tiled);
+        last.changes = last.changes.saturating_add(1);
+        let staging_len = self.size as usize;
+        if let Some(cached) = last.cache_lookup(&hash).filter(|b| b.len() == staging_len) {
+            // SAFETY: `self.data` covers `staging_len` writable staging bytes under `last`'s lock.
+            unsafe { std::ptr::copy_nonoverlapping(cached.as_ptr(), self.data, staging_len) };
+            #[cfg(feature = "diagnostics")]
+            DETILE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.detile(tiled);
+            if last.changes >= 2 && staging_len <= DETILE_CACHE_MAX_TEX {
+                // SAFETY: `self.data` holds `staging_len` initialized bytes produced by `self.detile`.
+                let detiled = unsafe { std::slice::from_raw_parts(self.data, staging_len) };
+                last.cache_store(hash, detiled);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, true)
@@ -1865,5 +1927,40 @@ mod host_written_tests {
         assert!(
             FOOTPRINT_PLANS.lock().unwrap_or_else(|e| e.into_inner()).len() <= FOOTPRINT_PLAN_CAP
         );
+    }
+
+    #[test]
+    fn detile_cache_skips_static_hits_oscillating_and_frees_on_drop() {
+        let before = DETILE_CACHE_BYTES.load(Ordering::Acquire);
+        let h_a = blake3::hash(b"frame_a");
+        let h_b = blake3::hash(b"frame_b");
+        let h_c = blake3::hash(b"frame_c");
+        let h_d = blake3::hash(b"frame_d");
+        let h_e = blake3::hash(b"frame_e");
+        let mut last = Last::default();
+
+        // First change is treated as static: not cached.
+        last.changes = 1;
+        assert!(last.cache_lookup(&h_a).is_none());
+
+        // Second change (oscillating): stored and recalled on hit, with 4-slot LRU eviction.
+        last.changes = 2;
+        last.cache_store(h_b, &[2u8; 64]);
+        assert_eq!(DETILE_CACHE_BYTES.load(Ordering::Acquire), before + 64);
+        assert_eq!(last.cache_lookup(&h_b), Some([2u8; 64].as_slice()));
+
+        last.cache_store(h_a, &[1u8; 64]);
+        last.cache_store(h_c, &[3u8; 64]);
+        last.cache_store(h_d, &[4u8; 64]);
+        // Touch h_b so h_a is LRU before inserting h_e.
+        assert_eq!(last.cache_lookup(&h_b), Some([2u8; 64].as_slice()));
+        last.cache_store(h_e, &[5u8; 64]);
+
+        assert!(last.cache_lookup(&h_a).is_none(), "LRU entry must be evicted past 4 slots");
+        assert_eq!(last.cache_lookup(&h_b), Some([2u8; 64].as_slice()));
+        assert_eq!(DETILE_CACHE_BYTES.load(Ordering::Acquire), before + 4 * 64);
+
+        drop(last);
+        assert_eq!(DETILE_CACHE_BYTES.load(Ordering::Acquire), before);
     }
 }

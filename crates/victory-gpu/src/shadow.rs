@@ -186,17 +186,19 @@ fn give_back_tiles(all: impl Iterator<Item = Vec<u8>>) {
 }
 
 /// Of sparse copies shaders write: bytes declared, bytes of snapshots taken,
-/// bytes compared after and bytes of those that differed.
+/// bytes in marked pages, bytes compared after and bytes of those that differed.
 #[cfg(feature = "diagnostics")]
-static SPARSE_WRITES: [std::sync::atomic::AtomicU64; 4] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+static SPARSE_WRITES: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
 /// Logs and resets the counts above.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn sparse_writes_text() -> String {
-    let [declared, taken, compared, differed] =
-        [0, 1, 2, 3].map(|i| SPARSE_WRITES[i].swap(0, Ordering::Relaxed) as f64 / 1e6);
-    format!("declared {declared:.1} MB, snapshots {taken:.1} MB, compared {compared:.1} MB, differed {differed:.1} MB")
+    let [declared, taken, marked, compared, differed] =
+        [0, 1, 2, 3, 4].map(|i| SPARSE_WRITES[i].swap(0, Ordering::Relaxed) as f64 / 1e6);
+    format!(
+        "declared {declared:.1} MB, snapshots {taken:.1} MB, marked {marked:.1} MB, compared {compared:.1} MB, differed {differed:.1} MB"
+    )
 }
 
 /// Bytes of the snapshot memory kept for reuse.
@@ -543,6 +545,16 @@ impl Shadow {
         list.defer_gpu_write(self, address as usize, len as usize);
     }
 
+    /// Like [`Shadow::gpu_writes`], for non-shader GPU writes (such as
+    /// `ResolveQueryData`) that do not emit shader write-marks on the GPU.
+    pub(crate) fn gpu_writes_unmarked(self: &Arc<Self>, list: &HostList, address: u64, len: u64) {
+        if self.direct.is_some() {
+            return;
+        }
+        let len = len.min(self.left(address));
+        list.defer_gpu_write_unmarked(self, address as usize, len as usize);
+    }
+
     /// At submission, after the range's refresh: a submitted list's shaders
     /// write this range. Its bytes are kept to tell later what the GPU wrote:
     /// one snapshot per copy and submission, grown to cover every range the
@@ -645,11 +657,23 @@ impl Shadow {
             // An unchanged page is never modified by copy-back, so later
             // overlapping ranges can skip it for the rest of the submission.
             let mode = self.watched.load(Ordering::Relaxed);
+            let filter_marks = crate::marks::filter_copy_back();
+            let mut dirty_words = Vec::new();
             let mut title: Option<Vec<u8>> = None;
             let mut synced = Vec::new();
             let mut at = from;
             while at < to {
                 let n = (PAGE - (start + at) % PAGE).min(to - at);
+                if filter_marks {
+                    if !crate::marks::is_page_marked(start + at) {
+                        at += n;
+                        continue;
+                    }
+                    let w = crate::marks::word_index(start + at);
+                    if dirty_words.last().copied() != Some(w) {
+                        dirty_words.push(w);
+                    }
+                }
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
@@ -685,6 +709,7 @@ impl Shadow {
                 }
                 at += n;
             }
+            crate::marks::note_dirty_words(&dirty_words);
             if let Some(buf) = title {
                 give_back(buf);
             }
@@ -1201,9 +1226,32 @@ impl Shadow {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
         if let Some(s) = &self.sparse {
-            self.each_tile(s, from, to, |at, data, n| {
-                crate::host::copy_mapped(data, at as *const u8, n, false);
-            });
+            if s.before_any.load(Ordering::Acquire) {
+                let start = self.start as usize;
+                let mut touched: Vec<(u32, usize, usize, usize)> = Vec::new();
+                self.each_tile(s, from, to, |at, data, n| {
+                    crate::host::copy_mapped(data, at as *const u8, n, false);
+                    touched.push((((at - start) / PAGE) as u32, at % PAGE, data as usize, n));
+                });
+                let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+                for (tile, off, data, n) in touched {
+                    if let Some(buf) = before.get_mut(&tile) {
+                        // SAFETY: `data` points inside the live tile mapping (`off + n <= PAGE`)
+                        // and `buf` has length `PAGE`.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                data as *const u8,
+                                buf.as_mut_ptr().add(off),
+                                n,
+                            );
+                        }
+                    }
+                }
+            } else {
+                self.each_tile(s, from, to, |at, data, n| {
+                    crate::host::copy_mapped(data, at as *const u8, n, false);
+                });
+            }
             return to - from;
         }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
@@ -1745,6 +1793,8 @@ struct Sparse {
     tiles: Mutex<std::collections::HashMap<u32, Tile, Mix>>,
     /// What tiles shaders write held before the submission.
     before: Mutex<std::collections::HashMap<u32, Vec<u8>, Mix>>,
+    /// Whether `before` holds any persistent per-tile snapshots.
+    before_any: std::sync::atomic::AtomicBool,
     /// By tile: the frame to look at it next in, and how often in a row it
     /// had not changed.
     looks: Mutex<std::collections::HashMap<u32, Arc<Mutex<Look>>, Mix>>,
@@ -2067,6 +2117,18 @@ pub(crate) fn sweep(frame: u64) {
                     looks.remove(at);
                 }
             }
+            if s.before_any.load(Ordering::Acquire) {
+                let mut removed = Vec::new();
+                {
+                    let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
+                    for (at, _) in &old {
+                        if let Some(buf) = before.remove(at) {
+                            removed.push(buf);
+                        }
+                    }
+                }
+                give_back_tiles(removed.into_iter());
+            }
             {
                 let base = shadow.start as usize / PAGE;
                 let mut copied = shadow.copied.lock().unwrap_or_else(|e| e.into_inner());
@@ -2108,6 +2170,7 @@ pub(crate) fn sweep(frame: u64) {
             "tiles given back"
         );
     }
+    sweep_loose();
 }
 
 /// Reads of these tiles give zeros again.
@@ -2212,6 +2275,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
         sparse: Some(Sparse {
             tiles: Mutex::default(),
             before: Mutex::default(),
+            before_any: std::sync::atomic::AtomicBool::new(false),
             looks: Mutex::default(),
             kept: Mutex::default(),
             aliases: Mutex::default(),
@@ -2484,11 +2548,14 @@ impl Shadow {
             unsafe { buf.set_len(PAGE) };
             before.insert(tile, buf);
         }
+        s.before_any.store(true, Ordering::Release);
     }
 
     /// [`Shadow::copy_back`] of a sparse copy, its tiles on several threads.
     fn sparse_back(&self, s: &Sparse, address: usize, len: usize) -> usize {
         let views = self.tiles_of(s, address, address + len);
+        let filter_marks = crate::marks::filter_copy_back();
+        let mut dirty_words = Vec::new();
         let mut before = s.before.lock().unwrap_or_else(|e| e.into_inner());
         let start = self.start as usize;
         // (title address, view, length, the snapshot's bytes): one tile each,
@@ -2496,10 +2563,22 @@ impl Shadow {
         let work: Vec<(usize, usize, usize, usize)> = views
             .iter()
             .filter_map(|&(at, data, n)| {
+                if filter_marks {
+                    if !crate::marks::is_page_marked(at) {
+                        return None;
+                    }
+                    let w = crate::marks::word_index(at);
+                    if dirty_words.last().copied() != Some(w) {
+                        dirty_words.push(w);
+                    }
+                    #[cfg(feature = "diagnostics")]
+                    SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
+                }
                 let old = before.get_mut(&(((at - start) / PAGE) as u32))?;
                 Some((at, data, n, old.as_mut_ptr() as usize + at % PAGE))
             })
             .collect();
+        crate::marks::note_dirty_words(&dirty_words);
         let written = std::sync::atomic::AtomicUsize::new(0);
         crate::host::in_parallel(&work, 8, |chunk| {
             let mut title: Option<Vec<u8>> = None;
@@ -2509,12 +2588,12 @@ impl Shadow {
                 let host = unsafe { std::slice::from_raw_parts_mut(data as *mut u8, n) };
                 let old = unsafe { std::slice::from_raw_parts_mut(old as *mut u8, n) };
                 #[cfg(feature = "diagnostics")]
-                SPARSE_WRITES[2].fetch_add(n as u64, Ordering::Relaxed);
+                SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
                 if host == old {
                     continue;
                 }
                 #[cfg(feature = "diagnostics")]
-                SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
+                SPARSE_WRITES[4].fetch_add(n as u64, Ordering::Relaxed);
                 let buf = title.get_or_insert_with(|| {
                     let mut v = pooled(PAGE);
                     v.resize(PAGE, 0);
@@ -2542,7 +2621,8 @@ impl Shadow {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         self.pending_len.store(pending.len(), Ordering::Relaxed);
-        if pending.is_empty() {
+        if pending.is_empty() && !filter_marks {
+            s.before_any.store(false, Ordering::Release);
             give_back_tiles(before.drain().map(|(_, buf)| buf));
         }
         written
@@ -2918,9 +2998,67 @@ pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
 /// allocations if memory use grows.
 const WINDOW: u64 = 4 << 20;
 
-/// Copies of title memory outside buffers, by (start, length).
-/// Copies of title memory outside buffers, by (start, length).
-static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+/// Copies of title memory outside buffers, by (start, length), paired with their
+/// last-access timestamp in milliseconds (`Marvisak #3078`).
+static LOOSE: Mutex<BTreeMap<(u64, u64), (Arc<Shadow>, AtomicU64)>> = Mutex::new(BTreeMap::new());
+
+fn loose_now_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+fn window_idle_ms() -> u64 {
+    static IDLE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *IDLE.get_or_init(|| {
+        std::env::var("VICTORY_WINDOW_IDLE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30)
+            .saturating_mul(1000)
+    })
+}
+
+/// Frees loose shadow windows unreferenced for at least `idle_ms` (`Marvisak #3078`).
+fn sweep_loose_with(idle_ms: u64) -> usize {
+    if idle_ms == 0 {
+        return 0;
+    }
+    let now = loose_now_ms();
+    let evicted: Vec<(u64, Arc<Shadow>)> = {
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let stale: Vec<(u64, u64)> = map
+            .iter()
+            .filter_map(|(&key, (shadow, last_used))| {
+                (now.saturating_sub(last_used.load(Ordering::Relaxed)) >= idle_ms
+                    && shadow.pending_len.load(Ordering::Relaxed) == 0
+                    && Arc::strong_count(shadow) == 1)
+                    .then_some(key)
+            })
+            .collect();
+        if stale.is_empty() {
+            return 0;
+        }
+        let mut out = Vec::with_capacity(stale.len());
+        for key in stale {
+            if let Some((shadow, _)) = map.remove(&key) {
+                out.push((key.1, shadow));
+            }
+        }
+        BUFFER_GENERATION.fetch_add(1, Ordering::SeqCst);
+        out
+    };
+    let count = evicted.len();
+    let megabytes: u64 = evicted.iter().map(|(len, _)| *len).sum::<u64>() >> 20;
+    for (_, shadow) in evicted {
+        crate::host::retire(shadow);
+    }
+    tracing::info!(windows = count, megabytes, "idle loose windows freed");
+    count
+}
+
+fn sweep_loose() {
+    sweep_loose_with(window_idle_ms());
+}
 
 /// Windows a covering window answered instead of a new copy (diagnostics).
 pub(crate) static REUSES: AtomicU64 = AtomicU64::new(0);
@@ -2940,8 +3078,10 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     }
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
+    let now = loose_now_ms();
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(shadow) = map.get(&(start, len)) {
+    if let Some((shadow, last_used)) = map.get(&(start, len)) {
+        last_used.store(now, Ordering::Relaxed);
         return Some(shadow.clone());
     }
     // Any window copied already that holds the range: a range crossing a
@@ -2951,7 +3091,10 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         .rev()
         .take(64)
         .find(|((s, l), _)| *s <= address && s + l >= end)
-        .map(|(_, shadow)| shadow.clone())
+        .map(|(_, (shadow, last_used))| {
+            last_used.store(now, Ordering::Relaxed);
+            shadow.clone()
+        })
     {
         REUSES.fetch_add(1, Ordering::Relaxed);
         tracing::debug!(
@@ -2985,7 +3128,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         "loose memory copied to the host"
     );
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len, card));
-    map.insert((start, len), shadow.clone());
+    map.insert((start, len), (shadow.clone(), AtomicU64::new(now)));
     Some(shadow)
 }
 
@@ -3001,7 +3144,7 @@ pub(crate) fn near(va: u64) -> String {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .values()
-            .map(|s| (s.gpu, s.start, s.len)),
+            .map(|(s, _)| (s.gpu, s.start, s.len)),
     );
     for s in SPARSE.lock().unwrap_or_else(|e| e.into_inner()).values().flatten() {
         all.push((s.gpu, s.start, s.len));
@@ -3659,5 +3802,42 @@ mod find_cache_tests {
     #[test]
     fn null_address_does_not_allocate_shadow_copy() {
         assert!(find(0, 1).is_none());
+    }
+
+    #[test]
+    fn sweep_loose_evicts_idle_unreferenced_windows_only() {
+        let Some(h) = host() else {
+            return;
+        };
+        let make = |start: u64| -> Arc<Shadow> {
+            let (buf, data) = h.shared_buffer(PAGE as u64).unwrap();
+            // SAFETY: live D3D12 resource.
+            let gpu = unsafe { buf.GetGPUVirtualAddress() };
+            Arc::new(Shadow::new(buf, data, gpu, start, PAGE as u64, None))
+        };
+        let idle_key = (0x7FFE_0000_0000u64, PAGE as u64);
+        let pinned_key = (0x7FFE_0010_0000u64, PAGE as u64);
+        let fresh_key = (0x7FFE_0020_0000u64, PAGE as u64);
+        let held = make(pinned_key.0);
+        {
+            let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            map.insert(idle_key, (make(idle_key.0), AtomicU64::new(0)));
+            map.insert(pinned_key, (held.clone(), AtomicU64::new(0)));
+            map.insert(
+                fresh_key,
+                (make(fresh_key.0), AtomicU64::new(loose_now_ms().saturating_add(60_000))),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let gen_before = buffer_generation();
+        let freed = sweep_loose_with(5);
+        assert!(freed >= 1);
+        assert_ne!(buffer_generation(), gen_before);
+        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!map.contains_key(&idle_key));
+        assert!(map.contains_key(&pinned_key));
+        assert!(map.contains_key(&fresh_key));
+        map.remove(&pinned_key);
+        map.remove(&fresh_key);
     }
 }
