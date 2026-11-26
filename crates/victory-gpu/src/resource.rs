@@ -327,6 +327,7 @@ pub(crate) fn family(format: u32) -> u32 {
         (97, 99),
     ];
     match format {
+        67 => 39,
         87 => 90,
         88 => 92,
         f => FAMILIES
