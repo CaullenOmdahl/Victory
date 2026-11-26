@@ -22,6 +22,7 @@
 //! for screen passes) are guesses; another pass the title runs only once
 //! and whose pipeline takes longer is lost.
 
+use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -218,7 +219,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         super::library::note_used(&p.key);
     }
     if p.made.get().is_none() {
-        start(p);
+        start(p, true);
         if p.lost.load(Ordering::Relaxed) || stuck(p) {
             return None;
         }
@@ -230,10 +231,10 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 }
 
 /// Queues `p` for the workers, once.
-fn start(p: &Arc<Pending>) {
+fn start(p: &Arc<Pending>, now: bool) {
     if !p.queued.swap(true, Ordering::Relaxed) {
         PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
-        queue(p.clone());
+        queue(p.clone(), now);
     }
 }
 
@@ -242,7 +243,7 @@ fn start(p: &Arc<Pending>) {
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p);
+        start(p, false);
     }
 }
 
@@ -386,7 +387,7 @@ fn wait_within(waits: &Waits, budget: Duration, p: &Pending, frame: u64) {
     }
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
-    while p.made.get().is_none() && !stuck(p) {
+    while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) && !stuck(p) {
         let rest = end.saturating_duration_since(Instant::now());
         if rest.is_zero() {
             break;
@@ -395,9 +396,26 @@ fn wait_within(waits: &Waits, budget: Duration, p: &Pending, frame: u64) {
     }
 }
 
-/// What the workers take from: the ordinary pipelines, the screen passes.
-static RECEIVER: [OnceLock<Mutex<std::sync::mpsc::Receiver<Arc<Pending>>>>; 2] =
-    [const { OnceLock::new() }; 2];
+/// What the workers take from (normal, then screen passes), each in priority
+/// order: waited-for draws, early depth-only pipelines, and other early starts.
+static QUEUES: [(Mutex<[VecDeque<Arc<Pending>>; 3]>, Condvar); 2] = [
+    (Mutex::new([const { VecDeque::new() }; 3]), Condvar::new()),
+    (Mutex::new([const { VecDeque::new() }; 3]), Condvar::new()),
+];
+
+fn queue_index(p: &Pending, now: bool) -> usize {
+    if now {
+        0
+    } else if p
+        .graphics
+        .as_deref()
+        .is_some_and(GraphicsState::writes_depth_only)
+    {
+        1
+    } else {
+        2
+    }
+}
 
 static WORKERS_RUNNING: AtomicUsize = AtomicUsize::new(0);
 
@@ -417,10 +435,21 @@ fn worker(i: usize, screen: bool) {
                 use windows::Win32::System::Threading::*;
                 let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
             }
-            let Some(receiver) = RECEIVER[usize::from(screen)].get() else { return };
+            let (lock, work) = &QUEUES[usize::from(screen)];
             loop {
-                let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                let Ok(p) = next else { return };
+                let p = {
+                    let mut q = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    loop {
+                        if let Some(p) = q[0]
+                            .pop_front()
+                            .or_else(|| q[1].pop_front())
+                            .or_else(|| q[2].pop_front())
+                        {
+                            break p;
+                        }
+                        q = work.wait(q).unwrap_or_else(|e| e.into_inner());
+                    }
+                };
                 // SAFETY: a plain call.
                 let id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
                 AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).push((id, p.clone()));
@@ -452,6 +481,10 @@ pub(super) fn worker_lost(id: u32) {
         w.0 != id
     });
     if let Some(screen) = lost {
+        let (lock, done) = &DONE;
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+        drop(_held);
         WAITING.fetch_sub(1, Ordering::Relaxed);
         worker(LOST.fetch_add(1, Ordering::Relaxed), screen);
     }
@@ -459,13 +492,11 @@ pub(super) fn worker_lost(id: u32) {
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8, and two
 /// for screen passes), started on first use.
-fn queue(p: Arc<Pending>) {
-    static SENDER: [OnceLock<std::sync::mpsc::Sender<Arc<Pending>>>; 2] =
-        [const { OnceLock::new() }; 2];
+fn queue(p: Arc<Pending>, now: bool) {
+    static STARTED: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
     let screen = p.screen;
-    let sender = SENDER[usize::from(screen)].get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
-        let _ = RECEIVER[usize::from(screen)].set(Mutex::new(receiver));
+    let slot = usize::from(screen);
+    STARTED[slot].call_once(|| {
         let workers = if screen {
             2
         } else {
@@ -474,13 +505,11 @@ fn queue(p: Arc<Pending>) {
         for i in 0..workers {
             worker(i + if screen { 50 } else { 0 }, screen);
         }
-        sender
     });
-    if let Err(e) = sender.send(p) {
-        // No worker: made here instead.
-        e.0.make();
-        WAITING.fetch_sub(1, Ordering::Relaxed);
-    }
+    let index = queue_index(&p, now);
+    let (lock, work) = &QUEUES[slot];
+    lock.lock().unwrap_or_else(|e| e.into_inner())[index].push_back(p);
+    work.notify_one();
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -648,5 +677,46 @@ mod tests {
         assert!(claim_wait(&p, 7));
         assert!(!claim_wait(&p, 8));
         assert_eq!(p.waited_frame.load(Ordering::Relaxed), 7);
+    }
+
+    #[test]
+    fn depth_only_pipelines_go_ahead_of_other_early_starts() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_D32_FLOAT;
+        let pending = |depth: bool| {
+            let mut g = Box::new(GraphicsState::default());
+            if depth {
+                let subobject = [16u32, DXGI_FORMAT_D32_FLOAT.0 as u32];
+                // SAFETY: a whole depth-format subobject of a stream.
+                unsafe { g.read(16, subobject.as_ptr().cast()) };
+            }
+            Pending::new(Vec::new(), Some(g))
+        };
+        let (shadow, other) = (pending(true), pending(false));
+        assert_eq!(queue_index(&shadow, false), 1);
+        assert_eq!(queue_index(&other, false), 2);
+        assert_eq!(queue_index(&shadow, true), 0);
+        assert_eq!(queue_index(&other, true), 0);
+    }
+
+    #[test]
+    fn lost_worker_wakes_waiter_immediately() {
+        static WAITS: Waits = Waits::new();
+        let p = Arc::new(Pending::new(Vec::new(), None));
+        let waiter_p = p.clone();
+        let waiter = std::thread::spawn(move || {
+            let started = Instant::now();
+            wait_within(&WAITS, Duration::from_secs(5), &waiter_p, 1);
+            started.elapsed()
+        });
+
+        std::thread::sleep(Duration::from_millis(10));
+        p.lost.store(true, Ordering::Relaxed);
+        let (lock, done) = &DONE;
+        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
+        done.notify_all();
+        drop(_held);
+
+        let elapsed = waiter.join().expect("waiter thread must not panic");
+        assert!(elapsed < Duration::from_secs(2));
     }
 }
