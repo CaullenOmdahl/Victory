@@ -161,7 +161,9 @@ pub extern "system" fn XMemVirtualAlloc(
         victory_gpu::title_memory_reserved(at as usize, size, raw_protect);
     }
     if kind & MEM_RESERVE_PLACEHOLDER != 0 && !at.is_null() {
-        physical().reservations.push((at as usize, size));
+        let mut phys = physical();
+        drop_overlapping_placeholders(&mut phys.placeholders, at as usize, at as usize + size);
+        phys.reservations.push((at as usize, size));
     }
     if !constrained && kind & MEM_COMMIT != 0 && !at.is_null() {
         victory_gpu::title_memory_reserved(at as usize, size, raw_protect);
@@ -673,6 +675,16 @@ struct Physical {
     whole: Vec<(usize, usize, Arc<Section>)>,
     /// Pages with a place in such a view.
     bound: std::collections::HashSet<usize>,
+    /// Exact single-placeholder ranges left by [`unmap`] that need no `split_at` before remapping.
+    placeholders: std::collections::HashSet<(usize, usize)>,
+}
+
+fn drop_overlapping_placeholders(
+    placeholders: &mut std::collections::HashSet<(usize, usize)>,
+    base: usize,
+    end: usize,
+) {
+    placeholders.retain(|&(p, n)| p.saturating_add(n) <= base || p >= end);
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -1268,6 +1280,7 @@ fn map_whole(physical: &mut Physical, base: usize, pages: &[usize]) -> bool {
             };
             // The title splits it in pieces before it maps them.
             const COALESCE: u32 = 1;
+            drop_overlapping_placeholders(&mut physical.placeholders, at, at + len);
             // SAFETY: placeholders of one reservation, none mapped.
             unsafe { VirtualFree(at as *mut c_void, len, MEM_RELEASE | COALESCE) };
             if !map_view(at, len, &all) {
@@ -1410,6 +1423,16 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
 /// separate reservations, or pieces the title split, for good. All or
 /// nothing: if a view fails, those made before it are placeholders again.
 fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
+    if physical.placeholders.remove(&(base, len)) {
+        if !map_view(base, len, &slice) {
+            return false;
+        }
+        victory_gpu::title_memory_remapped(base, len);
+        physical.views.insert(base, (len, slice));
+        return true;
+    }
+    let end = base + len;
+    drop_overlapping_placeholders(&mut physical.placeholders, base, end);
     if len >= 16 * MIB {
         tracing::debug!(
             base = format_args!("{base:#x}"),
@@ -1419,7 +1442,6 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             "physical pages mapped"
         );
     }
-    let end = base + len;
     split_at(base);
     split_at(end);
     let mut made: Vec<(usize, usize, Slice)> = Vec::new();
@@ -1482,10 +1504,14 @@ fn map_view(base: usize, len: usize, slice: &Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
-        // SAFETY: the view just mapped, back to a placeholder.
-        unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
-        return false;
+    let pages = len.div_ceil(PAGE);
+    if !slice.section.committed_all(slice.index, pages) {
+        if !commit(base, len) {
+            // SAFETY: the view just mapped, back to a placeholder.
+            unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
+            return false;
+        }
+        slice.section.mark_committed(slice.index, pages);
     }
     // The GPU side guards every view of a page together.
     victory_gpu::title_memory_view(
@@ -1622,12 +1648,17 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 MEM_PRESERVE_PLACEHOLDER,
             )
         };
-        if at < base {
-            map(physical, at, base - at, slice.clone());
-        }
-        if at + size > end {
+        let head_ok = at >= base || map(physical, at, base - at, slice.clone());
+        let tail_ok = at + size <= end || {
             let index = slice.index + (end - at) / PAGE;
-            map(physical, end, at + size - end, Slice { index, ..slice });
+            map(physical, end, at + size - end, Slice { index, ..slice })
+        };
+        if head_ok && tail_ok {
+            let gap_start = at.max(base);
+            let gap_end = (at + size).min(end);
+            if gap_end > gap_start {
+                physical.placeholders.insert((gap_start, gap_end - gap_start));
+            }
         }
     }
 }
@@ -2449,6 +2480,51 @@ mod tests {
         assert_eq!(unsafe { ((b + PAGE - 2) as *const u8).read() }, 0);
         assert_eq!(XMemMapPhysicalPages(b as _, 1, std::ptr::null()), b as _);
         assert_eq!(XMemMapPhysicalPages(a as _, 2, std::ptr::null()), a as _);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn remapping_unmapped_page_reuses_cached_placeholder() {
+        let pages = allocate(2);
+        let va = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!va.is_null());
+        let addr = va as usize;
+
+        assert_eq!(XMemMapPhysicalPages(va, 2, pages.as_ptr()), va);
+        // SAFETY: both mapped 64 KiB pages are committed and writable.
+        unsafe {
+            *(va as *mut u32) = 0x1122_3344;
+            *((va as *mut u8).add(PAGE) as *mut u32) = 0x5566_7788;
+        }
+
+        // Unmapping splits nothing further and records the exact unmapped range as a cached placeholder.
+        assert_eq!(XMemMapPhysicalPages(va, 1, std::ptr::null()), va);
+        assert!(physical().placeholders.contains(&(addr, PAGE)));
+
+        // Remapping page 1 onto the same single-page range consumes the cached placeholder and keeps its bytes.
+        assert_eq!(XMemMapPhysicalPages(va, 1, pages[1..].as_ptr()), va);
+        assert!(!physical().placeholders.contains(&(addr, PAGE)));
+        // SAFETY: page 1 is now mapped at `va`.
+        assert_eq!(unsafe { *(va as *const u32) }, 0x5566_7788);
+
+        // Unmapping/remapping a multi-page range clears any overlapping cached placeholders.
+        assert_eq!(XMemMapPhysicalPages(va, 1, std::ptr::null()), va);
+        assert!(physical().placeholders.contains(&(addr, PAGE)));
+        assert_eq!(XMemMapPhysicalPages(va, 2, std::ptr::null()), va);
+        assert_eq!(XMemMapPhysicalPages(va, 2, pages.as_ptr()), va);
+        assert!(!physical().placeholders.contains(&(addr, PAGE)));
+        // SAFETY: page 0 is back at `va`.
+        assert_eq!(unsafe { *(va as *const u32) }, 0x1122_3344);
+
+        assert_eq!(XMemMapPhysicalPages(va, 2, std::ptr::null()), va);
+        // SAFETY: `va` is our whole reservation.
+        assert_ne!(unsafe { VirtualFree(va, 0, MEM_RELEASE) }, 0);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }

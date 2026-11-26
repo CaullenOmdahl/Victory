@@ -5280,7 +5280,7 @@ impl Meter {
                 crate::copystat::log(frames);
                 let beside_frames = f64::from(self.log_frames.max(1));
                 self.log_frames = 0;
-                if std::env::var_os("VICTORY_COPY_BACK_BESIDE").is_some_and(|v| v == "1") {
+                if crate::watch::copy_back_beside() {
                     let (beside_writes, beside_bytes) = crate::watch::take_beside_stats();
                     tracing::info!(
                         "copy-back beside (VICTORY_COPY_BACK_BESIDE=1): {:.1} writes/frame, {:.2} MB/frame",

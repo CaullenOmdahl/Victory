@@ -1209,16 +1209,23 @@ fn note_beside_write(at: usize, len: usize) {
     }
 }
 
-/// With `VICTORY_COPY_BACK_BESIDE=1`: writes `bytes` into title memory at
-/// `at` through the runtime's [`PageWriter`], so no guard is opened and put
-/// back (`VirtualProtect` / TLB shootdowns skipped); the title's views stay
-/// guarded and show the new bytes through the same physical pages. False,
+/// Whether copy-back writes through unguarded persistent physical-page
+/// views (`VICTORY_COPY_BACK_BESIDE=0` opts out).
+pub(crate) fn copy_back_beside() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var_os("VICTORY_COPY_BACK_BESIDE").is_none_or(|v| v != "0")
+    });
+    *ON
+}
+
+/// With `VICTORY_COPY_BACK_BESIDE` (default on): writes `bytes` into title
+/// memory at `at` through the runtime's [`PageWriter`], so no guard is opened
+/// and put back (`VirtualProtect` / TLB shootdowns skipped); the title's views
+/// stay guarded and show the new bytes through the same physical pages. False,
 /// with nothing written, where the switch is off or no physical-page view
 /// shows `[at, at + bytes.len())`.
 pub(crate) fn write_beside(at: usize, bytes: &[u8]) -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_COPY_BACK_BESIDE").is_some_and(|v| v == "1"));
-    let Some(writer) = PAGE_WRITER.get().filter(|_| *ON) else {
+    let Some(writer) = PAGE_WRITER.get().filter(|_| copy_back_beside()) else {
         return false;
     };
     write_through(at, bytes, |write| writer(at, bytes.len(), write))
