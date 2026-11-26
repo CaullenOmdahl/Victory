@@ -5074,6 +5074,48 @@ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
     read(src, dst.as_mut_ptr(), dst.len())
 }
 
+type NtReadVirtualMemoryFn = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    *const std::ffi::c_void,
+    *mut std::ffi::c_void,
+    usize,
+    *mut usize,
+) -> i32;
+
+type NtWriteVirtualMemoryFn = unsafe extern "system" fn(
+    *mut std::ffi::c_void,
+    *mut std::ffi::c_void,
+    *const std::ffi::c_void,
+    usize,
+    *mut usize,
+) -> i32;
+
+fn ntdll_export(name: &std::ffi::CStr) -> Option<usize> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    // SAFETY: plain lookup in `ntdll.dll`, which is always loaded.
+    unsafe {
+        let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
+        if ntdll.is_null() {
+            return None;
+        }
+        GetProcAddress(ntdll, name.as_ptr().cast()).map(|f| f as usize)
+    }
+}
+
+fn nt_read_virtual_memory() -> Option<NtReadVirtualMemoryFn> {
+    static FN: OnceLock<Option<usize>> = OnceLock::new();
+    let addr = (*FN.get_or_init(|| ntdll_export(c"NtReadVirtualMemory")))?;
+    // SAFETY: `addr` came from `GetProcAddress(ntdll, "NtReadVirtualMemory")`.
+    Some(unsafe { std::mem::transmute::<usize, NtReadVirtualMemoryFn>(addr) })
+}
+
+fn nt_write_virtual_memory() -> Option<NtWriteVirtualMemoryFn> {
+    static FN: OnceLock<Option<usize>> = OnceLock::new();
+    let addr = (*FN.get_or_init(|| ntdll_export(c"NtWriteVirtualMemory")))?;
+    // SAFETY: `addr` came from `GetProcAddress(ntdll, "NtWriteVirtualMemory")`.
+    Some(unsafe { std::mem::transmute::<usize, NtWriteVirtualMemoryFn>(addr) })
+}
+
 /// Copies `len` bytes from `src` to `dst` unless a source page is not
 /// readable.
 fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
@@ -5084,6 +5126,12 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut done = 0;
+    if let Some(nt_read) = nt_read_virtual_memory() {
+        // SAFETY: destination is writable mapped memory of `len` bytes; the
+        // kernel validates `src` and returns a negative status on unmapped pages.
+        let status = unsafe { nt_read(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) };
+        return status >= 0 && done == len;
+    }
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
     unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
@@ -5101,6 +5149,12 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
             return ok;
         }
         let mut done = 0;
+        if let Some(nt_write) = nt_write_virtual_memory() {
+            // SAFETY: `from` points into our mapped host copy; the kernel
+            // validates destination pages and returns an NTSTATUS.
+            let status = unsafe { nt_write(GetCurrentProcess(), at as _, from.cast(), n, &mut done) };
+            return status >= 0 && done == n;
+        }
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }

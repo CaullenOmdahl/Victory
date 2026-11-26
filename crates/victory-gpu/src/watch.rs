@@ -973,23 +973,67 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
     // with one view (most of them): this runs under the guards' lock, which
     // every copy's check waits for (6 % of the submitting thread's time when
     // it asked block by block, run p1).
-    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
-    let Some(views) = views.as_ref() else { return };
-    for block in from..to {
-        let shown = views.shown(block * BLOCK);
-        if shown.len() < 2 || shown.len() > MANY_VIEWS || !g.protected.contains(&block) {
-            continue;
+    let mut alias_blocks: Vec<usize> = Vec::new();
+    {
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+        let Some(views) = views.as_ref() else { return };
+        for block in from..to {
+            let shown = views.shown(block * BLOCK);
+            if shown.len() < 2 || shown.len() > MANY_VIEWS || !g.protected.contains(&block) {
+                continue;
+            }
+            for &at in shown {
+                let alias = at / BLOCK;
+                g.aliased.insert(alias);
+                if alias != block && !g.protected.contains(&alias) && !g.pinned(alias) {
+                    alias_blocks.push(alias);
+                }
+            }
         }
-        for &at in shown {
-            let alias = at / BLOCK;
-            g.aliased.insert(alias);
-            if alias != block && !g.protected.contains(&alias) && !g.pinned(alias) {
-                let mut old = 0;
+    }
+    if alias_blocks.is_empty() {
+        return;
+    }
+    if alias_blocks.len() > 1 {
+        alias_blocks.sort_unstable();
+        alias_blocks.dedup();
+    }
+    let mark_guarded = |g: &mut Guards, run_start: usize, run_end: usize| {
+        for alias in run_start..run_end {
+            g.protected.insert(alias);
+            g.dirty.insert(alias);
+        }
+        bump_region_epochs(run_start * BLOCK, run_end * BLOCK);
+    };
+    let mut at = 0;
+    while at < alias_blocks.len() {
+        let run_start = alias_blocks[at];
+        let mut run_end = run_start + 1;
+        at += 1;
+        while at < alias_blocks.len() && alias_blocks[at] == run_end {
+            run_end += 1;
+            at += 1;
+        }
+        let n = run_end - run_start;
+        let mut old = 0;
+        // SAFETY: title view memory; only its protection changes.
+        let ok = unsafe {
+            VirtualProtect(
+                (run_start * BLOCK) as *const _,
+                n * BLOCK,
+                PAGE_READONLY,
+                &mut old,
+            ) != 0
+        };
+        if ok {
+            mark_guarded(g, run_start, run_end);
+        } else if n > 1 {
+            for alias in run_start..run_end {
                 // SAFETY: title view memory; only its protection changes.
-                if unsafe { VirtualProtect(at as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
-                    g.protected.insert(alias);
-                    g.dirty.insert(alias);
-                    bump_region_epochs(at, at + BLOCK);
+                if unsafe {
+                    VirtualProtect((alias * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) != 0
+                } {
+                    mark_guarded(g, alias, alias + 1);
                 }
             }
         }
