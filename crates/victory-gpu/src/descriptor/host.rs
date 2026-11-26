@@ -68,7 +68,7 @@ pub(crate) struct HostHeap {
     /// (by lists not yet reset).
     /// Where the next search starts, the slots taken, and the smallest run
     /// known not to be free since the last release (`usize::MAX`: none).
-    next: Mutex<(u32, Vec<bool>, usize)>,
+    next: Mutex<(u32, Taken, usize)>,
     /// Per-slot element byte stride (`u32`) for structured buffers whose
     /// stride shader analysis could not recover statically.
     strides: Option<StrideTable>,
@@ -1226,7 +1226,7 @@ impl HostHeap {
                 .map(|_| AtomicU64::new(0))
                 .collect(),
             staged_any: std::sync::atomic::AtomicBool::new(false),
-            next: Mutex::new((0, vec![false; extra as usize], usize::MAX)),
+            next: Mutex::new((0, Taken::new(extra as usize), usize::MAX)),
             strides,
             bindless: Mutex::new(Bindless {
                 freed_seen: freed_views_total(),
@@ -1390,22 +1390,9 @@ impl HostHeap {
         // n - 1 so contiguous runs crossing the cursor are not missed).
         let cursor = *next as usize;
         let second_end = cursor.saturating_add(n.saturating_sub(1)).min(spare);
-        let starts = (cursor..spare).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = taken
+            .find_run(cursor, spare, n)
+            .or_else(|| taken.find_run(0, second_end, n));
         let Some(first) = found else {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, spare, "no free dynamic descriptor slots: a table is not made"));
@@ -1413,13 +1400,13 @@ impl HostHeap {
             FAILED[1].fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        taken[first..first + n].fill(true);
+        taken.set_range(first, n);
         #[cfg(feature = "diagnostics")]
         if !self.sampler {
             static MADE: AtomicU64 = AtomicU64::new(0);
             let before = MADE.fetch_add(n as u64, Ordering::Relaxed);
             if before >> 20 != (before + n as u64) >> 20 {
-                let used = taken.iter().filter(|t| **t).count();
+                let used = taken.count_ones();
                 tracing::info!(used, spare, "dynamic descriptor slots");
             }
         }
@@ -1443,9 +1430,7 @@ impl HostHeap {
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let end = at.saturating_add(n).min(self.spare) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            slots.fill(false);
-        }
+        guard.1.clear_range(at as usize, end.saturating_sub(at as usize));
         guard.2 = usize::MAX;
     }
 
@@ -4825,5 +4810,123 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(buffer_raw_alignment(true, 4), 16);
         assert_eq!(buffer_raw_alignment(false, 4), 4);
         assert_eq!(buffer_raw_alignment(false, 32), 32);
+    }
+
+    #[test]
+    fn taken_bitmap_matches_word_boundaries_and_wraps() {
+        let mut t = super::Taken::new(200);
+        assert_eq!(t.count_ones(), 0);
+        // Allocate across 64-bit word boundary (58..70)
+        assert_eq!(t.find_run(0, 200, 12), Some(0));
+        t.set_range(0, 58);
+        assert_eq!(t.find_run(0, 200, 12), Some(58));
+        t.set_range(58, 12);
+        assert_eq!(t.count_ones(), 70);
+        assert_eq!(t.find_run(0, 200, 130), Some(70));
+        // Multi-word hole crossing 64 and 128 boundaries
+        t.set_range(70, 130);
+        assert_eq!(t.count_ones(), 200);
+        assert_eq!(t.find_run(0, 200, 1), None);
+        t.clear_range(60, 75);
+        assert_eq!(t.count_ones(), 125);
+        assert_eq!(t.find_run(65, 200, 10), Some(65));
+        assert_eq!(t.find_run(0, 200, 75), Some(60));
+        assert_eq!(t.find_run(0, 200, 76), None);
+        // Unaligned search window [62, 134)
+        assert_eq!(t.find_run(62, 134, 72), Some(62));
+        assert_eq!(t.find_run(62, 134, 73), None);
+    }
+}
+
+/// 64-bit word-packed bitmap of taken dynamic descriptor slots (`1` = in use).
+struct Taken {
+    bits: Vec<u64>,
+    len: usize,
+}
+
+impl Taken {
+    fn new(len: usize) -> Self {
+        Self {
+            bits: vec![0u64; len.div_ceil(64)],
+            len,
+        }
+    }
+
+    /// Returns the first index `i` in `[start, end)` with `n` contiguous free
+    /// (`0`) bits, skipping full `u64::MAX` words and full free words in one step.
+    fn find_run(&self, start: usize, end: usize, n: usize) -> Option<usize> {
+        let end = end.min(self.len);
+        if n == 0 || start.saturating_add(n) > end {
+            return None;
+        }
+        let mut at = start;
+        let mut run = 0usize;
+        while at < end {
+            let bit = at & 63;
+            let avail = (64 - bit).min(end - at);
+            let word = self.bits[at >> 6] >> bit;
+            let free = (!word).trailing_ones() as usize;
+            if free >= avail {
+                if run + avail >= n {
+                    return Some(at - run);
+                }
+                run += avail;
+                at += avail;
+            } else {
+                if run + free >= n {
+                    return Some(at - run);
+                }
+                let busy = (word >> free).trailing_ones() as usize;
+                run = 0;
+                at += (free + busy).min(avail);
+            }
+        }
+        None
+    }
+
+    fn fill_range(&mut self, start: usize, n: usize, val: bool) {
+        let end = start.saturating_add(n).min(self.len);
+        if start >= end {
+            return;
+        }
+        let mut at = start;
+        while at < end {
+            let word_idx = at >> 6;
+            let bit = at & 63;
+            let count = (64 - bit).min(end - at);
+            let mask = if count == 64 {
+                u64::MAX
+            } else {
+                ((1u64 << count) - 1) << bit
+            };
+            if val {
+                self.bits[word_idx] |= mask;
+            } else {
+                self.bits[word_idx] &= !mask;
+            }
+            at += count;
+        }
+    }
+
+    fn set_range(&mut self, start: usize, n: usize) {
+        self.fill_range(start, n, true);
+    }
+
+    fn clear_range(&mut self, start: usize, n: usize) {
+        self.fill_range(start, n, false);
+    }
+
+    fn count_ones(&self) -> usize {
+        if self.len == 0 {
+            return 0;
+        }
+        let full = self.len >> 6;
+        let rem = self.len & 63;
+        let mut total: usize = self.bits[..full].iter().map(|w| w.count_ones() as usize).sum();
+        if rem > 0 {
+            let mask = (1u64 << rem) - 1;
+            total += (self.bits[full] & mask).count_ones() as usize;
+        }
+        total
     }
 }

@@ -31,7 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Mutex, RwLock};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Per-block (64 KiB) epoch table (or `VICTORY_EPOCH_SHIFT=26` for 64 MiB).
 /// Incremented for only the block(s) touched whenever a guarded block is
@@ -99,6 +99,28 @@ pub(crate) fn region_epoch(start: usize, end: usize) -> u64 {
         }
     }
     hash
+}
+
+/// Current epoch for the 64 KiB guard block (or configured region bucket)
+/// containing `addr`, read without acquiring any guard locks.
+#[inline]
+pub(crate) fn block_epoch(addr: usize) -> u64 {
+    REGION_EPOCHS[(addr >> region_shift()) & (REGION_BUCKETS - 1)].load(Ordering::Acquire)
+}
+
+/// Number of unmapped blocks currently tracked in `GUARDS.holes` so ranges
+/// outside known holes skip the `guards_read()` lock check entirely.
+static KNOWN_HOLES: AtomicUsize = AtomicUsize::new(0);
+
+/// Fast lock-free-when-empty check for whether `[start, end)` overlaps any
+/// known unmapped hole recorded by `guard()`.
+pub(crate) fn has_known_hole(start: usize, end: usize) -> bool {
+    if start >= end || KNOWN_HOLES.load(Ordering::Relaxed) == 0 {
+        return false;
+    }
+    let (first, last) = (start / BLOCK, end.div_ceil(BLOCK));
+    let g = guards_read();
+    g.holes.range(first..last).next().is_some()
 }
 
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
@@ -312,6 +334,25 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
 const PIN: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl Guards {
+    fn note_hole(&mut self, block: usize) {
+        if self.holes.insert(block) {
+            KNOWN_HOLES.fetch_add(1, Ordering::Relaxed);
+        }
+        self.dirty.remove(&block);
+    }
+
+    fn clear_holes(&mut self, holes: Vec<usize>) {
+        let mut removed = 0usize;
+        for block in holes {
+            if self.holes.remove(&block) {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            KNOWN_HOLES.fetch_sub(removed, Ordering::Relaxed);
+        }
+    }
+
     /// Whether `block` is left writable for a kernel write.
     fn pinned(&self, block: usize) -> bool {
         self.pins.iter().any(|&(from, to, _)| from <= block && block < to)
@@ -625,8 +666,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
             }
             let hole_end = hole_run_end(block, last);
             for b in block..hole_end {
-                g.holes.insert(b);
-                g.dirty.remove(&b);
+                g.note_hole(b);
             }
             block = hole_end;
             continue;
@@ -819,8 +859,7 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
         let (end, can_guard) = view_run(at, to);
         if !can_guard {
             for block in at..end {
-                g.holes.insert(block);
-                g.dirty.remove(&block);
+                g.note_hole(block);
             }
         } else if set(at, end) {
             note(g, written, at, end);
@@ -829,8 +868,7 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
                 if set(block, block + 1) {
                     note(g, written, block, block + 1);
                 } else {
-                    g.holes.insert(block);
-                    g.dirty.remove(&block);
+                    g.note_hole(block);
                 }
             }
         }
@@ -863,6 +901,7 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
                 if unsafe { VirtualProtect(at as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
                     g.protected.insert(alias);
                     g.dirty.insert(alias);
+                    bump_region_epochs(at, at + BLOCK);
                 }
             }
         }
@@ -1059,9 +1098,7 @@ fn remapped_locked(g: &mut Guards, at: usize, end: usize, protect_blocks: bool) 
     let uncovered = g.uncover(first, last);
     let dropped_pins = g.drop_pins(first, last);
     let changed = uncovered || !holes.is_empty() || !blocks.is_empty() || dropped_pins;
-    for block in holes {
-        g.holes.remove(&block);
-    }
+    g.clear_holes(holes);
     for block in blocks {
         g.protected.remove(&block);
         g.clean.remove(&block);
@@ -1751,5 +1788,26 @@ mod tests {
         assert!(written.is_none());
         // SAFETY: releases our test reservation.
         assert_ne!(unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) }, 0);
+    }
+
+    #[test]
+    fn block_epoch_and_known_hole_track_updates_and_remaps() {
+        let ep0 = block_epoch(0x10_0000);
+        bump_region_epochs(0x10_0000, 0x10_0000 + BLOCK);
+        assert_ne!(block_epoch(0x10_0000), ep0);
+
+        let hole_block = 0x7FFF_0000usize / BLOCK;
+        let hole_addr = hole_block * BLOCK;
+        assert!(!has_known_hole(hole_addr, hole_addr + BLOCK));
+        {
+            let mut g = guards_mut();
+            g.note_hole(hole_block);
+        }
+        assert!(has_known_hole(hole_addr, hole_addr + BLOCK));
+        {
+            let mut g = guards_mut();
+            remapped_locked(&mut g, hole_addr, hole_addr + BLOCK, false);
+        }
+        assert!(!has_known_hole(hole_addr, hole_addr + BLOCK));
     }
 }

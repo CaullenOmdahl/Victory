@@ -55,6 +55,9 @@ pub(crate) struct Shadow {
     /// Ranges already guarded and copied at `region_epoch(from, to)` (O(1) fast
     /// path when no guard fault/remap/rewrite occurred in those 64 MiB regions).
     clean_spans: Mutex<crate::fx::Map<(usize, usize), u64>>,
+    /// Lock-free per-64 KiB page last-observed [`crate::watch::block_epoch`];
+    /// skips `writes_guarded` + `GUARDS` lock entirely on unchanged pages.
+    page_epochs: Box<[AtomicU64]>,
     /// The buffer has memory only where it was brought up to date.
     sparse: Option<Sparse>,
     /// Device-local VRAM mirror (`DEFAULT`) + Wave64 GPU hash state (`card.rs`).
@@ -327,6 +330,7 @@ impl Shadow {
             direct: None,
             unwatched: Mutex::default(),
             clean_spans: Mutex::default(),
+            page_epochs: (0..pages).map(|_| AtomicU64::new(0)).collect(),
             sparse: None,
             card,
             gone: std::sync::atomic::AtomicBool::new(false),
@@ -814,6 +818,9 @@ impl Shadow {
         }
         let lazy = lazy && !forced && always != 2;
         if !forced && mode == WATCHED_GUARDED {
+            if !self.page_epochs.is_empty() {
+                return self.update_guarded_pages(from, to, lazy);
+            }
             // Subdivide large guarded spans into 8 MiB chunks so a single write
             // fault in one corner of a 174 MiB buffer does not invalidate
             // `clean_spans` or scan all 2,784 pages on every submission.
@@ -844,11 +851,19 @@ impl Shadow {
                 }
                 return copied;
             }
+            let (p0, p1) = (from / PAGE, (to - 1) / PAGE);
+            let pre: Vec<u64> = if !self.page_epochs.is_empty() {
+                (p0..=p1).map(|p| crate::watch::block_epoch(p * PAGE)).collect()
+            } else {
+                Vec::new()
+            };
             let ge = crate::watch::region_epoch(from, to);
             if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
                 self.watched.store(WATCHED_GUARDED, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
-                if crate::watch::region_epoch(from, to) == ge {
+                if !self.page_epochs.is_empty() {
+                    self.stamp_page_epochs(from, to, p0, p1, &pre);
+                } else if crate::watch::region_epoch(from, to) == ge {
                     let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
                     if spans.len() >= 8192 {
                         spans.clear();
@@ -876,6 +891,104 @@ impl Shadow {
         self.update_unwatched(from, to, lazy)
     }
 
+    /// Stamps `page_epochs` for whole pages in `p0..=p1` whose live block epoch
+    /// still matches `pre` after `copy_stale` finishes (partial-page refreshes
+    /// leave the uncopied part of the page unstamped).
+    fn stamp_page_epochs(&self, from: usize, to: usize, p0: usize, p1: usize, pre: &[u64]) {
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let base = start / PAGE;
+        let max_p = base + self.page_epochs.len();
+        for (i, p) in (p0..=p1.min(max_p.saturating_sub(1))).enumerate() {
+            if (p * PAGE).max(start) >= from
+                && ((p + 1) * PAGE).min(end) <= to
+                && let Some(&expected) = pre.get(i)
+                && expected != 0
+                && crate::watch::block_epoch(p * PAGE) == expected
+            {
+                self.page_epochs[p - base].store(expected, Ordering::Release);
+            }
+        }
+    }
+
+    /// Lock-free per-64 KiB page epoch scan: skips `writes_guarded` completely
+    /// for clean pages, coalescing only pages whose `watch::block_epoch`
+    /// advanced since this shadow last checked them.
+    fn update_guarded_pages(&self, from: usize, to: usize, lazy: bool) -> usize {
+        let base = self.start as usize / PAGE;
+        let max_p = base + self.page_epochs.len();
+        let (p0, p1) = (from / PAGE, ((to - 1) / PAGE).min(max_p.saturating_sub(1)));
+        let mut dirty_runs: Vec<(usize, usize)> = Vec::new();
+        for p in p0..=p1 {
+            let live = crate::watch::block_epoch(p * PAGE);
+            if self.page_epochs[p - base].load(Ordering::Acquire) != live {
+                if let Some((_, last_p)) = dirty_runs.last_mut().filter(|(_, end)| *end + 1 == p) {
+                    *last_p = p;
+                } else {
+                    dirty_runs.push((p, p));
+                }
+            }
+        }
+        if dirty_runs.is_empty() {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                let n = (to - from) as u64;
+                add(C::Checked, n);
+                add(C::Unchanged, n);
+                add(C::Skipped, 1);
+                add(C::SkippedBytes, n);
+            }
+            return 0;
+        }
+        let mut copied = 0usize;
+        #[cfg(feature = "diagnostics")]
+        let mut checked_bytes = 0usize;
+        for (rp0, rp1) in dirty_runs {
+            let rs = (rp0 * PAGE).max(from);
+            let re = ((rp1 + 1) * PAGE).min(to);
+            #[cfg(feature = "diagnostics")]
+            {
+                checked_bytes += re - rs;
+            }
+            let pre: Vec<u64> = (rp0..=rp1).map(|p| crate::watch::block_epoch(p * PAGE)).collect();
+            if let Some((now, written)) = crate::watch::writes_guarded(rs, re) {
+                let n = self.copy_stale(rs, re, now, &written);
+                copied += n;
+                self.stamp_page_epochs(rs, re, rp0, rp1, &pre);
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (re - rs) as u64);
+                    add(C::Unchanged, (re - rs).saturating_sub(n) as u64);
+                }
+            } else if self.sparse.is_some()
+                && let Some((now, written)) = crate::watch::writes(rs, re, false)
+            {
+                let n = self.copy_stale(rs, re, now, &written);
+                copied += n;
+                #[cfg(feature = "diagnostics")]
+                {
+                    use crate::copystat::{C, add};
+                    add(C::Checked, (re - rs) as u64);
+                    add(C::Unchanged, (re - rs).saturating_sub(n) as u64);
+                }
+            } else {
+                copied += self.update_unwatched(rs, re, lazy);
+            }
+        }
+        #[cfg(feature = "diagnostics")]
+        {
+            let skipped = (to - from).saturating_sub(checked_bytes);
+            if skipped > 0 {
+                use crate::copystat::{C, add};
+                add(C::Checked, skipped as u64);
+                add(C::Unchanged, skipped as u64);
+                add(C::SkippedBytes, skipped as u64);
+            }
+        }
+        copied
+    }
+
     /// Updates `[from, to)` via write-guard tracking, caching clean chunks by
     /// their 1 MiB region epochs and falling back cleanly when unguarded.
     fn update_guarded_chunk(&self, from: usize, to: usize, lazy: bool) -> usize {
@@ -886,8 +999,11 @@ impl Shadow {
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
-                    add(C::Checked, (to - from) as u64);
-                    add(C::Unchanged, (to - from) as u64);
+                    let n = (to - from) as u64;
+                    add(C::Checked, n);
+                    add(C::Unchanged, n);
+                    add(C::Skipped, 1);
+                    add(C::SkippedBytes, n);
                 }
                 return 0;
             }
@@ -1185,6 +1301,7 @@ fn placed(
         }),
         unwatched: Mutex::default(),
         clean_spans: Mutex::default(),
+        page_epochs: Box::default(),
         sparse: None,
         card: None,
         gone: std::sync::atomic::AtomicBool::new(false),
@@ -1958,6 +2075,9 @@ pub(crate) fn sweep(frame: u64) {
                     if let Some(c) = copied.get_mut(page) {
                         *c = 0;
                     }
+                    if let Some(ep) = shadow.page_epochs.get(page) {
+                        ep.store(0, Ordering::Release);
+                    }
                 }
             }
             shadow
@@ -2083,6 +2203,12 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
         direct: None,
         unwatched: Mutex::default(),
         clean_spans: Mutex::default(),
+        page_epochs: if of.is_some() {
+            Box::default()
+        } else {
+            let pages = (start + len).div_ceil(PAGE as u64) - start / PAGE as u64;
+            (0..pages).map(|_| AtomicU64::new(0)).collect()
+        },
         sparse: Some(Sparse {
             tiles: Mutex::default(),
             before: Mutex::default(),

@@ -187,6 +187,13 @@ fn bury(finished: u64) {
 static SUBMISSION_US: [std::sync::atomic::AtomicU64; 2] =
     [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
 
+/// Time spent retiring completed asynchronous submissions in `reap_completed`
+/// since the last frame-rate line, in microseconds: total reap, then
+/// `finish_submission` (copy-back + deferred copies + list resets).
+#[cfg(feature = "diagnostics")]
+static ASYNC_REAP_US: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
 /// After submissions: shader-written ranges compared and copied back into
 /// title memory (microseconds, bytes that differed), since the last
 /// frame-rate line.
@@ -1410,6 +1417,8 @@ impl Host {
     /// buries objects retired before them. The caller holds `submitted`:
     /// finishing puts back what shaders wrote, as a submission does.
     fn reap_completed(&self) {
+        #[cfg(feature = "diagnostics")]
+        let reap_started = std::time::Instant::now();
         let Some(completed) = Self::fence_completed(&self.fence) else {
             return;
         };
@@ -1433,7 +1442,14 @@ impl Host {
             {
                 {
                     let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
+                    #[cfg(feature = "diagnostics")]
+                    let finish_started = std::time::Instant::now();
                     self.finish_submission(&runs, back, late, late_refresh);
+                    #[cfg(feature = "diagnostics")]
+                    ASYNC_REAP_US[1].fetch_add(
+                        finish_started.elapsed().as_micros() as u64,
+                        Ordering::Relaxed,
+                    );
                 }
                 // Before its lists go: a list that goes with it waits for
                 // this fence, with `submitted` held here.
@@ -1448,6 +1464,11 @@ impl Host {
             bury(last_sub);
         }
         crate::timeline::deliver(FINISHED_FENCE.load(Ordering::Acquire));
+        #[cfg(feature = "diagnostics")]
+        ASYNC_REAP_US[0].fetch_add(
+            reap_started.elapsed().as_micros() as u64,
+            Ordering::Relaxed,
+        );
     }
 
     /// Waits for in-flight GPU work without holding `submitted`, then acquires
@@ -4557,6 +4578,15 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     }
     #[cfg(feature = "diagnostics")]
     let moved = std::time::Instant::now();
+    if !title_dst
+        && len >= 64 << 10
+        && crate::watch::has_known_hole(src as usize, (src as usize).saturating_add(len))
+    {
+        read_sparse(src, dst, len);
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+        return;
+    }
     let whole = read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
@@ -5035,12 +5065,20 @@ impl Meter {
         // Over the same frames as the counts above.
         #[cfg(feature = "diagnostics")]
         let drops = crate::pipeline::take_drops();
+        #[cfg(feature = "diagnostics")]
+        let [reap_ms, finish_ms] = [0, 1].map(|i| {
+            ASYNC_REAP_US[i].swap(0, Ordering::Relaxed) as f64 / 1000.0 / frames
+        });
         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
             self.logged = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
             #[cfg(feature = "diagnostics")]
             log_gpu_waits();
+            #[cfg(feature = "diagnostics")]
+            tracing::info!(
+                "async retire since: {reap_ms:.1} ms/frame reap ({finish_ms:.1} ms/frame finish_submission)"
+            );
             #[cfg(feature = "diagnostics")]
             tracing::info!(
                 "prewarm since: {:.1} ms, {:.2} MB of fills done ahead, {:.1} ms of plans made ahead, {} slots staged and copied",
