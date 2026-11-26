@@ -13,17 +13,19 @@ use super::bitcode::{Attr, Bin, Cast, Rmw, Term, V, pred};
 use super::container::SigElement;
 use super::shader::{Shader, flags};
 use crate::ShaderError;
-use crate::gfx10::{Dpp, Fields, NULL, Operand};
+use crate::gfx10::{Dpp, Encoding, Fields, NULL, Operand};
 use crate::io::{Barycentric, Export, Input, Interp, Io, Target};
 use crate::ir::{EXEC, Exit, Inst, Program, Reg, Value};
 use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usage, UsedResource};
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
-type Why = &'static str;
-
+mod tables;
 #[cfg(test)]
 mod user_data_tests;
+use tables::{DenseMap, FxMap, FxSet, value_count};
+
+type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
 #[derive(Debug, Clone, Copy)]
@@ -532,39 +534,39 @@ struct Lower<'a> {
     /// more (see [`crate::sgpr_spill`]): not lowered.
     dead: HashSet<Site>,
     bad: &'a HashMap<Value, Why>,
-    lane_fail: HashMap<Value, Why>,
-    vals: HashMap<Value, Val>,
-    floats: HashMap<Value, V>,
+    lane_fail: FxMap<Value, Why>,
+    vals: DenseMap<Val>,
+    floats: DenseMap<V>,
     /// DXIL block per IR block (unreachable: none).
     block: Vec<Option<usize>>,
     cur: usize,
-    bools: HashMap<(usize, Bool), V>,
-    lane_bits: HashMap<Value, V>,
+    bools: FxMap<(usize, Bool), V>,
+    lane_bits: FxMap<Value, V>,
     /// IR phi location by value.
-    phi_at: HashMap<Value, (usize, usize)>,
-    mask_phis: HashMap<Value, V>,
+    phi_at: DenseMap<(usize, usize)>,
+    mask_phis: FxMap<Value, V>,
     pending_masks: Vec<(V, usize, usize)>,
     data_phis: Vec<(V, usize, usize)>,
-    read_phis: HashSet<Value>,
-    params: HashMap<Value, (usize, u32)>,
+    read_phis: FxSet<Value>,
+    params: FxMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
     samplers: Vec<[u32; 4]>,
-    descriptors: HashMap<(Site, bool), &'a Source>,
-    scalar: HashMap<Site, Address>,
-    exports: HashMap<Site, &'a Export>,
-    interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
+    descriptors: FxMap<(Site, bool), &'a Source>,
+    scalar: FxMap<Site, Address>,
+    exports: FxMap<Site, &'a Export>,
+    interps: FxMap<Site, &'a Interp>,
+    handles: FxMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Handles made in the entry block for descriptors at addresses the
     /// root parameters alone give (table and heap loads with no other
     /// term), by root parameter, byte offset, dword, sampler heap and
     /// properties ([`Lower::entry_address`]).
-    entry_handles: HashMap<(EntryAddress, u8, bool, (u32, u32)), V>,
+    entry_handles: FxMap<(EntryAddress, u8, bool, (u32, u32)), V>,
     /// Handles of descriptors chosen by control flow, made in their join
     /// block, by the choice (its `Debug` text), sampler heap and properties.
-    join_handles: HashMap<(String, bool, (u32, u32)), V>,
+    join_handles: FxMap<(String, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
-    edges: HashMap<(usize, usize), usize>,
+    edges: FxMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
     exported: Vec<bool>,
     /// Reverse-postorder index per IR block.
@@ -597,7 +599,7 @@ struct Lower<'a> {
     /// Mesh: the thread index in the group (made in the entry block).
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
-    no_barrier: HashSet<usize>,
+    no_barrier: FxSet<usize>,
     /// Whether arbitrary outputs were pruned against a paired pixel shader.
     pruned: bool,
     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
@@ -615,16 +617,16 @@ struct Lower<'a> {
     /// The instruction being lowered may read lane masks as data.
     mask_ok: bool,
     /// Ballots of masks read as data, by low dword: (low, high).
-    ballots: HashMap<Value, (V, V)>,
+    ballots: FxMap<Value, (V, V)>,
     /// SCC of a scalar mask operation ("some lane is set"), with the low
     /// dword of the mask it tests: read as data, the ballot is not zero.
-    mask_scc: HashMap<Value, Value>,
+    mask_scc: FxMap<Value, Value>,
     /// Lane masks read as numbers (see [`mask_numbers`]).
-    mask_numbers: HashSet<Value>,
+    mask_numbers: FxSet<Value>,
     /// Masks whose ballot is being built: a mask whose lane bit needs its
     /// own value as a number (an opaque mask keyed by a dword it shares
     /// with another) would otherwise recurse until the stack overflows.
-    balloting: HashSet<Value>,
+    balloting: FxSet<Value>,
     /// Block writing each value.
     def_block: Vec<Option<usize>>,
     /// Instruction site `(block, index)` defining each value (`None` for phis
@@ -634,17 +636,17 @@ struct Lower<'a> {
     done_export: Vec<bool>,
     /// Cached 4-dword rows (`index / 4`) loaded from the user-data CBV in the
     /// entry block.
-    user_rows: HashMap<u32, V>,
+    user_rows: FxMap<u32, V>,
     /// Cached extracted user-data dwords (`index`) in the entry block.
-    user_vals: HashMap<u32, V>,
+    user_vals: FxMap<u32, V>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
-    sections: HashMap<usize, HashMap<usize, super::wave::Section>>,
+    sections: FxMap<usize, HashMap<usize, super::wave::Section>>,
     /// Values written in a section that code outside it reads.
-    section_out: HashSet<Value>,
+    section_out: FxSet<Value>,
     /// Values of whole-wave sections holding one lane's, the one read after.
-    one_lane: HashSet<Value>,
+    one_lane: FxSet<Value>,
     /// Memory by address is written too, for other groups to read.
     coherent: Option<bool>,
     /// Threads of different groups take turns through atomics (a tree built
@@ -652,7 +654,7 @@ struct Lower<'a> {
     /// it. The console's program waits for its writes there.
     ordered: Option<bool>,
     /// Views of buffers accessed by address, by instruction.
-    made: HashMap<Site, V>,
+    made: FxMap<Site, V>,
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
@@ -685,7 +687,11 @@ struct Lower<'a> {
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
 /// after `inst`, from `mode` before it (`None`: not known).
+#[inline]
 fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
+    if !matches!(inst.machine.encoding, Encoding::Sopp | Encoding::Sopk) {
+        return mode;
+    }
     match (inst.name(), &inst.fields) {
         ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
         (
@@ -713,6 +719,19 @@ fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
 /// program's start, then as the MODE writes on the way set it; `None` where
 /// paths that set it differently join (or a write is not a constant).
 fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
+    // Fast path: if no instruction can move MODE bits 3:2 away from the
+    // initial nearest-even (0), every reachable block enters with Some(0).
+    let changes_mode = p
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| round16_after(i, Some(0)) != Some(0)));
+    if !changes_mode {
+        let mut out = vec![None; p.blocks.len()];
+        for b in crate::ir::reverse_postorder(&p.blocks) {
+            out[b] = Some(0);
+        }
+        return out;
+    }
     // None: not reached yet; Some(m): the mode (m None: not known).
     let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
     entry[0] = Some(Some(0));
@@ -724,7 +743,7 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
             for inst in &p.blocks[b].insts {
                 m = round16_after(inst, m);
             }
-            for s in p.blocks[b].exit.successors() {
+            for s in p.blocks[b].exit.succs() {
                 let new = match entry[s] {
                     None => Some(m),
                     Some(old) if old == m => continue,
@@ -813,9 +832,9 @@ fn implicit_derivatives(name: &str) -> bool {
 /// mask takes, and the masks the set operations and joins writing them
 /// read in turn. Only these get a number where a set operation writes them
 /// (the others would take ballots nothing reads).
-fn mask_numbers(st: &Structured, p: &crate::ir::Program) -> HashSet<Value> {
+fn mask_numbers(st: &Structured, p: &crate::ir::Program) -> FxSet<Value> {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
-    let mut out: HashSet<Value> = HashSet::new();
+    let mut out: FxSet<Value> = FxSet::default();
     for b in &p.blocks {
         for phi in b.phis.iter().filter(|phi| !is_mask(phi.value)) {
             out.extend(phi.args.iter().copied().filter(|&a| is_mask(a)));
@@ -864,7 +883,7 @@ fn mask_numbers(st: &Structured, p: &crate::ir::Program) -> HashSet<Value> {
 /// bit) as a number.
 fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
-    let ops: Vec<&Operand> = match &i.fields {
+    let ops: &[Operand] = match &i.fields {
         // A mask operation (its result a mask) is no data use.
         Fields::Sop { .. }
             if i.writes
@@ -873,15 +892,15 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
         {
             return false;
         }
-        Fields::Sop { src, .. } => src.iter().collect(),
+        Fields::Sop { src, .. } => src,
         Fields::Valu(v)
             if !matches!(i.name(), "v_cndmask_b32") && !i.name().contains("_co_ci_") =>
         {
-            v.src.iter().collect()
+            &v.src
         }
         _ => return false,
     };
-    ops.into_iter().any(|op| match *op {
+    ops.iter().any(|op| match *op {
         Operand::Scalar { code, .. } if code != NULL => i.read(Reg::S(code)).is_some_and(is_mask),
         _ => false,
     })
@@ -889,8 +908,8 @@ fn reads_mask_as_data(st: &Structured, i: &Inst) -> bool {
 
 /// SCC of each scalar operation writing a tracked lane mask, with the
 /// mask's low dword (EXEC's new value for the `saveexec` forms).
-fn mask_sccs(st: &Structured, p: &crate::ir::Program) -> HashMap<Value, Value> {
-    let mut out = HashMap::new();
+fn mask_sccs(st: &Structured, p: &crate::ir::Program) -> FxMap<Value, Value> {
+    let mut out = FxMap::default();
     for inst in p.blocks.iter().flat_map(|b| &b.insts) {
         let Fields::Sop { dst, .. } = &inst.fields else {
             continue;
@@ -1239,7 +1258,8 @@ impl<'a> Lower<'a> {
         keep: Option<&KeptOutputs>,
     ) -> Self {
         let p = x.p;
-        let mut phi_at = HashMap::new();
+        let nvals = value_count(p);
+        let mut phi_at = DenseMap::with_capacity(nvals);
         for (b, block) in p.blocks.iter().enumerate() {
             for (i, phi) in block.phis.iter().enumerate() {
                 phi_at.insert(phi.value, (b, i));
@@ -1388,7 +1408,7 @@ impl<'a> Lower<'a> {
                 s.wave_size = Some(wave);
             }
         }
-        let mut no_barrier = HashSet::new();
+        let mut no_barrier = FxSet::default();
         if let StageIo::Ms(ms) = &x.native.io {
             s.prims = x.prims.clone();
             if let Some(keep) = keep {
@@ -1451,29 +1471,15 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        let exports: HashMap<Site, &'a Export> = x.io.exports.iter().map(|e| (e.site, e)).collect();
+        let exports: FxMap<Site, &'a Export> = x.io.exports.iter().map(|e| (e.site, e)).collect();
         let mut done_export = vec![false; p.blocks.len()];
         for (&(b, i), e) in &exports {
             if e.done && p.blocks.get(b).is_some_and(|block| i < block.insts.len()) {
                 done_export[b] = true;
             }
         }
-        let value_count = p
-            .inputs
-            .iter()
-            .map(|&(_, v)| v.0 as usize + 1)
-            .chain(p.blocks.iter().flat_map(|block| {
-                block.phis.iter().map(|phi| phi.value.0 as usize + 1).chain(
-                    block
-                        .insts
-                        .iter()
-                        .flat_map(|inst| inst.writes.iter().map(|&(_, v)| v.0 as usize + 1)),
-                )
-            }))
-            .max()
-            .unwrap_or(0);
-        let mut def_block = vec![None; value_count];
-        let mut def_site = vec![None; value_count];
+        let mut def_block = vec![None; nvals];
+        let mut def_site = vec![None; nvals];
         for (b, block) in p.blocks.iter().enumerate() {
             for phi in &block.phis {
                 def_block[phi.value.0 as usize] = Some(b);
@@ -1489,18 +1495,18 @@ impl<'a> Lower<'a> {
             s,
             x,
             bad,
-            lane_fail: HashMap::new(),
-            vals: HashMap::new(),
-            floats: HashMap::new(),
+            lane_fail: FxMap::default(),
+            vals: DenseMap::with_capacity(nvals),
+            floats: DenseMap::with_capacity(nvals),
             block: vec![None; p.blocks.len()],
             cur: 0,
-            bools: HashMap::new(),
-            lane_bits: HashMap::new(),
+            bools: FxMap::default(),
+            lane_bits: FxMap::default(),
             phi_at,
-            mask_phis: HashMap::new(),
+            mask_phis: FxMap::default(),
             pending_masks: Vec::new(),
             data_phis: Vec::new(),
-            read_phis: HashSet::new(),
+            read_phis: FxSet::default(),
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
@@ -1514,10 +1520,10 @@ impl<'a> Lower<'a> {
             scalar: x.res.scalar.iter().copied().collect(),
             exports,
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
-            handles: HashMap::new(),
-            entry_handles: HashMap::new(),
-            join_handles: HashMap::new(),
-            edges: HashMap::new(),
+            handles: FxMap::default(),
+            entry_handles: FxMap::default(),
+            join_handles: FxMap::default(),
+            edges: FxMap::default(),
             exported: vec![false; p.blocks.len()],
             rpo: vec![usize::MAX; p.blocks.len()],
             tail: vec![None; p.blocks.len()],
@@ -1546,18 +1552,18 @@ impl<'a> Lower<'a> {
                 _ => MaskData::None,
             },
             mask_ok: false,
-            ballots: HashMap::new(),
+            ballots: FxMap::default(),
             mask_scc: mask_sccs(x.st, p),
             mask_numbers: mask_numbers(x.st, p),
-            balloting: HashSet::new(),
+            balloting: FxSet::default(),
             def_block,
             def_site,
             done_export,
-            user_rows: HashMap::new(),
-            user_vals: HashMap::new(),
+            user_rows: FxMap::default(),
+            user_vals: FxMap::default(),
             cur_ir: 0,
-            sections: HashMap::new(),
-            section_out: HashSet::new(),
+            sections: FxMap::default(),
+            section_out: FxSet::default(),
             one_lane: Default::default(),
             coherent: None,
             ordered: None,
@@ -2280,10 +2286,13 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             self.mode16 = self.round16[b];
+            let has_sections = self.sections.contains_key(&b);
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
-                if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
+                if has_sections
+                    && let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end)
+                {
                     self.section(b, i, end)?;
                     i = end;
                     continue;
@@ -2551,44 +2560,61 @@ impl<'a> Lower<'a> {
         if self.phi_at.contains_key(&v) {
             self.read_phis.insert(v);
         }
-        let is_mask = self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v);
         if let Some(&(val, h)) = self.finals.get(&v)
             && !self.loop_bodies[&h].contains(&self.cur_ir)
         {
-            if is_mask && !self.mask_ok {
+            if !self.mask_ok && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v)) {
                 return Err(LANE_MASK);
             }
             return Ok(val);
         }
-        if is_mask && !self.mask_ok && std::env::var_os("VICTORY_WHY").is_some() {
+        if !self.mask_ok
+            && std::env::var_os("VICTORY_WHY").is_some()
+            && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v))
+        {
             let def = self.def_block(v).map(|b| (b, self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == v)).map(|i| (format!("{:#x}", i.machine.offset), i.name().to_owned())), self.x.p.blocks[b].phis.iter().find(|p| p.value == v).map(|p| (p.reg, p.args.clone()))));
             eprintln!("mask data {v:?} {:?} def {def:?} cur {} high {:?} val {:?}", self.x.st.masks.get(&v), self.cur_ir, self.x.st.highs.get(&v), self.vals.get(&v));
         }
         match self.vals.get(&v) {
-            Some(&Val::Missing(_)) | None if self.mask_ok && is_mask => {
-                return self.mask_dword(v).map(Val::I32);
+            Some(&Val::Missing(w)) => {
+                if self.mask_ok {
+                    if self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v) {
+                        return self.mask_dword(v).map(Val::I32);
+                    }
+                    if let Some(&lo) = self.mask_scc.get(&v) {
+                        return self.mask_any(lo).map(Val::Bit);
+                    }
+                }
+                // shortcut: descriptors a program that traces rays reads as data
+                // (a hit's material, say): no ray hits anything.
+                if matches!(
+                    w,
+                    "a descriptor's address or format read as data"
+                        | "a descriptor read only as data"
+                        | "a constant buffer's descriptor read as data"
+                ) && crate::resource::traces_rays(self.x.p)
+                {
+                    return Ok(Val::I32(self.s.m.i32(0)));
+                }
+                return Err(w);
             }
-            Some(&Val::Missing(_)) if self.mask_ok && self.mask_scc.contains_key(&v) => {
-                let lo = self.mask_scc[&v];
-                return self.mask_any(lo).map(Val::Bit);
+            Some(&val @ Val::I32(_)) => {
+                if !self.mask_ok
+                    && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v))
+                    && !self.phi_at.contains_key(&v)
+                {
+                    return Err(LANE_MASK);
+                }
+                return Ok(val);
             }
-            // A mask's number (from a set operation) only for the uses
-            // `MaskData` allows.
-            Some(&Val::I32(_)) if is_mask && !self.mask_ok && !self.phi_at.contains_key(&v) => {
-                return Err(LANE_MASK);
-            }
-            // shortcut: descriptors a program that traces rays reads as data
-            // (a hit's material, say): no ray hits anything.
-            Some(&Val::Missing(
-                "a descriptor's address or format read as data"
-                | "a descriptor read only as data"
-                | "a constant buffer's descriptor read as data",
-            )) if crate::resource::traces_rays(self.x.p) => {
-                return Ok(Val::I32(self.s.m.i32(0)));
-            }
-            Some(&Val::Missing(w)) => return Err(w),
             Some(&val) => return Ok(val),
-            None => {}
+            None => {
+                if self.mask_ok
+                    && (self.x.st.masks.contains_key(&v) || self.x.st.highs.contains_key(&v))
+                {
+                    return self.mask_dword(v).map(Val::I32);
+                }
+            }
         }
         if let Some(&(param, dword)) = self.params.get(&v) {
             let val = self.user(param, dword);
@@ -5263,26 +5289,19 @@ impl<'a> Lower<'a> {
         self.mask_ok = match self.mask_data {
             MaskData::Console => true,
             MaskData::Host => {
-                name.starts_with("s_bcnt1_i32_")
+                matches!(
+                    inst.machine.encoding,
+                    Encoding::Sop1 | Encoding::Sopc | Encoding::Vop3
+                ) && (name.starts_with("s_bcnt1_i32_")
                     || name.starts_with("s_ff1_i32_")
                     || name.starts_with("v_mbcnt_")
                     || matches!(
                         name,
                         "s_cmp_eq_u32" | "s_cmp_lg_u32" | "s_cmp_eq_u64" | "s_cmp_lg_u64"
-                    )
+                    ))
             }
             MaskData::None => false,
         };
-        let effect = matches!(inst.fields, Fields::Exp { .. })
-            || matches!(inst.fields, Fields::Flat { .. })
-                && !(name.starts_with("global_load_") || name.starts_with("scratch_load_"))
-            || name.contains("store")
-            || name.contains("atomic")
-            || name == "s_barrier"
-            || matches!(inst.fields, Fields::Ds { .. })
-                && !(name.starts_with("ds_read")
-                    || name.starts_with("ds_swizzle")
-                    || name.contains("permute"));
         let fence = (name.starts_with("buffer_atomic") || name.starts_with("global_atomic"))
             && self.ordered();
         if fence {
@@ -5330,8 +5349,20 @@ impl<'a> Lower<'a> {
         }
         match r {
             Ok(()) => Ok(()),
-            Err(why) if effect => Err(unsupported(offset, why)),
             Err(why) => {
+                let effect = matches!(inst.fields, Fields::Exp { .. })
+                    || matches!(inst.fields, Fields::Flat { .. })
+                        && !(name.starts_with("global_load_") || name.starts_with("scratch_load_"))
+                    || name.contains("store")
+                    || name.contains("atomic")
+                    || name == "s_barrier"
+                    || matches!(inst.fields, Fields::Ds { .. })
+                        && !(name.starts_with("ds_read")
+                            || name.starts_with("ds_swizzle")
+                            || name.contains("permute"));
+                if effect {
+                    return Err(unsupported(offset, why));
+                }
                 for &(_, v) in &inst.writes {
                     self.vals.insert(v, Val::Missing(why));
                 }
@@ -9305,6 +9336,9 @@ impl<'a> Lower<'a> {
     /// products are exact there and round once to f16 (f32 has the 2 x 11 +
     /// 2 bits that make double rounding harmless); `None` if `name` is none.
     fn valu16(&mut self, inst: &Inst, name: &str, guard: Option<V>) -> Option<Result<(), Why>> {
+        if !name.ends_with("16") && name != "v_cvt_f16_f32" {
+            return None;
+        }
         const FLOAT2: &[&str] = &[
             "v_add_f16",
             "v_sub_f16",
@@ -12146,22 +12180,21 @@ impl<'a> Lower<'a> {
         };
         // d16: two 16-bit channels per VGPR, low half first (buffer and
         // tbuffer formats alike).
-        let d16 = name.contains("_format_d16_");
-        let plain = name.replace("_format_d16_", "_format_");
-        let (typed, count) = match plain
+        let rest = name
             .strip_prefix("buffer_load_")
-            .or(plain.strip_prefix("buffer_store_"))
-            .or(plain.strip_prefix("tbuffer_load_"))
-        {
+            .or_else(|| name.strip_prefix("buffer_store_"))
+            .or_else(|| name.strip_prefix("tbuffer_load_"));
+        let d16 = rest.is_some_and(|s| s.starts_with("format_d16_"));
+        let (typed, count) = match rest {
             _ if atomic.is_some() || sub_load.is_some() || sub_store.is_some() => (false, 1),
             Some("dword") => (false, 1),
             Some("dwordx2") => (false, 2),
             Some("dwordx3") => (false, 3),
             Some("dwordx4") => (false, 4),
-            Some("format_x") => (true, 1),
-            Some("format_xy") => (true, 2),
-            Some("format_xyz") => (true, 3),
-            Some("format_xyzw") => (true, 4),
+            Some("format_x" | "format_d16_x") => (true, 1),
+            Some("format_xy" | "format_d16_xy") => (true, 2),
+            Some("format_xyz" | "format_d16_xyz") => (true, 3),
+            Some("format_xyzw" | "format_d16_xyzw") => (true, 4),
             _ => return Err(name),
         };
         let Operand::Vector { reg: areg, .. } = *addr else {
