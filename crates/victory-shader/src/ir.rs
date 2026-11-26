@@ -76,13 +76,44 @@ pub enum Exit {
     Indirect,
 }
 
+/// A block's successors (at most two), stored inline without allocating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Succs {
+    to: [usize; 2],
+    len: usize,
+}
+
+impl std::ops::Deref for Succs {
+    type Target = [usize];
+
+    fn deref(&self) -> &[usize] {
+        &self.to[..self.len]
+    }
+}
+
+impl IntoIterator for Succs {
+    type Item = usize;
+    type IntoIter = std::iter::Take<std::array::IntoIter<usize, 2>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.to.into_iter().take(self.len)
+    }
+}
+
 impl Exit {
-    pub fn successors(&self) -> Vec<usize> {
+    pub(crate) fn succs(&self) -> Succs {
         match *self {
-            Exit::Jump(b) => vec![b],
-            Exit::Branch { taken, not_taken } => vec![taken, not_taken],
-            Exit::End | Exit::Indirect => vec![],
+            Exit::Jump(b) => Succs { to: [b, 0], len: 1 },
+            Exit::Branch { taken, not_taken } => Succs {
+                to: [taken, not_taken],
+                len: 2,
+            },
+            Exit::End | Exit::Indirect => Succs { to: [0, 0], len: 0 },
         }
+    }
+
+    pub fn successors(&self) -> Vec<usize> {
+        self.succs().to_vec()
     }
 }
 
@@ -537,7 +568,7 @@ pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
     while let Some(top) = stack.last_mut() {
         let (b, i) = *top;
         top.1 += 1;
-        match blocks[b].exit.successors().get(i) {
+        match blocks[b].exit.succs().get(i) {
             Some(&s) if !seen[s] => {
                 seen[s] = true;
                 stack.push((s, 0));
@@ -559,7 +590,7 @@ fn link(blocks: &mut [Block]) {
         block.preds.clear();
     }
     for b in 0..blocks.len() {
-        for s in blocks[b].exit.successors() {
+        for s in blocks[b].exit.succs() {
             blocks[s].preds.push(b);
         }
     }
@@ -576,7 +607,7 @@ pub(crate) fn irreducible_edge(
     let &entry = order.first()?;
     let idom = idoms(blocks, order, index);
     for &b in order {
-        for s in blocks[b].exit.successors() {
+        for s in blocks[b].exit.succs() {
             if index[s] > index[b] {
                 continue;
             }
@@ -670,7 +701,7 @@ fn split_irreducible(blocks: &mut Vec<Block>) -> Result<(), ShaderError> {
             }
             copy[b] = blocks.len() + copied.len();
             copied.push(b);
-            for s in blocks[b].exit.successors() {
+            for s in blocks[b].exit.succs() {
                 if region[s] && s != header {
                     stack.push(s);
                 }
@@ -714,12 +745,14 @@ fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec
         let mut seen = vec![false; blocks.len()];
         let mut stack = vec![from];
         while let Some(b) = stack.pop() {
-            let next = if forward {
-                blocks[b].exit.successors()
+            let succs;
+            let next: &[usize] = if forward {
+                succs = blocks[b].exit.succs();
+                &succs
             } else {
-                blocks[b].preds.clone()
+                &blocks[b].preds
             };
-            for n in next {
+            for &n in next {
                 if inside[n] && !seen[n] {
                     seen[n] = true;
                     stack.push(n);
@@ -785,7 +818,7 @@ fn liveness(blocks: &[Block], order: &[usize]) -> (Vec<RegSet>, Vec<RegSet>) {
         changed = false;
         for &b in order.iter().rev() {
             let mut out = empty;
-            for s in blocks[b].exit.successors() {
+            for s in blocks[b].exit.succs() {
                 for (o, i) in out.iter_mut().zip(&live_in[s]) {
                     *o |= i;
                 }
@@ -1152,10 +1185,12 @@ fn effects(
         // Lanes disabled in EXEC keep the old value.
         r.extend(w.iter().filter(|w| matches!(w, Reg::V(_))));
     }
-    let mut seen = Vec::with_capacity(r.len());
-    r.retain(|reg| {
-        let new = !seen.contains(reg);
-        seen.push(*reg);
+    let mut seen: RegSet = [0; REGS.div_ceil(64)];
+    r.retain(|&reg| {
+        let new = !contains(&seen, reg);
+        if new {
+            insert(&mut seen, reg);
+        }
         new
     });
     Ok(Some((r, w)))
@@ -1514,5 +1549,51 @@ mod tests {
         assert_eq!(vgprs(&movrels.reads), [4, 5, 0]);
         assert_eq!(movrels.read(Reg::V(4)), movreld.write(Reg::V(4)));
         assert!(build(&code, false, 4).is_err(), "v4 is past 4 VGPRs");
+    }
+
+    #[test]
+    fn exit_succs_matches_successors() {
+        for exit in [
+            Exit::End,
+            Exit::Indirect,
+            Exit::Jump(7),
+            Exit::Branch {
+                taken: 3,
+                not_taken: 5,
+            },
+        ] {
+            let s = exit.succs();
+            assert_eq!(&*s, &exit.successors()[..]);
+            assert_eq!(s.into_iter().collect::<Vec<_>>(), exit.successors());
+        }
+    }
+
+    #[test]
+    fn effects_dedup_preserves_first_occurrence_order() {
+        let code: Vec<u8> = [
+            0x0600_0100_u32, // v_add_f32 v0, v0, v0
+            0x7E04_8502,     // v_movreld_b32 v2, v2
+            S_ENDPGM,
+        ]
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+        let p = build(&code, false, 6).unwrap();
+        let [add, movreld, _] = &p.blocks[0].insts[..] else {
+            panic!()
+        };
+        let read_regs = |inst: &Inst| -> Vec<Reg> { inst.reads.iter().map(|&(r, _)| r).collect() };
+        assert_eq!(read_regs(add), [Reg::V(0), Reg::S(EXEC)]);
+        assert_eq!(
+            read_regs(movreld),
+            [
+                Reg::V(2),
+                Reg::S(M0),
+                Reg::S(EXEC),
+                Reg::V(3),
+                Reg::V(4),
+                Reg::V(5),
+            ]
+        );
     }
 }

@@ -22,6 +22,9 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 type Why = &'static str;
 
+#[cfg(test)]
+mod user_data_tests;
+
 /// How an interpolation evaluates an input channel.
 #[derive(Debug, Clone, Copy)]
 enum Eval {
@@ -117,6 +120,9 @@ pub(crate) struct Lowered {
     /// Test builds: the property words of each handle annotation, in order.
     #[cfg(test)]
     pub annotations: Vec<(u32, u32)>,
+    /// Written `cbufferLoadLegacy.i32` calls and extracts in the module.
+    #[cfg(test)]
+    pub cbuf_stats: super::bitcode::CbufStats,
 }
 
 pub(crate) struct Parts<'a> {
@@ -620,7 +626,17 @@ struct Lower<'a> {
     /// with another) would otherwise recurse until the stack overflows.
     balloting: HashSet<Value>,
     /// Block writing each value.
-    def_block: HashMap<Value, usize>,
+    def_block: Vec<Option<usize>>,
+    /// Instruction site `(block, index)` defining each value (`None` for phis
+    /// and program inputs).
+    def_site: Vec<Option<Site>>,
+    /// Per IR block: whether the block contains a `done` export.
+    done_export: Vec<bool>,
+    /// Cached 4-dword rows (`index / 4`) loaded from the user-data CBV in the
+    /// entry block.
+    user_rows: HashMap<u32, V>,
+    /// Cached extracted user-data dwords (`index`) in the entry block.
+    user_vals: HashMap<u32, V>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
@@ -1435,6 +1451,40 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        let exports: HashMap<Site, &'a Export> = x.io.exports.iter().map(|e| (e.site, e)).collect();
+        let mut done_export = vec![false; p.blocks.len()];
+        for (&(b, i), e) in &exports {
+            if e.done && p.blocks.get(b).is_some_and(|block| i < block.insts.len()) {
+                done_export[b] = true;
+            }
+        }
+        let value_count = p
+            .inputs
+            .iter()
+            .map(|&(_, v)| v.0 as usize + 1)
+            .chain(p.blocks.iter().flat_map(|block| {
+                block.phis.iter().map(|phi| phi.value.0 as usize + 1).chain(
+                    block
+                        .insts
+                        .iter()
+                        .flat_map(|inst| inst.writes.iter().map(|&(_, v)| v.0 as usize + 1)),
+                )
+            }))
+            .max()
+            .unwrap_or(0);
+        let mut def_block = vec![None; value_count];
+        let mut def_site = vec![None; value_count];
+        for (b, block) in p.blocks.iter().enumerate() {
+            for phi in &block.phis {
+                def_block[phi.value.0 as usize] = Some(b);
+            }
+            for (i, inst) in block.insts.iter().enumerate() {
+                for &(_, v) in &inst.writes {
+                    def_block[v.0 as usize] = Some(b);
+                    def_site[v.0 as usize] = Some((b, i));
+                }
+            }
+        }
         Lower {
             s,
             x,
@@ -1462,7 +1512,7 @@ impl<'a> Lower<'a> {
                 .map(|d| ((d.site, d.role == Role::Sampler), &d.source))
                 .collect(),
             scalar: x.res.scalar.iter().copied().collect(),
-            exports: x.io.exports.iter().map(|e| (e.site, e)).collect(),
+            exports,
             interps: x.io.interps.iter().map(|(s, i)| (*s, i)).collect(),
             handles: HashMap::new(),
             entry_handles: HashMap::new(),
@@ -1500,18 +1550,11 @@ impl<'a> Lower<'a> {
             mask_scc: mask_sccs(x.st, p),
             mask_numbers: mask_numbers(x.st, p),
             balloting: HashSet::new(),
-            def_block: p
-                .blocks
-                .iter()
-                .enumerate()
-                .flat_map(|(b, block)| {
-                    block
-                        .insts
-                        .iter()
-                        .flat_map(move |i| i.writes.iter().map(move |w| (w.1, b)))
-                        .chain(block.phis.iter().map(move |phi| (phi.value, b)))
-                })
-                .collect(),
+            def_block,
+            def_site,
+            done_export,
+            user_rows: HashMap::new(),
+            user_vals: HashMap::new(),
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
@@ -2117,6 +2160,8 @@ impl<'a> Lower<'a> {
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
             #[cfg(test)]
             annotations: std::mem::take(&mut self.s.annotations),
+            #[cfg(test)]
+            cbuf_stats: self.s.m.cbuf_load_stats(),
             stride_table,
             dxil: self.s.finish(),
             user_data,
@@ -2265,9 +2310,16 @@ impl<'a> Lower<'a> {
         self.exported[b] || self.has_done_export(b)
     }
 
+    fn def_block(&self, v: Value) -> Option<usize> {
+        self.def_block.get(v.0 as usize).copied().flatten()
+    }
+
+    fn def_site(&self, v: Value) -> Option<Site> {
+        self.def_site.get(v.0 as usize).copied().flatten()
+    }
+
     fn has_done_export(&self, b: usize) -> bool {
-        (0..self.x.p.blocks[b].insts.len())
-            .any(|i| self.exports.get(&(b, i)).is_some_and(|e| e.done))
+        self.done_export.get(b).copied().unwrap_or(false)
     }
 
     /// Values of the program's input registers.
@@ -2509,7 +2561,7 @@ impl<'a> Lower<'a> {
             return Ok(val);
         }
         if is_mask && !self.mask_ok && std::env::var_os("VICTORY_WHY").is_some() {
-            let def = self.def_block.get(&v).map(|&b| (b, self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == v)).map(|i| (format!("{:#x}", i.machine.offset), i.name().to_owned())), self.x.p.blocks[b].phis.iter().find(|p| p.value == v).map(|p| (p.reg, p.args.clone()))));
+            let def = self.def_block(v).map(|b| (b, self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == v)).map(|i| (format!("{:#x}", i.machine.offset), i.name().to_owned())), self.x.p.blocks[b].phis.iter().find(|p| p.value == v).map(|p| (p.reg, p.args.clone()))));
             eprintln!("mask data {v:?} {:?} def {def:?} cur {} high {:?} val {:?}", self.x.st.masks.get(&v), self.cur_ir, self.x.st.highs.get(&v), self.vals.get(&v));
         }
         match self.vals.get(&v) {
@@ -2651,6 +2703,44 @@ impl<'a> Lower<'a> {
         }
     }
 
+    fn user_at(&mut self, u: UserData) -> V {
+        let index = u.index;
+        self.user_reads.insert(index, u);
+        self.s.user_data = self.s.user_data.max(index + 1);
+        if let Some(&v) = self.user_vals.get(&index) {
+            return v;
+        }
+        let entry = self.s.entry;
+        let row = index / 4;
+        let r = match self.user_rows.get(&row) {
+            Some(&r) => r,
+            None => {
+                let h = match self.user_data {
+                    Some(h) => h,
+                    None => {
+                        let h = self.s.user_data_handle();
+                        self.user_data = Some(h);
+                        h
+                    }
+                };
+                let ri = self.s.m.i32(row);
+                let r = self.s.op(
+                    entry,
+                    "cbufferLoadLegacy.i32",
+                    Attr::ReadOnly,
+                    self.s.t.cbuf_ret,
+                    59,
+                    &[h, ri],
+                );
+                self.user_rows.insert(row, r);
+                r
+            }
+        };
+        let v = self.s.m.extract(entry, r, index % 4);
+        self.user_vals.insert(index, v);
+        v
+    }
+
     /// A user-data dword: a root parameter's value.
     fn user(&mut self, param: usize, dword: u32) -> Val {
         let rp = self.x.native.layout[param];
@@ -2662,35 +2752,12 @@ impl<'a> Lower<'a> {
             _ => return Val::Missing("a root descriptor"),
         }
         let index = u32::from(rp.user_data) + dword;
-        self.user_reads.insert(
+        Val::I32(self.user_at(UserData {
             index,
-            UserData {
-                index,
-                slot: rp.slot,
-                root: rp.root,
-                dword,
-            },
-        );
-        self.s.user_data = self.s.user_data.max(index + 1);
-        let h = match self.user_data {
-            Some(h) => h,
-            None => {
-                let h = self.s.user_data_handle();
-                self.user_data = Some(h);
-                h
-            }
-        };
-        let entry = self.s.entry;
-        let row = self.s.m.i32(index / 4);
-        let r = self.s.op(
-            entry,
-            "cbufferLoadLegacy.i32",
-            Attr::ReadOnly,
-            self.s.t.cbuf_ret,
-            59,
-            &[h, row],
-        );
-        Val::I32(self.s.m.extract(entry, r, index % 4))
+            slot: rp.slot,
+            root: rp.root,
+            dword,
+        }))
     }
 
     /// The heap index of the host's first view of memory by address: the
@@ -2708,35 +2775,12 @@ impl<'a> Lower<'a> {
             .max()
             .unwrap_or(0)
             + nth;
-        self.user_reads.insert(
+        self.user_at(UserData {
             index,
-            UserData {
-                index,
-                slot: u8::MAX,
-                root,
-                dword,
-            },
-        );
-        self.s.user_data = self.s.user_data.max(index + 1);
-        let h = match self.user_data {
-            Some(h) => h,
-            None => {
-                let h = self.s.user_data_handle();
-                self.user_data = Some(h);
-                h
-            }
-        };
-        let entry = self.s.entry;
-        let row = self.s.m.i32(index / 4);
-        let r = self.s.op(
-            entry,
-            "cbufferLoadLegacy.i32",
-            Attr::ReadOnly,
-            self.s.t.cbuf_ret,
-            59,
-            &[h, row],
-        );
-        self.s.m.extract(entry, r, index % 4)
+            slot: u8::MAX,
+            root,
+            dword,
+        })
     }
 
     /// The host's view of the title memory at `hi:lo` (40 bits) and the
@@ -3199,10 +3243,10 @@ impl<'a> Lower<'a> {
             if let Some(&xy) = self.ballots.get(&lo) {
                 return Ok(xy);
             }
-            let at = match self.def_block.get(&lo) {
+            let at = match self.def_block(lo) {
                 None => self.s.entry,
-                Some(&b) if b == self.cur_ir => self.cur,
-                Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+                Some(b) if b == self.cur_ir => self.cur,
+                Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
             };
             let bit = self.boolean(m, at)?;
             let xy = self.console_ballot(at, bit);
@@ -3214,7 +3258,7 @@ impl<'a> Lower<'a> {
         }
         if !self.x.st.active.contains(&lo) {
             if std::env::var_os("VICTORY_WHY").is_some() {
-                let def = self.def_block.get(&lo).map(|&b| (b, self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == lo)).map(|i| (i.machine.offset, i.name().to_owned())), self.x.p.blocks[b].phis.iter().find(|p| p.value == lo).map(|p| (p.reg, p.args.clone()))));
+                let def = self.def_block(lo).map(|b| (b, self.x.p.blocks[b].insts.iter().find(|i| i.writes.iter().any(|w| w.1 == lo)).map(|i| (i.machine.offset, i.name().to_owned())), self.x.p.blocks[b].phis.iter().find(|p| p.value == lo).map(|p| (p.reg, p.args.clone()))));
                 eprintln!("mask {lo:?} {m:?} def {def:?} cur {}", self.cur_ir);
             }
             return Err("a lane mask holding lanes elsewhere read as data");
@@ -3222,11 +3266,11 @@ impl<'a> Lower<'a> {
         if let Some(&xy) = self.ballots.get(&lo) {
             return Ok(xy);
         }
-        let at = match self.def_block.get(&lo) {
+        let at = match self.def_block(lo) {
             // Program inputs (EXEC on entry).
             None => self.s.entry,
-            Some(&b) if b == self.cur_ir => self.cur,
-            Some(&b) => self.tail[b].ok_or("a lane mask written after its use")?,
+            Some(b) if b == self.cur_ir => self.cur,
+            Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
         };
         if !self.balloting.insert(lo) {
             return Err("a lane mask whose lanes depend on its own value");
@@ -3263,16 +3307,12 @@ impl<'a> Lower<'a> {
         // `s_*_saveexec_*`) and `b` exits via `s_cbranch_execz`/`execnz` without
         // rewriting EXEC, a block entered solely through one branch edge knows
         // whether `lo != 0` without balloting lanes from elsewhere.
-        if let Some(&b) = self.def_block.get(&lo) {
+        if let Some((b, idx)) = self.def_site(lo) {
             let blk = &self.x.p.blocks[b];
+            let def = &blk.insts[idx];
             if let crate::ir::Exit::Branch { taken, not_taken } = blk.exit
                 && taken != not_taken
                 && self.x.p.blocks[self.cur_ir].preds.as_slice() == [b]
-                && let Some((idx, def)) = blk
-                    .insts
-                    .iter()
-                    .enumerate()
-                    .find(|(_, inst)| inst.writes.iter().any(|&(_, w)| w == lo))
                 && (def.write(Reg::S(EXEC)) == Some(lo) || def.name().contains("_wrexec_"))
                 && !blk.insts[idx + 1..]
                     .iter()
@@ -13224,15 +13264,10 @@ impl<'a> Lower<'a> {
         if let Some(&Val::Bit(x)) = self.vals.get(&v) {
             return Ok(x);
         }
-        let b = *self
-            .def_block
-            .get(&v)
-            .ok_or("an SCC from the program's start")?;
-        let inst = self.x.p.blocks[b]
-            .insts
-            .iter()
-            .find(|i| i.writes.iter().any(|w| w.1 == v))
+        let (b, i) = self
+            .def_site(v)
             .ok_or("an SCC without its instruction")?;
+        let inst = &self.x.p.blocks[b].insts[i];
         let mask = inst
             .writes
             .iter()
@@ -13433,13 +13468,7 @@ impl<'a> Lower<'a> {
     /// A dword a scalar load writes, where the load is a descriptor the
     /// program uses as a resource or sampler.
     fn descriptor_dword(&self, v: Value) -> bool {
-        let Some(load) = self.x.p.blocks.iter().enumerate().find_map(|(b, block)| {
-            block
-                .insts
-                .iter()
-                .position(|i| i.writes.iter().any(|w| w.1 == v))
-                .map(|i| (b, i))
-        }) else {
+        let Some(load) = self.def_site(v) else {
             return false;
         };
         self.x.p.blocks[load.0].insts[load.1]
