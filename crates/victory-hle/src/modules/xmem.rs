@@ -387,6 +387,95 @@ struct Section {
 /// mapped or written).
 static SECTION_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+// Charge each successful section for the lifetime of the process: a mapped
+// view can keep its backing alive after the title frees the page numbers.
+static PHYSICAL_PAGEFILE_REMAINING: LazyLock<AtomicUsize> = LazyLock::new(|| {
+    let bytes = std::env::var("VICTORY_PHYSICAL_PAGEFILE_FIRST_MB")
+        .ok()
+        .and_then(|mib| mib.trim().parse::<usize>().ok())
+        .and_then(|mib| mib.checked_mul(MIB))
+        .unwrap_or(0);
+    AtomicUsize::new(bytes)
+});
+
+fn reserve_pagefile(remaining: &AtomicUsize, size: usize) -> bool {
+    remaining
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bytes| {
+            bytes.checked_sub(size)
+        })
+        .is_ok()
+}
+
+fn create_section_handle(size: usize, storage: HANDLE, protection: u32) -> std::io::Result<HANDLE> {
+    // SAFETY: callers supply either a live writable file handle or
+    // `INVALID_HANDLE_VALUE` for pagefile backing.
+    let handle = unsafe {
+        CreateFileMappingW(
+            storage,
+            std::ptr::null(),
+            protection,
+            (size as u64 >> 32) as u32,
+            size as u32,
+            std::ptr::null(),
+        )
+    };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(handle)
+}
+
+fn physical_section_in(
+    size: usize,
+    directory: &std::path::Path,
+    remaining: &AtomicUsize,
+) -> std::io::Result<HANDLE> {
+    use std::os::windows::io::AsRawHandle;
+
+    victory_core::ensure_outside_repo(directory).map_err(std::io::Error::other)?;
+    if reserve_pagefile(remaining, size) {
+        match create_section_handle(size, INVALID_HANDLE_VALUE, PAGE_READWRITE | SEC_COMMIT) {
+            Ok(handle) => {
+                tracing::info!(bytes = size, "physical pages use budgeted pagefile backing");
+                return Ok(handle);
+            }
+            Err(error) => {
+                remaining.fetch_add(size, Ordering::Relaxed);
+                tracing::warn!(
+                    bytes = size,
+                    %error,
+                    "pagefile backing failed; using a temporary file"
+                );
+            }
+        }
+    }
+    let file = tempfile::tempfile_in(directory)?;
+    let handle = create_section_handle(size, file.as_raw_handle(), PAGE_READWRITE)?;
+    tracing::info!(bytes = size, "physical pages use temporary file backing");
+    Ok(handle)
+}
+
+/// Creates a section handle whose views share physical pages. On Wine with
+/// `VICTORY_PHYSICAL_BACKING_DIR` set outside the repo, sections exceeding
+/// `VICTORY_PHYSICAL_PAGEFILE_FIRST_MB` use an anonymous temporary file so Linux
+/// can reclaim file-backed pages.
+fn physical_section(size: usize) -> std::io::Result<HANDLE> {
+    if on_wine()
+        && let Some(directory) = std::env::var_os("VICTORY_PHYSICAL_BACKING_DIR")
+    {
+        return physical_section_in(
+            size,
+            std::path::Path::new(&directory),
+            &PHYSICAL_PAGEFILE_REMAINING,
+        );
+    }
+    // Under Wine a committed section is a sparse file, free until touched, and
+    // committing a reserved one page by page costs a wineserver request each
+    // that scans every range committed so far: commit it whole there.
+    let protection = PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE };
+    create_section_handle(size, INVALID_HANDLE_VALUE, protection)
+}
+
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
 // SAFETY: as above.
@@ -746,28 +835,15 @@ fn allocate_physical_pages_with_cap(
         // A pagefile-backed section of `size` bytes, its pages committed when
         // first mapped or written (`commit`): Grand Theft Auto VI asks for 6.1
         // GiB at once, which a busy host often cannot commit (error 1450).
-        // SAFETY: plain section creation.
-        let handle = unsafe {
-            CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                std::ptr::null(),
-                // Under Wine a committed section is a sparse file, free until
-                // touched, and committing a reserved one page by page costs a
-                // wineserver request each that scans every range committed so
-                // far: commit it whole there.
-                PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
-                (size as u64 >> 32) as u32,
-                size as u32,
-                std::ptr::null(),
-            )
+        let handle = match physical_section(size) {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::warn!(n, chunk_pages, %error, "XMemAllocatePhysicalPages failed");
+                // SAFETY: checked non-null.
+                unsafe { count.write(0) };
+                return 0;
+            }
         };
-        if handle.is_null() {
-            let error = std::io::Error::last_os_error();
-            tracing::warn!(n, chunk_pages, %error, "XMemAllocatePhysicalPages failed");
-            // SAFETY: checked non-null.
-            unsafe { count.write(0) };
-            return 0;
-        }
         SECTION_BYTES.fetch_add(size, Ordering::Relaxed);
         sections.push((Arc::new(Section::new(handle, size)), chunk_pages));
         remaining -= chunk_pages;
@@ -1765,6 +1841,34 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_pagefile_sections_share_a_fixed_budget() {
+        let remaining = AtomicUsize::new(4 * PAGE);
+        assert!(!reserve_pagefile(&remaining, 5 * PAGE));
+        assert!(reserve_pagefile(&remaining, 3 * PAGE));
+        assert!(!reserve_pagefile(&remaining, 2 * PAGE));
+        assert!(reserve_pagefile(&remaining, PAGE));
+        assert!(!reserve_pagefile(&remaining, PAGE));
+    }
+
+    #[test]
+    fn physical_section_in_backing_dir_uses_temp_file_and_rejects_repo_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let handle = physical_section_in(PAGE, tmp.path(), &AtomicUsize::new(0)).unwrap();
+        assert!(!handle.is_null());
+        // SAFETY: valid section handle returned by `physical_section_in`.
+        unsafe { CloseHandle(handle) };
+
+        assert!(
+            physical_section_in(
+                PAGE,
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+                &AtomicUsize::new(0),
+            )
+            .is_err()
+        );
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
