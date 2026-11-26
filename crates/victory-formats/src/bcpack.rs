@@ -754,7 +754,12 @@ fn pbits(mode: u16) -> bool {
 /// Channel precisions: the p-bit is red's lowest bit; rotation swaps alpha
 /// with the rotated channel.
 fn bc7_precision(ctrl: u16) -> [u8; 4] {
-    let (mode, rot) = (ctrl & 7, usize::from(ctrl >> 3 & 3));
+    let mode = ctrl & 7;
+    let rot = if matches!(mode, 4 | 5) {
+        usize::from(ctrl >> 3 & 3)
+    } else {
+        0
+    };
     let mut p = BC7_BITS[usize::from(mode)];
     if rot != 0 {
         p.swap(3, rot - 1);
@@ -859,7 +864,11 @@ fn bc7_pack(ep: &Bc7Ep, ix: &Bc7Ix, prec: [u8; 4], out: &mut [u8]) {
     let mode = ctrl & 7;
     let subsets = usize::from((ctrl & 0xff) >> 6);
     let part = usize::from(ctrl >> 8 & 63);
-    let rot = usize::from(ctrl >> 3 & 3);
+    let rot = if matches!(mode, 4 | 5) {
+        usize::from(ctrl >> 3 & 3)
+    } else {
+        0
+    };
     let mut w = Bits::default();
     w.put(1 << mode, u32::from(mode) + 1);
     match mode {
@@ -1607,5 +1616,24 @@ mod tests {
             n += 1;
         }
         assert!(n > 0);
+    }
+
+    #[test]
+    fn bc7_rotation_applies_only_to_modes_4_and_5() {
+        for mode in [0u16, 1, 2, 3, 6, 7] {
+            let base = bc7_precision(mode);
+            for rot in 1..=3 {
+                assert_eq!(
+                    bc7_precision(mode | (rot << 3)),
+                    base,
+                    "mode {mode} must ignore rot={rot}"
+                );
+            }
+        }
+        // Mode 4 [5,5,5,6] and mode 5 [7,7,7,8] swap alpha (channel 3) with channel rot-1.
+        assert_eq!(bc7_precision(4), [5, 5, 5, 6]);
+        assert_eq!(bc7_precision(4 | (1 << 3)), [6, 5, 5, 5]);
+        assert_eq!(bc7_precision(5), [7, 7, 7, 8]);
+        assert_eq!(bc7_precision(5 | (2 << 3)), [7, 8, 7, 7]);
     }
 }

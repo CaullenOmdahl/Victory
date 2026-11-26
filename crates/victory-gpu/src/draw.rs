@@ -1952,6 +1952,8 @@ impl State {
                     why("not bounded (no clamp, or arguments not 4-byte aligned)");
                     return false;
                 };
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
                 (bounded, 0)
             }
         };
@@ -1971,10 +1973,6 @@ impl State {
                     return false;
                 }
             }
-        }
-        if inline {
-            self.host_pipeline = 0;
-            self.host_roots[1] = 0;
         }
         let ran = match kind {
             DRAW if rect_args.is_some() => {

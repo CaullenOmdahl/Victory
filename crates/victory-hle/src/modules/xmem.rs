@@ -1328,11 +1328,14 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         tracing::warn!(to = format_args!("{to:#x}"), len, "page mappings into a reservation shown whole");
         return false;
     }
-    unmap(&mut physical, to, len);
+    if from == 0 {
+        unmap(&mut physical, to, len);
+        return true;
+    }
+    // Resolve and retain every source slice before tearing down overlapping
+    // destination mappings or aborting on a source hole (`Marvisak #2199`).
+    let mut slices = Vec::with_capacity(len.div_ceil(PAGE));
     for k in (0..len).step_by(PAGE) {
-        if from == 0 {
-            break;
-        }
         let at = from + k;
         let Some(slice) = physical
             .views
@@ -1346,7 +1349,11 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        slices.push((to + k, slice));
+    }
+    unmap(&mut physical, to, len);
+    for (addr, slice) in slices {
+        if !map(&mut physical, addr, PAGE, slice) {
             return false;
         }
     }
@@ -2310,6 +2317,45 @@ mod tests {
         let second = allocate(4);
         assert_eq!(second.len(), 4);
         assert_eq!(XMemFreePhysicalPages(4, second.as_ptr()), 1);
+    }
+
+    #[test]
+    fn map_alias_preserves_dst_on_source_hole_and_supports_overlap() {
+        let pages = allocate(3);
+        let va = XMemVirtualAlloc(std::ptr::null_mut(), 3 * PAGE, MEM_RESERVE | PAGES_64K, 0, 0x04);
+        assert!(!va.is_null());
+        assert_eq!(XMemMapPhysicalPages(va, 2, pages.as_ptr()), va);
+        // SAFETY: pages 0 and 1 of `va` are mapped.
+        unsafe {
+            *(va as *mut u32) = 0xDEAD_BEEF;
+            *((va as *mut u8).add(PAGE) as *mut u32) = 0x1234_5678;
+        }
+        // Source [va + PAGE, va + 3 * PAGE) hits an unmapped hole at page 2: abort without
+        // unmapping existing destination page 0.
+        assert!(!map_alias(va as u64, (va as u64) + PAGE as u64, (2 * PAGE) as u64));
+        // SAFETY: destination page 0 remained intact.
+        assert_eq!(unsafe { *(va as *const u32) }, 0xDEAD_BEEF);
+
+        // Map page 2, then run overlapping alias shift by 1 page.
+        let p2 = unsafe { va.cast::<u8>().add(2 * PAGE).cast::<c_void>() };
+        assert_eq!(
+            unsafe { XMemMapPhysicalPages(p2, 1, pages.as_ptr().add(2)) },
+            p2
+        );
+        // SAFETY: page 2 is now mapped.
+        unsafe {
+            *((va as *mut u8).add(2 * PAGE) as *mut u32) = 0xCAFE_BABE;
+        }
+        assert!(map_alias(va as u64, (va as u64) + PAGE as u64, (2 * PAGE) as u64));
+        // SAFETY: aliased pages reflect original pages 1 and 2.
+        unsafe {
+            assert_eq!(*(va as *const u32), 0x1234_5678);
+            assert_eq!(*((va as *const u8).add(PAGE) as *const u32), 0xCAFE_BABE);
+        }
+
+        assert!(map_alias(va as u64, 0, (3 * PAGE) as u64));
+        assert_ne!(unsafe { VirtualFree(va, 0, MEM_RELEASE) }, 0);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 }
 

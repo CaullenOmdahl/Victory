@@ -1508,6 +1508,18 @@ impl Host {
         !self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
     }
 
+    /// Whether the most recently submitted GPU fence is still executing (`Belobug #232`).
+    fn in_flight_running(&self) -> bool {
+        let target = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .back()
+            .map(|f| f.fence)
+            .unwrap_or(0);
+        target != 0 && Self::fence_completed(&self.fence).is_some_and(|c| c < target)
+    }
+
     /// Waits until the host GPU fence reaches at least `target`.
     pub(crate) fn wait_fence(&self, target: u64) {
         if target == 0 || FINISHED_FENCE.load(Ordering::Acquire) >= target {
@@ -1727,7 +1739,7 @@ impl Host {
         // buffers in `prepare`. During the gap between submissions, the GPU
         // ran in parallel with the title's CPU command-list recording, and
         // runs on while this submission's buffer copies are refreshed.
-        let ahead = if keep.is_some() && self.has_in_flight() {
+        let ahead = if keep.is_some() && self.in_flight_running() {
             self.prewarm(runs)
         } else {
             Vec::new()

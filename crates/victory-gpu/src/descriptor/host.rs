@@ -2111,6 +2111,10 @@ impl HostHeap {
         }
         let _done = Done(&self.recording);
         let started = std::time::Instant::now();
+        // Bail out before taking placed_live() if bindless is already contended.
+        if evictions && matches!(self.bindless.try_lock(), Err(std::sync::TryLockError::WouldBlock)) {
+            return;
+        }
         // Asked before taking the heap's lock: the placed textures' lock is
         // taken first where both are held.
         let live = evictions.then(crate::resource::placed_live);
@@ -2125,12 +2129,16 @@ impl HostHeap {
             let b = &mut *b;
             if let Some(live) = &live {
                 b.uploaded.retain(|t, _| live.contains(t));
-                for (&slot, &(_, t)) in &b.recorded {
-                    if !live.contains(&t) {
-                        b.record_pending.insert(slot);
+                let mut moved = Vec::new();
+                b.recorded.retain(|&slot, &mut (_, t)| {
+                    if live.contains(&t) {
+                        true
+                    } else {
+                        moved.push(slot);
+                        false
                     }
-                }
-                b.recorded.retain(|_, (_, t)| live.contains(t));
+                });
+                b.record_pending.extend(moved);
                 self.record_looked[0].store(epoch, Ordering::Release);
                 self.record_looked[1].store(frame + 1, Ordering::Release);
             }
