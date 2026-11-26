@@ -3311,7 +3311,8 @@ fn loose_window() -> u64 {
 
 /// Copies of title memory outside buffers, by (start, length), paired with their
 /// last-access timestamp in milliseconds (`Marvisak #3078`).
-static LOOSE: Mutex<BTreeMap<(u64, u64), (Arc<Shadow>, AtomicU64)>> = Mutex::new(BTreeMap::new());
+static LOOSE: std::sync::RwLock<BTreeMap<(u64, u64), (Arc<Shadow>, AtomicU64)>> =
+    std::sync::RwLock::new(BTreeMap::new());
 
 fn loose_now_ms() -> u64 {
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -3336,7 +3337,7 @@ fn sweep_loose_with(idle_ms: u64) -> usize {
     }
     let now = loose_now_ms();
     let evicted: Vec<(u64, Arc<Shadow>)> = {
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         let stale: Vec<(u64, u64)> = map
             .iter()
             .filter_map(|(&key, (shadow, last_used))| {
@@ -3378,20 +3379,19 @@ pub(crate) static REUSES: AtomicU64 = AtomicU64::new(0);
 /// own content; the copies are never freed, so what this reaches is what
 /// the segment carries until the process ends.
 pub(crate) fn loose_stats() -> (usize, u64) {
-    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
     let bytes = map.iter().map(|((_, len), _)| *len).sum();
     (map.len(), bytes)
 }
 
-fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    if let Some(copy) = sparse(address, end) {
-        return Some(copy);
-    }
-    let window = loose_window();
-    let start = address & !(window - 1);
-    let len = end.next_multiple_of(window) - start;
-    let now = loose_now_ms();
-    let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+fn find_loose_in(
+    map: &BTreeMap<(u64, u64), (Arc<Shadow>, AtomicU64)>,
+    address: u64,
+    end: u64,
+    start: u64,
+    len: u64,
+    now: u64,
+) -> Option<Arc<Shadow>> {
     if let Some((shadow, last_used)) = map.get(&(start, len)) {
         last_used.store(now, Ordering::Relaxed);
         return Some(shadow.clone());
@@ -3416,6 +3416,49 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         );
         return Some(shadow);
     }
+    None
+}
+
+/// Removes unreferenced, idle inner loose windows strictly contained within
+/// `[start, start + len)` so inserting a wider window does not keep duplicate
+/// smaller copies alive.
+fn reclaim_superseded_loose(
+    map: &mut BTreeMap<(u64, u64), (Arc<Shadow>, AtomicU64)>,
+    start: u64,
+    len: u64,
+) -> Vec<Arc<Shadow>> {
+    let end = start.saturating_add(len);
+    let keys: Vec<(u64, u64)> = map
+        .range((start, 0)..(end, 0))
+        .filter_map(|(&(ks, kl), (shadow, _))| {
+            ((ks, kl) != (start, len)
+                && ks >= start
+                && ks.saturating_add(kl) <= end
+                && shadow.pending_len.load(Ordering::Relaxed) == 0
+                && Arc::strong_count(shadow) == 1)
+                .then_some((ks, kl))
+        })
+        .collect();
+    keys.into_iter()
+        .filter_map(|key| map.remove(&key).map(|(shadow, _)| shadow))
+        .collect()
+}
+
+fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
+    if let Some(copy) = sparse(address, end) {
+        return Some(copy);
+    }
+    let window = loose_window();
+    let start = address & !(window - 1);
+    let len = end.next_multiple_of(window) - start;
+    let now = loose_now_ms();
+    {
+        let map = LOOSE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(shadow) = find_loose_in(&map, address, end, start, len, now) {
+            return Some(shadow);
+        }
+    }
+    // Allocate outside `LOOSE` so concurrent lookups never block behind D3D12 resource creation.
     let h = host()?;
     let (staging, data) = h.shared_buffer(len)?;
     crate::host::name(&staging, || format!("title memory {start:#x}+{len:#x}"));
@@ -3434,13 +3477,25 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     };
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len, card));
+    let superseded = {
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = find_loose_in(&map, address, end, start, len, now) {
+            drop(map);
+            drop(shadow);
+            return Some(existing);
+        }
+        map.insert((start, len), (shadow.clone(), AtomicU64::new(now)));
+        reclaim_superseded_loose(&mut map, start, len)
+    };
+    for old in superseded {
+        crate::host::retire(old);
+    }
     tracing::debug!(
         start = format_args!("{start:#x}"),
         len,
         "loose memory copied to the host"
     );
-    let shadow = Arc::new(Shadow::new(buffer, data, gpu, start, len, card));
-    map.insert((start, len), (shadow.clone(), AtomicU64::new(now)));
     Some(shadow)
 }
 
@@ -3454,7 +3509,7 @@ pub(crate) fn near(va: u64) -> String {
         .collect();
     all.extend(
         LOOSE
-            .lock()
+            .read()
             .unwrap_or_else(|e| e.into_inner())
             .values()
             .map(|(s, _)| (s.gpu, s.start, s.len)),
@@ -4134,7 +4189,7 @@ mod find_cache_tests {
         let fresh_key = (0x7FFE_0020_0000u64, PAGE as u64);
         let held = make(pinned_key.0);
         {
-            let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
             map.insert(idle_key, (make(idle_key.0), AtomicU64::new(0)));
             map.insert(pinned_key, (held.clone(), AtomicU64::new(0)));
             map.insert(
@@ -4147,12 +4202,46 @@ mod find_cache_tests {
         let freed = sweep_loose_with(5);
         assert!(freed >= 1);
         assert_ne!(buffer_generation(), gen_before);
-        let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut map = LOOSE.write().unwrap_or_else(|e| e.into_inner());
         assert!(!map.contains_key(&idle_key));
         assert!(map.contains_key(&pinned_key));
         assert!(map.contains_key(&fresh_key));
         map.remove(&pinned_key);
         map.remove(&fresh_key);
+    }
+
+    #[test]
+    fn wider_loose_window_reclaims_superseded_unused_inner_window() {
+        let Some(h) = host() else {
+            return;
+        };
+        let make = |start: u64, len: u64| -> Arc<Shadow> {
+            let (buf, data) = h.shared_buffer(len).unwrap();
+            // SAFETY: live D3D12 resource.
+            let gpu = unsafe { buf.GetGPUVirtualAddress() };
+            Arc::new(Shadow::new(buf, data, gpu, start, len, None))
+        };
+        let base = 0x7FFD_0000_0000u64;
+        let inner_unused = (base + PAGE as u64, PAGE as u64);
+        let inner_held = (base + 2 * PAGE as u64, PAGE as u64);
+        let outer = (base, 8 * PAGE as u64);
+        let outside = (base + 8 * PAGE as u64, PAGE as u64);
+        let held = make(inner_held.0, inner_held.1);
+        let wide = make(outer.0, outer.1);
+
+        let mut map = BTreeMap::new();
+        map.insert(inner_unused, (make(inner_unused.0, inner_unused.1), AtomicU64::new(0)));
+        map.insert(inner_held, (held.clone(), AtomicU64::new(0)));
+        map.insert(outer, (wide.clone(), AtomicU64::new(0)));
+        map.insert(outside, (make(outside.0, outside.1), AtomicU64::new(0)));
+
+        let reclaimed = reclaim_superseded_loose(&mut map, outer.0, outer.1);
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].start, inner_unused.0);
+        assert!(!map.contains_key(&inner_unused));
+        assert!(map.contains_key(&inner_held));
+        assert!(map.contains_key(&outer));
+        assert!(map.contains_key(&outside));
     }
 
     #[test]
