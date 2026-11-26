@@ -9,6 +9,7 @@ use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
 use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
+use victory_shader::{RootType, UsedResource};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -343,9 +344,49 @@ pub(crate) struct Input {
 const RECTANGLES: i32 = 19;
 const QUADS: i32 = 32;
 
+/// Immutable descriptor-table layout of a translated stage: entries
+/// grouped by title root slot once at pipeline creation.
+pub(crate) struct TableLayout {
+    pub(crate) slot: u8,
+    /// Shader order matters when preparing reads on a cache hit.
+    pub(crate) entries: Vec<UsedResource>,
+    /// `(record, index in entries)` of the first declared resource for each
+    /// 32-byte record, sorted by record.
+    pub(crate) records: Vec<(u32, usize)>,
+}
+
+impl TableLayout {
+    fn build(used: &[UsedResource]) -> Vec<Self> {
+        let mut by_slot = std::collections::BTreeMap::<u8, Vec<UsedResource>>::new();
+        for &entry in used.iter().filter(|u| u.root == RootType::Table) {
+            by_slot.entry(entry.slot).or_default().push(entry);
+        }
+        by_slot
+            .into_iter()
+            .map(|(slot, entries)| {
+                let mut records: Vec<(u32, usize)> = entries
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, u)| (u.table_offset_dwords / 8, idx))
+                    .collect();
+                // Stable sort and keep the first match, just as the draw's
+                // linear search did for aliases within a record.
+                records.sort_by_key(|&(record, _)| record);
+                records.dedup_by_key(|entry| entry.0);
+                Self {
+                    slot,
+                    entries,
+                    records,
+                }
+            })
+            .collect()
+    }
+}
+
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
+    pub(crate) tables: Vec<TableLayout>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
     /// Root parameters of its root views: (title root parameter, ours).
@@ -465,9 +506,11 @@ impl HostPipeline {
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+            let translated = shader.translated()?;
+            let t = &translated.host;
             let mut stage = Stage {
                 shader: shader.clone(),
+                tables: TableLayout::build(&translated.used),
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
@@ -943,5 +986,35 @@ mod tests {
         let mut t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&blending(false), &t), blending(false));
+    }
+
+    #[test]
+    fn table_layout_preserves_shader_order_and_first_record_alias() {
+        use victory_shader::ResourceType;
+        let entry = |slot, table_offset_dwords, kind, root| UsedResource {
+            kind,
+            root,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot,
+        };
+        let used = [
+            entry(9, 35, ResourceType::Srv, RootType::Table),
+            entry(2, 8, ResourceType::Sampler, RootType::Table),
+            entry(9, 0, ResourceType::Cbv, RootType::Table),
+            entry(9, 32, ResourceType::Uav, RootType::Table),
+            entry(9, 160, ResourceType::Srv, RootType::Constants),
+        ];
+        let layouts = TableLayout::build(&used);
+        assert_eq!(layouts.len(), 2);
+        assert_eq!(layouts[0].slot, 2);
+        assert_eq!(layouts[1].slot, 9);
+        assert_eq!(layouts[1].entries, [used[0], used[2], used[3]]);
+        // First match in entries order for record 4 (dwords 35 and 32) is index 0 (Srv).
+        assert_eq!(layouts[1].records, [(0, 1), (4, 0)]);
+        assert!(TableLayout::build(&used[4..]).is_empty());
     }
 }

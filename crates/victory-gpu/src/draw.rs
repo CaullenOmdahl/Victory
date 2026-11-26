@@ -21,7 +21,7 @@ use windows::core::Interface;
 
 use crate::host::HostList;
 use crate::object::This;
-use crate::pipeline::host::HostPipeline;
+use crate::pipeline::host::{HostPipeline, TableLayout};
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -920,7 +920,7 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
-            if !self.tables(list, &t.used, compute) {
+            if !self.tables(list, &t.used, &stage.tables, compute) {
                 return no("a table not made");
             }
             if let Some((param, dwords)) = stage.user_data {
@@ -1295,7 +1295,13 @@ impl State {
     /// within a list. Returns the fresh tables' new byte offsets by root
     /// parameter in `self.made`, or `false` when the draw must be dropped (a
     /// constant table found no dynamic slots).
-    fn tables(&mut self, list: &HostList, used: &[UsedResource], compute: bool) -> bool {
+    fn tables(
+        &mut self,
+        list: &HostList,
+        used: &[UsedResource],
+        layouts: &[TableLayout],
+        compute: bool,
+    ) -> bool {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         // Taken out so `self` stays free to borrow; a draw dropped below
         // leaves it empty, and it grows again.
@@ -1340,22 +1346,18 @@ impl State {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
             };
-            let entries: Vec<&UsedResource> = used
-                .iter()
-                .filter(tables)
-                .filter(|u| u.slot == slot)
-                .collect();
+            let Ok(layout_idx) = layouts.binary_search_by_key(&slot, |l| l.slot) else {
+                continue;
+            };
+            let layout = &layouts[layout_idx];
+            let entries = &layout.entries;
             let Some(heap) = self.heap_of(table) else {
                 continue;
             };
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8 + 1)
-                .max()
-                .unwrap_or(1);
+            let n = layout.records.last().map_or(0, |&(r, _)| r) + 1;
             let last = table + u64::from(n - 1) * 32;
             // Shaders read such a table to many lengths, and a copy for each
             // ran out of slots: the longest seen serves all.
@@ -1376,11 +1378,7 @@ impl State {
             } else {
                 Vec::new()
             };
-            let needed = entries
-                .iter()
-                .map(|u| u.table_offset_dwords as usize / 8 + 1)
-                .max()
-                .unwrap_or(1);
+            let needed = layout.records.last().map_or(0, |&(r, _)| r as usize) + 1;
             let same = self.large_tables.get(&table).and_then(|made| {
                 made.iter()
                     .find(|(r, _)| r.len() >= needed && r[..needed] == records[..needed.min(records.len())])
@@ -1444,9 +1442,16 @@ impl State {
                 .push((std::ptr::from_ref(heap) as usize, first, n));
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
+            let mut layout_records = layout.records.as_slice();
             for k in 0..n {
                 let index = first + k;
-                let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                let used = match layout_records.split_first() {
+                    Some((&(record, idx), rest)) if record == k => {
+                        layout_records = rest;
+                        Some(&entries[idx])
+                    }
+                    _ => None,
+                };
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {

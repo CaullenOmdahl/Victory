@@ -2390,46 +2390,11 @@ impl Shadow {
     }
 }
 
-/// Merges bytes the GPU changed (`host != old`) into `title`, syncs `host` to
-/// `title`, and returns the tight `[first, last)` byte span where `title` was
-/// modified (or `None` if nothing changed). Scans 8 bytes at a time so
-/// unchanged 64-bit words skip per-byte branching.
-fn merge_gpu_writes(title: &mut [u8], host: &mut [u8], old: &[u8]) -> Option<(usize, usize)> {
-    let n = title.len().min(host.len()).min(old.len());
-    let mut first = usize::MAX;
-    let mut last = 0usize;
-    let mut i = 0;
-    while i + 8 <= n {
-        let hw = u64::from_ne_bytes(host[i..i + 8].try_into().unwrap());
-        let ow = u64::from_ne_bytes(old[i..i + 8].try_into().unwrap());
-        if hw == ow {
-            host[i..i + 8].copy_from_slice(&title[i..i + 8]);
-        } else {
-            for k in i..i + 8 {
-                let h = host[k];
-                if h != old[k] && title[k] != h {
-                    title[k] = h;
-                    first = first.min(k);
-                    last = k + 1;
-                }
-                host[k] = title[k];
-            }
-        }
-        i += 8;
-    }
-    for k in i..n {
-        let h = host[k];
-        if h != old[k] && title[k] != h {
-            title[k] = h;
-            first = first.min(k);
-            last = k + 1;
-        }
-        host[k] = title[k];
-    }
-    (first < last).then_some((first, last))
-}
-
-/// Same as [`merge_gpu_writes`], also updating `old` to match `title`.
+/// Merges bytes the GPU changed (`host != staging_old` / `old`) into `title`
+/// and updates both `host` and `old` to match `title`, returning the tight
+/// `[first, last)` byte span where `title` was modified (or `None` if nothing
+/// changed). Scans 8 bytes at a time so unchanged 64-bit words skip per-byte
+/// branching.
 fn merge_gpu_writes_mut(
     title: &mut [u8],
     host: &mut [u8],
