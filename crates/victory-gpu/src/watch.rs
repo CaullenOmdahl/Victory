@@ -1004,7 +1004,20 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
     if start >= end || g.aliased.is_empty() {
         return any;
     }
-    let aliased: Vec<usize> = g.aliased.range(start / BLOCK..end.div_ceil(BLOCK)).copied().collect();
+    let first = start / BLOCK;
+    let last = end.div_ceil(BLOCK);
+    if first + 1 == last {
+        if g.aliased.remove(&first) {
+            for at in aliases(first * BLOCK) {
+                if at / BLOCK != first {
+                    open_here(g, at, at + BLOCK);
+                }
+                g.aliased.remove(&(at / BLOCK));
+            }
+        }
+        return any;
+    }
+    let aliased: Vec<usize> = g.aliased.range(first..last).copied().collect();
     for block in aliased {
         g.aliased.remove(&block);
         for at in aliases(block * BLOCK) {
@@ -1020,11 +1033,26 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 /// [`open`] for one range, without the other views of its pages.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
-    let blocks: Vec<usize> = g
-        .protected
-        .range(start / BLOCK..end.div_ceil(BLOCK))
-        .copied()
-        .collect();
+    let first = start / BLOCK;
+    let last = end.div_ceil(BLOCK);
+    if first >= last {
+        return false;
+    }
+    if first + 1 == last {
+        if !g.protected.remove(&first) {
+            return false;
+        }
+        g.clean.remove(&first);
+        g.dirty.insert(first);
+        let mut old = 0;
+        // SAFETY: block we made read-only; only its protection changes.
+        unsafe {
+            VirtualProtect((first * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old);
+        }
+        bump_region_epochs(start, end);
+        return true;
+    }
+    let blocks: Vec<usize> = g.protected.range(first..last).copied().collect();
     if blocks.is_empty() {
         return false;
     }
@@ -2164,5 +2192,36 @@ mod tests {
             .write()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&boundary_lo);
+    }
+
+    #[test]
+    fn single_block_open_unprotects_and_marks_dirty_without_range_scan() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        // SAFETY: a private read-write block dedicated to this test.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as usize;
+        assert_ne!(base, 0);
+        let block = base / BLOCK;
+        {
+            let mut g = guards_mut();
+            g.protected.insert(block);
+            g.clean.insert(block);
+            g.dirty.remove(&block);
+        }
+        let mut old = 0;
+        // SAFETY: `base` spans one committed block.
+        assert_ne!(
+            unsafe { VirtualProtect(base as *const _, BLOCK, PAGE_READONLY, &mut old) },
+            0
+        );
+        assert!(try_open_guarded(base + 128));
+        assert!(writable(base));
+        {
+            let mut g = guards_mut();
+            assert!(!g.protected.contains(&block));
+            assert!(!g.clean.contains(&block));
+            assert!(g.dirty.remove(&block));
+        }
+        // SAFETY: freeing our private allocation after unprotecting it.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 }

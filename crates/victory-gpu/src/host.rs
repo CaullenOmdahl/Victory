@@ -733,7 +733,7 @@ mod tests {
         use windows::Win32::Graphics::Dxgi::Common::{
             DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC,
         };
-        let Some(host) = host() else {
+        let Some(host) = super::host() else {
             return;
         };
         let desc = D3D12_RESOURCE_DESC {
@@ -3498,6 +3498,21 @@ impl HostList {
         self.scratch_in(len, 256, |_, _, gpu, data| (gpu, data))
     }
 
+    fn scratch_one_off<R>(
+        &self,
+        host: &Host,
+        len: u64,
+        f: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> R,
+    ) -> Option<R> {
+        let (buffer, data) = host.upload_buffer(len)?;
+        name(&buffer, || format!("list scratch {len:#x}"));
+        // SAFETY: a live buffer.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let made = f(&buffer, 0, gpu, data);
+        self.deferred().uploads.push(buffer);
+        Some(made)
+    }
+
     /// `len` bytes of upload memory at a multiple of `align` until the list
     /// is reset, handed to `f` with the buffer, the offset in it, the host GPU
     /// address and the CPU pointer.
@@ -3508,17 +3523,11 @@ impl HostList {
         f: impl FnOnce(&ID3D12Resource, u64, u64, *mut u8) -> R,
     ) -> Option<R> {
         let host = host()?;
-        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         let len = len.max(1).next_multiple_of(256);
         if len > SCRATCH_CHUNK {
-            let (buffer, data) = host.upload_buffer(len)?;
-            name(&buffer, || format!("list scratch {len:#x}"));
-            // SAFETY: a live buffer.
-            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-            let made = f(&buffer, 0, gpu, data);
-            self.deferred().uploads.push(buffer);
-            return Some(made);
+            return self.scratch_one_off(host, len, f);
         }
+        let mut s = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         if s.used.next_multiple_of(align) + len > SCRATCH_CHUNK && s.current < s.chunks.len() {
             (s.current, s.used) = (s.current + 1, 0);
         }
@@ -3526,13 +3535,25 @@ impl HostList {
             let free = SCRATCH_FREE.lock().unwrap_or_else(|e| e.into_inner()).pop();
             let chunk = match free {
                 Some(chunk) => chunk,
-                None => {
-                    let (buffer, data) = host.upload_buffer(SCRATCH_CHUNK)?;
-                    name(&buffer, || "list scratch".into());
-                    // SAFETY: a live buffer.
-                    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
-                    (buffer, data as usize, gpu)
-                }
+                None => match host.upload_buffer(SCRATCH_CHUNK) {
+                    Some((buffer, data)) => {
+                        name(&buffer, || "list scratch".into());
+                        // SAFETY: a live buffer.
+                        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+                        (buffer, data as usize, gpu)
+                    }
+                    None => {
+                        drop(s);
+                        static WARNED: std::sync::Once = std::sync::Once::new();
+                        WARNED.call_once(|| {
+                            tracing::warn!(
+                                len,
+                                "list scratch chunk OOM; falling back to exact-size upload buffer"
+                            );
+                        });
+                        return self.scratch_one_off(host, len, f);
+                    }
+                },
             };
             s.chunks.push(chunk);
             s.used = 0;
@@ -6462,6 +6483,26 @@ mod copy_order {
         assert!(d.filled.capacity() <= 2048);
         assert!(d.textures.capacity() <= 2048);
         assert!(d.bound.capacity() <= 2048);
+    }
+
+    #[test]
+    fn scratch_one_off_fallback_allocates_exact_aligned_buffer() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let list = host.new_list().expect("a host list");
+        let (off, gpu, data_non_null) = list
+            .scratch_one_off(host, 512, |buf, off, gpu, data| {
+                // SAFETY: live upload buffer of 512 bytes.
+                assert_eq!(unsafe { buf.GetDesc() }.Width, 512);
+                (off, gpu, !data.is_null())
+            })
+            .expect("exact-size scratch buffer");
+        assert_eq!(off, 0);
+        assert_ne!(gpu, 0);
+        assert!(data_non_null);
+        assert_eq!(list.deferred().uploads.len(), 1);
+        list.close();
     }
 }
 
