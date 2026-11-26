@@ -968,9 +968,36 @@ impl Shadow {
         let mut copied = 0usize;
         #[cfg(feature = "diagnostics")]
         let mut checked_bytes = 0usize;
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         for (rp0, rp1) in dirty_runs {
             let rs = (rp0 * PAGE).max(from);
             let re = ((rp1 + 1) * PAGE).min(to);
+            let partial = rs > (rp0 * PAGE).max(start) || re < ((rp1 + 1) * PAGE).min(end);
+            let partial_ge = if partial && self.sparse.is_none() {
+                let ge = crate::watch::region_epoch(rs, re);
+                let hit = self
+                    .clean_spans
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&(rs, re))
+                    == Some(&ge);
+                if hit {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use crate::copystat::{C, add};
+                        let n = (re - rs) as u64;
+                        add(C::Checked, n);
+                        add(C::Unchanged, n);
+                        add(C::Skipped, 1);
+                        add(C::SkippedBytes, n);
+                        checked_bytes += re - rs;
+                    }
+                    continue;
+                }
+                Some(ge)
+            } else {
+                None
+            };
             #[cfg(feature = "diagnostics")]
             {
                 checked_bytes += re - rs;
@@ -980,6 +1007,15 @@ impl Shadow {
                 let n = self.copy_stale(rs, re, now, &written);
                 copied += n;
                 self.stamp_page_epochs(rs, re, rp0, rp1, &pre);
+                if let Some(ge) = partial_ge
+                    && crate::watch::region_epoch(rs, re) == ge
+                {
+                    let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
+                    if spans.len() >= 8192 {
+                        spans.clear();
+                    }
+                    spans.insert((rs, re), ge);
+                }
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -2996,7 +3032,19 @@ pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
 /// gets copies of the aligned windows it touches.
 /// shortcut: copies of windows are never freed; key them to the title's
 /// allocations if memory use grows.
-const WINDOW: u64 = 4 << 20;
+/// Copies of title memory outside buffers align to this window size
+/// (`VICTORY_LOOSE_WINDOW_KIB`, default 256 KiB, clamped power of two `[64, 4096]`).
+fn loose_window() -> u64 {
+    static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let kib = std::env::var("VICTORY_LOOSE_WINDOW_KIB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(256)
+            .clamp(64, 4096);
+        kib.next_power_of_two() << 10
+    })
+}
 
 /// Copies of title memory outside buffers, by (start, length), paired with their
 /// last-access timestamp in milliseconds (`Marvisak #3078`).
@@ -3076,8 +3124,9 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(copy) = sparse(address, end) {
         return Some(copy);
     }
-    let start = address & !(WINDOW - 1);
-    let len = end.next_multiple_of(WINDOW) - start;
+    let window = loose_window();
+    let start = address & !(window - 1);
+    let len = end.next_multiple_of(window) - start;
     let now = loose_now_ms();
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((shadow, last_used)) = map.get(&(start, len)) {
@@ -3227,6 +3276,7 @@ mod tests {
         // One window-aligned pair of pages inside a reservation that
         // guarantees the addresses, found free again (other tests allocate
         // meanwhile: tried again if taken).
+        let window = loose_window();
         let pair = (0..8)
             .find_map(|_| {
                 // SAFETY: a fresh reservation, released at once; then the
@@ -3236,7 +3286,7 @@ mod tests {
                 unsafe {
                     let p = VirtualAlloc(
                         std::ptr::null(),
-                        3 * WINDOW as usize,
+                        3 * window as usize,
                         MEM_RESERVE,
                         PAGE_READWRITE,
                     ) as usize;
@@ -3244,17 +3294,17 @@ mod tests {
                         return None;
                     }
                     VirtualFree(p as *mut _, 0, MEM_RELEASE);
-                    let aligned = p.next_multiple_of(WINDOW as usize);
+                    let aligned = p.next_multiple_of(window as usize);
                     let at = |q: usize| {
                         VirtualAlloc(
                             q as *const _,
-                            WINDOW as usize,
+                            window as usize,
                             MEM_RESERVE | MEM_COMMIT,
                             PAGE_READWRITE,
                         ) as usize
                     };
-                    let (one, two) = (at(aligned), at(aligned + WINDOW as usize));
-                    if one == aligned && two == aligned + WINDOW as usize {
+                    let (one, two) = (at(aligned), at(aligned + window as usize));
+                    if one == aligned && two == aligned + window as usize {
                         return Some((one, two));
                     }
                     [one, two].into_iter().filter(|&q| q != 0).for_each(|q| {
@@ -3265,11 +3315,11 @@ mod tests {
             })
             .expect("a window-aligned pair of pages");
         let (one, two) = (pair.0 as u64, pair.1 as u64);
-        let Some(wide) = find(one, 2 * WINDOW) else {
+        let Some(wide) = find(one, 2 * window) else {
             return; // no host GPU here
         };
         let before = REUSES.load(Ordering::Relaxed);
-        let narrow = find(two, WINDOW);
+        let narrow = find(two, window);
         let Some(narrow) = narrow else {
             return; // no host GPU here (the wide one already was)
         };
@@ -3283,7 +3333,7 @@ mod tests {
             "the reuse is counted"
         );
         // An ask the wide window does not reach still gets its own copy.
-        let beyond = find(two, 2 * WINDOW);
+        let beyond = find(two, 2 * window);
         if let Some(beyond) = beyond {
             assert!(
                 !Arc::ptr_eq(&wide, &beyond),
@@ -3839,5 +3889,69 @@ mod find_cache_tests {
         assert!(map.contains_key(&fresh_key));
         map.remove(&pinned_key);
         map.remove(&fresh_key);
+    }
+
+    #[test]
+    fn loose_window_defaults_to_256k_and_partial_page_caches_clean_spans() {
+        let win = loose_window();
+        assert!(win.is_power_of_two() && win >= (64 << 10));
+        assert_eq!(win, 256 << 10);
+
+        let Some(h) = host() else {
+            return;
+        };
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+            PAGE_READWRITE, UnmapViewOfFile,
+        };
+        // SAFETY: isolated pagefile-backed MEM_MAPPED view owned by this test.
+        let (section, p) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                PAGE as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let p = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE).Value as usize;
+            assert_ne!(p, 0);
+            (section, p)
+        };
+        // SAFETY: writable view just mapped.
+        unsafe { (p as *mut u32).write(0x1122_3344) };
+        let (buf, data) = h.shared_buffer(PAGE as u64).unwrap();
+        // SAFETY: live D3D12 resource.
+        let gpu = unsafe { buf.GetGPUVirtualAddress() };
+        let shadow = Shadow::new(buf, data, gpu, p as u64, PAGE as u64, None);
+        // Force WATCHED_GUARDED + partial-page run (first 256 bytes of PAGE).
+        shadow.watched.store(WATCHED_GUARDED, Ordering::Relaxed);
+        let first = shadow.update_guarded_pages(p, p + 256, false);
+        assert_eq!(first, 256);
+        assert!(
+            shadow
+                .clean_spans
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&(p, p + 256))
+        );
+        // Repeat partial refresh at the same epoch skips copy work cleanly.
+        assert_eq!(shadow.update_guarded_pages(p, p + 256, false), 0);
+        // Simulating a title write bumps region_epoch so the partial span re-copies.
+        crate::watch::open_for_sync_write(p, 4);
+        // SAFETY: writable allocation.
+        unsafe { (p as *mut u32).write(0x5566_7788) };
+        let after_write = shadow.update_guarded_pages(p, p + 256, false);
+        assert_eq!(after_write, 256);
+        // SAFETY: read host copy bytes written by update_guarded_pages.
+        assert_eq!(unsafe { (data as *const u32).read() }, 0x5566_7788);
+        crate::watch::title_memory_remapped(p, PAGE);
+        // SAFETY: release isolated test mapping and section.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: p as *mut _ });
+            CloseHandle(section);
+        }
     }
 }
