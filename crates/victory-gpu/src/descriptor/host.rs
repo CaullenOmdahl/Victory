@@ -3146,6 +3146,16 @@ fn raw_stride(stride: u32) -> bool {
     stride >= 16 && stride.is_multiple_of(16)
 }
 
+/// A raw buffer view has 4-byte elements, but its host offset must be 16-byte
+/// aligned (`D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT`), matching [`raw_start_fits`].
+fn buffer_raw_alignment(raw: bool, element: u64) -> u64 {
+    if raw {
+        u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)
+    } else {
+        element
+    }
+}
+
 fn buffer_srv(
     address: u64,
     len: u64,
@@ -3156,9 +3166,11 @@ fn buffer_srv(
         return None;
     }
     // SAFETY: a buffer view's union member.
-    let structured = raw_stride(unsafe { desc.Anonymous.Buffer }.StructureByteStride);
+    let buf = unsafe { desc.Anonymous.Buffer };
+    let structured = raw_stride(buf.StructureByteStride);
     let element = if structured { 0 } else { element_size(&desc) };
-    let shadow = crate::shadow::for_view(address, len, element)?;
+    let raw = buf.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+    let shadow = crate::shadow::for_view(address, len, buffer_raw_alignment(raw, element))?;
     // SAFETY: a buffer view's union member.
     let buffer = unsafe { &mut desc.Anonymous.Buffer };
     let offset = shadow.offset(address);
@@ -3268,9 +3280,11 @@ fn buffer_uav(
         return None;
     }
     // SAFETY: a buffer view's union member.
-    let structured = raw_stride(unsafe { desc.Anonymous.Buffer }.StructureByteStride);
+    let buf = unsafe { desc.Anonymous.Buffer };
+    let structured = raw_stride(buf.StructureByteStride);
     let whole = if structured { 0 } else { uav_element_size(&desc).unwrap_or(0) };
-    let shadow = crate::shadow::for_view(address, len, whole)?;
+    let raw = buf.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+    let shadow = crate::shadow::for_view(address, len, buffer_raw_alignment(raw, whole))?;
     // SAFETY: a live buffer.
     let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
     if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
@@ -4797,5 +4811,12 @@ void main(uint3 id : SV_DispatchThreadID) {
         ] {
             assert_eq!(bit_exact_format(kept), kept);
         }
+    }
+
+    #[test]
+    fn raw_buffer_alignment_requires_16_bytes() {
+        assert_eq!(buffer_raw_alignment(true, 4), 16);
+        assert_eq!(buffer_raw_alignment(false, 4), 4);
+        assert_eq!(buffer_raw_alignment(false, 32), 32);
     }
 }
