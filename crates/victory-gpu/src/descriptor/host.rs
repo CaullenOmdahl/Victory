@@ -96,6 +96,10 @@ pub(crate) struct HostHeap {
 
 /// The dword of the stride table the element counts start at.
 const COUNTS_AT: u32 = victory_shader::emit::OWN_SLOTS;
+/// The dword of the stride table the low 32 bits of each view's title address start at.
+const ADDR_LO_AT: u32 = 2 * victory_shader::emit::OWN_SLOTS;
+/// The dword of the stride table the high 32 bits of each view's title address start at.
+const ADDR_HI_AT: u32 = 3 * victory_shader::emit::OWN_SLOTS;
 
 struct StrideTable {
     resource: ID3D12Resource,
@@ -105,13 +109,14 @@ struct StrideTable {
 }
 
 impl StrideTable {
-    /// The element counts follow the strides, from [`COUNTS_AT`] dwords on
-    /// (where shaders, which know no heap's size, look for them). Always
-    /// covers at least `COUNTS_AT` slots on both halves so clamped out-of-
-    /// bounds indices at `COUNTS_AT - 1` stay in bounds and read zero.
+    /// The element counts follow the strides from [`COUNTS_AT`] dwords on, then
+    /// the low/high 32-bit halves of each buffer view's 64-bit title base address
+    /// from [`ADDR_LO_AT`] and [`ADDR_HI_AT`] on (so shaders can mark 64 KiB pages
+    /// they write through heap views). Always covers at least `COUNTS_AT` slots
+    /// per section so clamped out-of-bounds indices at `COUNTS_AT - 1` stay in bounds.
     fn new(device: &ID3D12Device, len: u32) -> Option<Self> {
         let cap = len.max(COUNTS_AT);
-        let bytes = ((u64::from(COUNTS_AT) + u64::from(cap)) * 4).max(4);
+        let bytes = ((u64::from(ADDR_HI_AT) + u64::from(cap)) * 4).max(4);
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
             Width: bytes,
@@ -1448,7 +1453,12 @@ impl HostHeap {
         }
         self.keep_with_view(index, kept.flatten(), view);
         if ok {
-            self.set_stride_count(index, view_stride(view), view_count(view));
+            self.set_slot_meta(
+                index,
+                view_stride(view),
+                view_count(view),
+                buffer_range(view).map_or(0, |(a, _)| a),
+            );
         } else {
             self.set_stride(index, 0);
         }
@@ -1566,21 +1576,24 @@ impl HostHeap {
     }
 
     fn set_stride(&self, index: u32, stride: u32) {
-        self.set_stride_count(index, stride, 0);
+        self.set_slot_meta(index, stride, 0, 0);
     }
 
-    /// The stride and the element count of the buffer view in slot `index`
-    /// (zeros for anything else), for shaders: a size query of a structured
-    /// buffer of some strides crashes the AMD driver's compiler.
-    fn set_stride_count(&self, index: u32, stride: u32, count: u32) {
+    /// The stride, element count, and 64-bit title base address of the buffer
+    /// view in slot `index` (zeros for non-buffer/null slots).
+    fn set_slot_meta(&self, index: u32, stride: u32, count: u32, address: u64) {
         if let Some(t) = &self.strides
             && index < t.len
         {
-            // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer of
-            // `COUNTS_AT + t.len` dwords.
+            // SAFETY: `t.ptr` points to a live mapped UPLOAD buffer covering
+            // `ADDR_HI_AT + max(t.len, COUNTS_AT)` dwords.
             unsafe {
                 *(t.ptr as *mut u32).add(index as usize) = stride;
-                *(t.ptr as *mut u32).add((COUNTS_AT + index) as usize) = count;
+                if index < COUNTS_AT {
+                    *(t.ptr as *mut u32).add((COUNTS_AT + index) as usize) = count;
+                    *(t.ptr as *mut u32).add((ADDR_LO_AT + index) as usize) = address as u32;
+                    *(t.ptr as *mut u32).add((ADDR_HI_AT + index) as usize) = (address >> 32) as u32;
+                }
             }
         }
     }
@@ -1796,9 +1809,14 @@ impl HostHeap {
                     null_for(&view, self.cpu(index));
                 }
                 self.keep_with_view(index, kept.flatten(), &view);
-                // The stride is the title view's, however and whenever the
-                // host view is made.
-                self.set_stride_count(index, view_stride(&view), view_count(&view));
+                // The stride, count, and title base address are the title view's,
+                // however and whenever the host view is made.
+                self.set_slot_meta(
+                    index,
+                    view_stride(&view),
+                    view_count(&view),
+                    buffer_range(&view).map_or(0, |(a, _)| a),
+                );
                 if !later {
                     self.made_now[index as usize].store(key, Ordering::Release);
                 }
@@ -4105,8 +4123,8 @@ void main() {
         // SAFETY: plain query on a live upload buffer.
         let stride_bytes = unsafe { strides.resource.GetDesc() }.Width;
         assert!(
-            stride_bytes >= u64::from(COUNTS_AT) * 2 * 4,
-            "stride table must cover both stride and count halves up to COUNTS_AT"
+            stride_bytes >= u64::from(ADDR_HI_AT + COUNTS_AT) * 4,
+            "stride table must cover stride, count, and address halves up to COUNTS_AT"
         );
     }
 

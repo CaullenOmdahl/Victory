@@ -397,6 +397,12 @@ impl RootType {
     /// user data (root views have no bounds); its `dword` is the view's root
     /// parameter.
     pub const LIMIT: RootType = RootType::Other(0x4C49_4D54);
+    /// Not the title's: the low 32 bits of a root UAV's 64-bit title address,
+    /// as user data; its `dword` is the view's root parameter slot.
+    pub const ROOT_ADDR_LO: RootType = RootType::Other(0x5241_4C4F);
+    /// Not the title's: the high 32 bits of a root UAV's 64-bit title address,
+    /// as user data; its `dword` is the view's root parameter slot.
+    pub const ROOT_ADDR_HI: RootType = RootType::Other(0x5241_4849);
 
     fn from_raw(raw: u32) -> Self {
         match raw {

@@ -23,6 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod f64;
 mod half;
+mod marks;
 mod reciprocal;
 mod rsqrt;
 mod scalar_vcc;
@@ -118,6 +119,7 @@ pub(crate) struct Lowered {
     /// Root UAVs among `root_uavs` an operation may write.
     pub written_root_uavs: Vec<u8>,
     pub stride_table: bool,
+    pub write_marks: bool,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// Heap handles made with a non-uniform index.
@@ -575,6 +577,7 @@ struct Lower<'a> {
     params: FxMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    root_addrs: Vec<(u8, V, V)>,
     samplers: Vec<[u32; 4]>,
     descriptors: FxMap<(Site, bool), &'a Source>,
     scalar: FxMap<Site, Address>,
@@ -1602,6 +1605,7 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            root_addrs: Vec::new(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -2251,6 +2255,7 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let written_root_uavs = std::mem::take(&mut self.s.written_root_uavs);
         let stride_table = self.s.stride_table.is_some();
+        let write_marks = self.s.write_marks.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
             cmp_samplers,
@@ -2283,6 +2288,7 @@ impl<'a> Lower<'a> {
             #[cfg(test)]
             unary_f32_opcodes: self.s.m.written_call_opcodes("dx.op.unary.f32"),
             stride_table,
+            write_marks,
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
@@ -3112,6 +3118,7 @@ impl<'a> Lower<'a> {
             args.push(self.s.m.i32(4));
             let void = self.s.t.void;
             self.s.op(self.cur, "rawBufferStore.i32", Attr::NoUnwind, void, 140, &args);
+            self.mark_address_write(at.0, at.1, n * 4);
             self.end_guarded(place, &[]);
             return Ok(());
         }
@@ -3193,6 +3200,7 @@ impl<'a> Lower<'a> {
             }
             _ => return Err(name),
         };
+        self.mark_address_write(at.0, at.1, 4);
         let r = self.end_guarded(place, &[(r, zero)])[0];
         if let Some(Operand::Vector { reg, .. }) = *dst {
             self.write(inst, Reg::V(reg), r, guard);
@@ -12732,18 +12740,34 @@ impl<'a> Lower<'a> {
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
         let stride = used.map_or(0, |u| u.stride);
+        let mut by_addr = None;
         if self.by_address(src)
             && let Fields::Buffer { rsrc, .. } = &inst.fields
         {
             if typed && format.is_none() {
                 return Err("a typed buffer access by address");
             }
+            let mut raw_off = off;
             let (h, start, stride) = self.made_buffer(inst, rsrc)?;
             self.made.insert(site, h);
             off = self.s.m.bin(c, Bin::Add, off, start);
             if let Some(i) = index {
                 let rows = self.s.m.bin(c, Bin::Mul, i, stride);
                 off = self.s.m.bin(c, Bin::Add, off, rows);
+                raw_off = self.s.m.bin(c, Bin::Add, raw_off, rows);
+            }
+            if (store || atomic.is_some() || sub_store.is_some())
+                && let Operand::Scalar { code, .. } = *rsrc
+            {
+                let w0 = inst
+                    .read(Reg::S(code))
+                    .ok_or("a buffer descriptor")
+                    .and_then(|v| self.i32_of(v))?;
+                let w1 = inst
+                    .read(Reg::S(code + 1))
+                    .ok_or("a buffer descriptor")
+                    .and_then(|v| self.i32_of(v))?;
+                by_addr = Some((w0, w1, raw_off));
             }
         }
         let index = if self.by_address(src) { None } else { index };
@@ -12845,6 +12869,15 @@ impl<'a> Lower<'a> {
                 }
                 let bounds = self.buffer_bounds(h, index, off, stride, width / 8);
                 let active = self.buffer_store_guard(bounds, guard);
+                let write_target = self.resolve_write_target(src, by_addr);
+                let byte_off = match index {
+                    Some(i) => {
+                        let st = self.s.m.i32(stride);
+                        let rows = self.s.m.bin(c, Bin::Mul, i, st);
+                        self.s.m.bin(c, Bin::Add, rows, off)
+                    }
+                    None => off,
+                };
                 let at = self.begin_guarded(Some(active));
                 self.write_subword(off, width, x, |l, byte, mask, bits| {
                     let [a, b] = coords(byte);
@@ -12854,6 +12887,7 @@ impl<'a> Lower<'a> {
                         l.buffer_compare_exchange(h, [a, b, iu], old, x, false)
                     });
                 });
+                self.emit_buffer_write_mark(write_target, byte_off, None, width / 8);
                 self.end_guarded(at, &[]);
             }
             return Ok(());
@@ -12871,23 +12905,26 @@ impl<'a> Lower<'a> {
             let val = if wide { self.join64(vals[0], vals[1]) } else { vals[0] };
             let ty = self.s.m.type_of(val);
             let zero = self.s.m.int_const(ty, 0);
-            let (h, coords) = match index {
+            let (h, coords, byte_off) = match index {
                 Some(index) => {
                     if stride >= 4 && stride.is_multiple_of(4) {
                         if wide && !stride.is_multiple_of(8) {
                             return Err("a 64-bit buffer atomic without an eight-byte-aligned stride");
                         }
                         let h = self.handle(site, src, false, (12 | u, stride))?;
-                        (h, [index, off, iu])
+                        let st = self.s.m.i32(stride);
+                        let rows = self.s.m.bin(c, Bin::Mul, index, st);
+                        let byte_off = self.s.m.bin(c, Bin::Add, rows, off);
+                        (h, [index, off, iu], byte_off)
                     } else {
                         if wide {
                             return Err("a 64-bit buffer atomic through a structured buffer of unknown stride");
                         }
                         let byte = self.runtime_stride_offset(src, index, off)?;
-                        (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu])
+                        (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu], byte)
                     }
                 }
-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu], off),
             };
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
@@ -12898,6 +12935,7 @@ impl<'a> Lower<'a> {
             } else {
                 guard
             };
+            let write_target = self.resolve_write_target(src, by_addr);
             let at = self.begin_guarded(active);
             let r = if op == "cmpswap" {
                 // cmpswap: data is (new, compare).
@@ -12921,6 +12959,7 @@ impl<'a> Lower<'a> {
                     l.buffer_compare_exchange(h, coords, old, x, wide)
                 })
             };
+            self.emit_buffer_write_mark(write_target, byte_off, None, 4 * u32::from(words));
             if returns {
                 let r = self.end_guarded(at, &[(r, zero)])[0];
                 self.write_atomic_result(inst, reg, r, wide, guard);
@@ -12952,7 +12991,7 @@ impl<'a> Lower<'a> {
                 vals = wide;
             }
             let mut args = Vec::new();
-            let (op, name) = if typed {
+            let (op, name, mark_byte_off, mark_elem_idx, mark_bytes) = if typed {
                 // shortcut: typed stores are taken to write a float format.
                 // The channels the opcode leaves out are written as 0: the
                 // validator has typed stores write all four.
@@ -12960,41 +12999,49 @@ impl<'a> Lower<'a> {
                     return Err("a typed buffer store at an offset");
                 }
                 args.push(self.handle(site, src, false, (10 | u, 0x409))?);
-                args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
+                let elem = index.unwrap_or(self.s.m.i32(0));
+                args.extend([elem, iu]);
                 for x in vals {
                     args.push(self.as_float(x));
                 }
                 args.resize(3 + 4, self.s.m.f32(0));
-                (69, "bufferStore.f32")
+                (69, "bufferStore.f32", self.s.m.i32(0), Some(elem), 16u32)
             } else {
-                match index {
+                let byte_off = match index {
                     Some(index) => {
                         let stride = used.map_or(0, |u| u.stride);
                         if stride >= 4 && stride.is_multiple_of(4) {
                             args.push(self.handle(site, src, false, (12 | u, stride))?);
                             args.extend([index, off]);
+                            let st = self.s.m.i32(stride);
+                            let rows = self.s.m.bin(c, Bin::Mul, index, st);
+                            self.s.m.bin(c, Bin::Add, rows, off)
                         } else {
                             let byte = self.runtime_stride_offset(src, index, off)?;
                             args.push(self.handle(site, src, false, (11 | u, 0))?);
                             args.extend([byte, iu]);
+                            byte
                         }
                     }
                     None => {
                         args.push(self.handle(site, src, false, (11 | u, 0))?);
                         args.extend([off, iu]);
+                        off
                     }
-                }
+                };
                 args.extend(&vals);
                 args.resize(3 + 4, iu);
-                (140, "rawBufferStore.i32")
+                (140, "rawBufferStore.i32", byte_off, None, 4 * count)
             };
             args.push(self.s.m.i8(if typed { 0xF } else { (1u8 << count) - 1 }));
             if !typed {
                 args.push(self.s.m.i32(4));
             }
+            let write_target = self.resolve_write_target(src, by_addr);
             let at = self.begin_guarded(guard);
             let void = self.s.t.void;
             self.s.op(self.cur, name, Attr::NoUnwind, void, op, &args);
+            self.emit_buffer_write_mark(write_target, mark_byte_off, mark_elem_idx, mark_bytes);
             self.end_guarded(at, &[]);
             return Ok(());
         }

@@ -39,6 +39,8 @@ mod host;
 mod indirect;
 pub mod list;
 #[cfg(windows)]
+mod marks;
+#[cfg(windows)]
 mod memwait;
 #[cfg(windows)]
 mod memory;

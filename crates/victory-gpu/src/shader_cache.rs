@@ -70,6 +70,7 @@ fn build() -> &'static [u8; 32] {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.push(victory_shader::emit::rays().into());
                 bytes.push(victory_shader::emit::force_wave64().into());
+                bytes.push(victory_shader::emit::write_marks().into());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {
@@ -170,8 +171,8 @@ fn cached(
     (converter.translate)(container)
 }
 
-/// Cache entry version (VSH3 adds `written_root_uavs` so older entries re-translate).
-const MAGIC: &[u8; 4] = b"VSH3";
+/// Cache entry version (VSH4 adds `write_marks` so older entries re-translate).
+const MAGIC: &[u8; 4] = b"VSH4";
 const STAGES: [HwStage; 8] = [
     HwStage::Ls,
     HwStage::Hs,
@@ -251,6 +252,7 @@ fn encode(s: &HostShader) -> Vec<u8> {
         out.extend(slots);
     }
     word(&mut out, u32::from(s.stride_table));
+    word(&mut out, u32::from(s.write_marks));
     out
 }
 
@@ -310,6 +312,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let root_uavs = r.list()?;
     let written_root_uavs = r.list()?;
     let stride_table = r.word()? != 0;
+    let write_marks = r.word()? != 0;
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -321,6 +324,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_uavs,
         written_root_uavs,
         stride_table,
+        write_marks,
     })
 }
 
@@ -350,6 +354,7 @@ mod tests {
             root_uavs: vec![4],
             written_root_uavs: vec![4],
             stride_table: true,
+            write_marks: true,
         }
     }
 

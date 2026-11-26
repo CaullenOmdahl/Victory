@@ -660,6 +660,7 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         root_uavs: Vec::new(),
         written_root_uavs: Vec::new(),
         stride_table: false,
+        write_marks: false,
     }
 }
 

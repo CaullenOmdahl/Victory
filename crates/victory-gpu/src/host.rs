@@ -1144,8 +1144,10 @@ enum Step {
     Refresh(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
     /// Work that writes host memory only.
     Host(Box<dyn Fn() + Send>),
-    /// Shaders write a range (address, bytes) of a buffer's host copy.
-    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize),
+    /// Shaders write a range (address, bytes) of a buffer's host copy; when
+    /// `unmarked` is true (e.g. `ResolveQueryData`), no shader write-mark is
+    /// emitted on GPU so the host marks the pages itself.
+    GpuWrite(std::sync::Arc<crate::shadow::Shadow>, usize, usize, bool),
     /// Brings a texture's staging buffer up to date and, when dirty, copies
     /// it into the host texture on the list's prelude: once per submission,
     /// whichever lists sample it, until a `Copy` or `Run` intervenes.
@@ -1462,6 +1464,9 @@ impl Host {
         if last_sub != 0 {
             FINISHED.fetch_max(last_sub, Ordering::AcqRel);
             bury(last_sub);
+            if !self.has_in_flight() {
+                crate::marks::clear_pending();
+            }
         }
         crate::timeline::deliver(FINISHED_FENCE.load(Ordering::Acquire));
         #[cfg(feature = "diagnostics")]
@@ -1797,7 +1802,7 @@ impl Host {
         let mut declared = crate::fx::Set::default();
         for list in runs {
             for step in &list.deferred().copies {
-                if let Step::GpuWrite(shadow, address, len) = step
+                if let Step::GpuWrite(shadow, address, len, _) = step
                     && declared.insert((std::sync::Arc::as_ptr(shadow) as usize, *address, *len))
                 {
                     let target = if shadow.is_card() {
@@ -2011,6 +2016,9 @@ impl Host {
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         self.finish_submission(runs, cpu_back, batch.late, batch.late_refresh);
+        if !self.has_in_flight() {
+            crate::marks::clear_pending();
+        }
         self.log_messages();
     }
 
@@ -2931,7 +2939,32 @@ impl HostList {
         if deferred.gpu_written.insert(key) {
             deferred
                 .copies
-                .push(Step::GpuWrite(shadow.clone(), address, len));
+                .push(Step::GpuWrite(shadow.clone(), address, len, false));
+        }
+    }
+
+    /// Like [`HostList::defer_gpu_write`], for non-shader GPU writes (such as
+    /// `ResolveQueryData`) that do not emit shader write-marks on the GPU.
+    pub(crate) fn defer_gpu_write_unmarked(
+        &self,
+        shadow: &std::sync::Arc<crate::shadow::Shadow>,
+        address: usize,
+        len: usize,
+    ) {
+        let mut deferred = self.deferred();
+        let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
+        if deferred.gpu_written.insert(key) {
+            deferred
+                .copies
+                .push(Step::GpuWrite(shadow.clone(), address, len, true));
+        } else if let Some(Step::GpuWrite(_, _, _, unmarked)) = deferred.copies.iter_mut().find(|s| {
+            matches!(
+                s,
+                Step::GpuWrite(sh, a, l, _)
+                    if std::sync::Arc::as_ptr(sh) as usize == key.0 && (*a, *l) == (address, len)
+            )
+        }) {
+            *unmarked = true;
         }
     }
 
@@ -3605,13 +3638,16 @@ impl HostList {
                         add(C::RunUs, started.elapsed().as_micros() as u64);
                     }
                 }
-                Step::GpuWrite(shadow, address, len) => {
+                Step::GpuWrite(shadow, address, len, unmarked) => {
                     // The shaders start from the title's data.
                     batch.flush();
                     batch.gpu_write(*address, *len);
                     // A deferred copy's bytes must not land past a write
                     // recorded after it: the shader's stay.
                     batch.clip_late(*address, *len);
+                    if *unmarked {
+                        crate::marks::mark_cpu_range(*address, *len);
+                    }
                     shadow.writing(*address, *len);
                 }
                 Step::Texture(staging, copy) => {

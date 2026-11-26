@@ -120,7 +120,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use container::MESH_OUTPUT_LIMIT;
 pub use rectangle::rectangle_geometry;
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
+pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE, WRITE_MARKS_SPACE};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -177,6 +177,44 @@ pub fn force_wave64() -> bool {
 
 fn parse_force_wave64(value: Option<&std::ffi::OsStr>) -> bool {
     value.is_none_or(|v| v != "0")
+}
+
+/// Whether shaders mark the 64 KiB pages they write in the host's write-mark
+/// bitmap (`u0` in [`WRITE_MARKS_SPACE`]). Enabled by default in production;
+/// set `VICTORY_WRITE_MARKS=0` to disable and fall back to full snapshots.
+/// Under `#[cfg(test)]`, defaults to `false` unless `VICTORY_WRITE_MARKS=1`
+/// or overridden via [`with_write_marks_enabled`] so existing synthetic shader
+/// unit-test harnesses keep their exact bindings.
+pub fn write_marks() -> bool {
+    #[cfg(test)]
+    {
+        if let Some(v) = FORCE_WRITE_MARKS.with(|c| c.get()) {
+            return v;
+        }
+        return std::env::var_os("VICTORY_WRITE_MARKS").is_some_and(|v| v == "1");
+    }
+    #[cfg(not(test))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_WRITE_MARKS").is_none_or(|v| v != "0"))
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FORCE_WRITE_MARKS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_write_marks_enabled<R>(f: impl FnOnce() -> R) -> R {
+    struct Guard(Option<bool>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            FORCE_WRITE_MARKS.with(|c| c.set(self.0));
+        }
+    }
+    let _g = Guard(FORCE_WRITE_MARKS.with(|c| c.replace(Some(true))));
+    f()
 }
 
 /// The wave size a DXIL container's `PSV0` requires (minimum = maximum).
@@ -275,6 +313,9 @@ pub struct HostShader {
     /// True when the shader reads the runtime stride table (`t0` in
     /// [`STRIDE_SPACE`]).
     pub stride_table: bool,
+    /// True when the shader emits GPU write-marks into `u0` in
+    /// [`WRITE_MARKS_SPACE`].
+    pub write_marks: bool,
 }
 
 impl HostShader {
@@ -949,6 +990,7 @@ fn emit_program_pruned(
         root_uavs: l.root_uavs,
         written_root_uavs: l.written_root_uavs,
         stride_table: l.stride_table,
+        write_marks: l.write_marks,
     })
 }
 
@@ -1295,6 +1337,7 @@ mod tests {
             root_uavs: Vec::new(),
             written_root_uavs: Vec::new(),
             stride_table: false,
+            write_marks: false,
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1308,6 +1351,7 @@ mod tests {
                 root_uavs: Vec::new(),
                 written_root_uavs: Vec::new(),
                 stride_table: false,
+                write_marks: false,
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1943,6 +1987,7 @@ mod tests {
                 root_uavs: l.root_uavs,
                 written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
+                write_marks: l.write_marks,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let out = host
@@ -2091,6 +2136,7 @@ mod tests {
                 root_uavs: l.root_uavs,
                 written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
+                write_marks: l.write_marks,
             };
             let data: Vec<u32> = (0..16).map(|k| 0xC0DE_0000 + k).collect();
             for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -2244,6 +2290,7 @@ mod tests {
                 root_uavs: l.root_uavs,
                 written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
+                write_marks: l.write_marks,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -2412,6 +2459,7 @@ mod tests {
                 root_uavs: l.root_uavs,
                 written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
+                write_marks: l.write_marks,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let srv_data: Vec<u32> = (100..112).collect();
@@ -2571,6 +2619,7 @@ mod tests {
                 root_uavs: l.root_uavs,
                 written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
+                write_marks: l.write_marks,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let out = host

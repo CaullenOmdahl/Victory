@@ -1647,7 +1647,7 @@ fn host_resolve(this: This, heap: This, kind: u32, first: u32, count: u32, at: *
     // Title memory first (the stand-in values and the bytes between
     // results), then the results over it.
     shadow.refresh(&list, address, len);
-    shadow.gpu_writes(&list, address, len);
+    shadow.gpu_writes_unmarked(&list, address, len);
     let to = shadow.offset(address);
     #[cfg(feature = "diagnostics")]
     list.note_op(|| format!("resolve {count} queries of type {kind} to {address:#x}"));

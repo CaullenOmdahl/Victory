@@ -8,7 +8,9 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE, WRITE_MARKS_SPACE,
+};
 use victory_shader::{RootType, UsedResource};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -504,6 +506,8 @@ pub(crate) struct Stage {
     pub(crate) written_root_uavs: Vec<u8>,
     /// Root parameter of the runtime stride table (`t0`, [`STRIDE_SPACE`]).
     pub(crate) stride_table: Option<u32>,
+    /// Root parameter of the 64 KiB page write-mark bitmap (`u0`, [`WRITE_MARKS_SPACE`]).
+    pub(crate) write_marks: Option<u32>,
 }
 
 impl Stage {
@@ -626,6 +630,7 @@ impl HostPipeline {
                 root_uavs: Vec::new(),
                 written_root_uavs: t.written_root_uavs.clone(),
                 stride_table: None,
+                write_marks: None,
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -682,6 +687,20 @@ impl HostPipeline {
                         Descriptor: D3D12_ROOT_DESCRIPTOR1 {
                             ShaderRegister: 0,
                             RegisterSpace: STRIDE_SPACE,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
+            }
+            if t.write_marks {
+                stage.write_marks = Some(params.len() as u32);
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: 0,
+                            RegisterSpace: WRITE_MARKS_SPACE,
                             Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
                         },
                     },

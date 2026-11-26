@@ -981,6 +981,20 @@ impl State {
                             };
                         continue;
                     }
+                    if u.root == RootType::ROOT_ADDR_LO || u.root == RootType::ROOT_ADDR_HI {
+                        values[u.index as usize] =
+                            match self.roots_ref(compute).get(u.dword as usize) {
+                                Some(Root::View(address)) => {
+                                    if u.root == RootType::ROOT_ADDR_LO {
+                                        *address as u32
+                                    } else {
+                                        (*address >> 32) as u32
+                                    }
+                                }
+                                _ => 0,
+                            };
+                        continue;
+                    }
                     values[u.index as usize] = match fresh {
                         Some(&(_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
@@ -1041,6 +1055,13 @@ impl State {
                     once!("a shader reads the runtime stride table without a host view heap");
                     bind_null_root(l, compute, true, param, 0, None, "no view heap for runtime stride table");
                 }
+            }
+            if let Some(param) = stage.write_marks {
+                let Some(gpu) = crate::marks::gpu_address() else {
+                    return no("no write-marks buffer");
+                };
+                // SAFETY: an open list; the 2 MiB persistent shared buffer lives for the device lifetime.
+                unsafe { set_root_view(l, compute, false, param, gpu, true) };
             }
         }
         true

@@ -15,6 +15,9 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// Where the host's runtime stride table is bound: `t0` in this space
 /// (one `u32` element stride per view-heap slot).
 pub const STRIDE_SPACE: u32 = 2;
+/// Where the host's 64 KiB page write-mark bitmap is bound: `u0` in this space
+/// (`RWByteAddressBuffer`, 2 MiB covering the 40-bit title address space).
+pub const WRITE_MARKS_SPACE: u32 = 3;
 
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
@@ -103,6 +106,9 @@ pub(crate) struct Shader {
     pub root_uavs_rov: bool,
     /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
     pub stride_table: Option<V>,
+    /// Handle of the 64 KiB page write-mark bitmap (`u0`, [`WRITE_MARKS_SPACE`]),
+    /// if the shader marks pages it writes.
+    pub write_marks: Option<V>,
     pub flags: u64,
     /// Heap handles made with a non-uniform index.
     pub nonuniform_handles: u32,
@@ -171,6 +177,7 @@ impl Shader {
             root_uavs_shared: false,
             root_uavs_rov: false,
             stride_table: None,
+            write_marks: None,
             flags: 0,
             nonuniform_handles: 0,
             view_clamp: super::active_clamp().0,
@@ -387,6 +394,31 @@ impl Shader {
         h
     }
 
+    /// The handle of the host's 64 KiB page write-mark bitmap (`u0`,
+    /// [`WRITE_MARKS_SPACE`], a raw `RWByteAddressBuffer`).
+    pub fn write_marks_handle(&mut self) -> V {
+        if let Some(h) = self.write_marks {
+            return h;
+        }
+        let z = self.m.i32(0);
+        let bind = [z, z, self.m.i32(WRITE_MARKS_SPACE), self.m.i8(1)];
+        let bind = self.m.aggregate(self.t.bind, &bind);
+        let f = self.m.bool(false);
+        let block = self.entry;
+        let h = self.op(
+            block,
+            "createHandleFromBinding",
+            Attr::ReadNone,
+            self.t.handle,
+            217,
+            &[bind, z, f],
+        );
+        let h = self.annotate(block, h, 0x1000 | 11, 0);
+        self.flags |= flags::RAW_BUFFERS | flags::WAVE_OPS;
+        self.write_marks = Some(h);
+        h
+    }
+
     /// The handle of immediate sampler `n` (a comparison sampler when its
     /// bit in `cmp_samplers` is set).
     pub fn sampler_handle(&mut self, block: usize, n: u32) -> V {
@@ -517,7 +549,7 @@ impl Shader {
     pub fn finish(mut self) -> Vec<u8> {
         self.align_packed_pixel_inputs();
         let compute = self.threads.is_some() && self.mesh.is_none() && !self.rectangles;
-        if !self.root_uavs.is_empty() && !self.pixel && !compute {
+        if (!self.root_uavs.is_empty() || self.write_marks.is_some()) && !self.pixel && !compute {
             self.flags |= flags::UAVS_EVERY_STAGE;
         }
         let ud_size = (self.user_data * 4).next_multiple_of(16);
@@ -553,6 +585,7 @@ impl Shader {
             || !self.root_srvs.is_empty()
             || !self.root_uavs.is_empty()
             || self.stride_table.is_some()
+            || self.write_marks.is_some()
         {
             let empty = self.m.md_str("");
             let mut cbvs = None;
@@ -645,7 +678,7 @@ impl Shader {
                 srvs = Some(self.m.md_node(list));
             }
             let mut uavs = None;
-            if !self.root_uavs.is_empty() {
+            if !self.root_uavs.is_empty() || self.write_marks.is_some() {
                 let shared = self.m.bool(self.root_uavs_shared);
                 let shared_md = self.m.md_value(shared);
                 let ty = self
@@ -678,6 +711,29 @@ impl Shader {
                         kind: 7,
                         space: ROOT_CBV_SPACE,
                         register: reg,
+                        dxil_kind: 11,
+                    });
+                }
+                if self.write_marks.is_some() {
+                    let n = list.len() as u32;
+                    let ops = vec![
+                        Some(i32c(&mut self, n)),
+                        Some(self.m.md_value(u)),
+                        Some(empty),
+                        Some(i32c(&mut self, WRITE_MARKS_SPACE)),
+                        Some(i32c(&mut self, 0)),
+                        Some(i32c(&mut self, 1)),
+                        Some(i32c(&mut self, 11)),
+                        Some(f_md),
+                        Some(f_md),
+                        Some(f_md),
+                        None,
+                    ];
+                    list.push(Some(self.m.md_node(ops)));
+                    bindings.push(Binding {
+                        kind: 7,
+                        space: WRITE_MARKS_SPACE,
+                        register: 0,
                         dxil_kind: 11,
                     });
                 }
