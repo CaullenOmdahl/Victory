@@ -731,6 +731,9 @@ fn v_fma_legacy_f32_follows_the_d3d9_zero_rule() {
         // A zero factor gives a zero product, whatever the other one is.
         ([0, f(f32::INFINITY), f(1.5), 0], f(1.5)),
         ([f(f32::NAN), 0, f(-2.0), 0], f(-2.0)),
+        // Subnormal source flushes to zero before multiply/add.
+        ([1, f(1.0), 0, 0], 0),
+        ([1, f(f32::INFINITY), f(1.0), 0], f(1.0)),
     ];
     let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
     run_cases(&shader, &inputs, |backend, i, _, got| {
@@ -1349,6 +1352,24 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
+    let vector_cases = [
+        ([0x8000_0000, u32::MAX, 33, 0], [1, u32::MAX]),
+        ([0x0000_0080, 36, 36, 0], [8, 0xffff_fff8]),
+        ([0x8000_0000, 28, 4, 0], [8, 0xffff_fff8]),
+        ([0xffff_ffff, 0, 31, 0], [0x7fff_ffff, u32::MAX]),
+    ];
+    let inputs = vector_cases.map(|(input, _)| input);
+    for (signed, (name, shader)) in [("v_bfe_u32", &v_unsigned), ("v_bfe_i32", &v_signed)]
+        .into_iter()
+        .enumerate()
+    {
+        run_cases(shader, &inputs, |backend, i, input, got| {
+            assert_eq!(
+                got, vector_cases[i].1[signed],
+                "{backend}: {name} {input:x?}"
+            );
+        });
+    }
 }
 
 #[test]

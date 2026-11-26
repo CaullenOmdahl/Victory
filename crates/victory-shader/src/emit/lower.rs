@@ -143,6 +143,10 @@ pub(crate) struct Lowered {
     icmps_and_selects: (usize, usize),
     #[cfg(test)]
     pub threads: Option<[u32; 3]>,
+    #[cfg(test)]
+    pub instructions: usize,
+    #[cfg(test)]
+    tertiary_i32_opcodes: Vec<i64>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2270,6 +2274,10 @@ impl<'a> Lower<'a> {
             icmps_and_selects: self.s.m.written_icmps_and_selects(),
             #[cfg(test)]
             threads: self.s.threads,
+            #[cfg(test)]
+            instructions: self.s.m.written_instructions(),
+            #[cfg(test)]
+            tertiary_i32_opcodes: self.s.m.written_call_opcodes("dx.op.tertiary.i32"),
             stride_table,
             dxil: self.s.finish(),
             user_data,
@@ -4074,6 +4082,7 @@ impl<'a> Lower<'a> {
     /// `a × b + addend` fused, with `0 × anything = 0` as in D3D9
     /// (`v_fma_legacy_f32`).
     fn fma_legacy(&mut self, a: V, b: V, addend: V) -> V {
+        let (a, b, addend) = (self.ftz(a), self.ftz(b), self.ftz(addend));
         let c = self.cur;
         let zero = self.s.m.f32(0);
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
@@ -10645,8 +10654,10 @@ impl<'a> Lower<'a> {
             }
             "v_bfe_u32" | "v_bfe_i32" => {
                 let (a, off, w) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                let w = m31(self, w);
-                self.bfe(a, off, w, name == "v_bfe_i32")
+                // DXIL's Ibfe and Ubfe already use five bits of width and offset.
+                let op = if name == "v_bfe_i32" { 51 } else { 52 };
+                self.s
+                    .op(c, "tertiary.i32", Attr::ReadNone, self.s.t.i32, op, &[w, off, a])
             }
             "v_bfi_b32" => {
                 let (m, a, b) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
@@ -16997,5 +17008,79 @@ mod loop86_tests {
         let sel = (0..8).fold(0, |s, i| s | (in_quad[i] << (3 * i)));
         assert!(run([0x7E00_02E9 | (3 << 17), (sel << 8) | 2]).is_ok());
         assert!(run([0x7E00_02E9 | (3 << 17), ((sel ^ 4) << 8) | 2]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod loop88_tests {
+    use crate::native::{ComputeIo, RootParam};
+    use crate::{HwStage, NativeProgram, ResourceType, RootType, UsedResource};
+
+    #[test]
+    fn vector_bitfield_extract_lowers_to_dxil_bfe() {
+        for (op, expected_dxil_op) in [(0x148u32, 52i64), (0x149, 51)] {
+            let words = [
+                0xBE81_0380u32, // s1 = 0
+                0xF408_0200,
+                0xFA00_0000, // s[8:11] = UAV
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xD400_0000 | (op << 16),
+                0x0002_0101 | (0x102 << 9) | (0x103 << 18), // v_bfe_{u32,i32} v0, v1, v2, v3
+                0x3402_0082,                                // v1 = v0 * 4
+                0xE070_1000,
+                0x8002_0001, // buffer_store_dword v0, v1, s[8:11], 0 offen
+                0xBF81_0000,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64: false,
+                vgprs: 4,
+                layout: vec![RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![UsedResource {
+                    kind: ResourceType::Uav,
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 4,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                io: crate::native::StageIo::Cs(ComputeIo {
+                    rsrc2: 2,
+                    threads: [32, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+            let l = super::lower(&super::Parts {
+                native: &native,
+                psv: None,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![],
+                outputs: vec![],
+                prims: vec![],
+                mesh_stride: 0,
+                target: crate::emit::Target::ANY,
+                console_cf: false,
+                per_lane_only: false,
+            })
+            .unwrap();
+            assert_eq!(l.tertiary_i32_opcodes, vec![expected_dxil_op]);
+            assert!(l.instructions <= 25, "count={}", l.instructions);
+        }
     }
 }

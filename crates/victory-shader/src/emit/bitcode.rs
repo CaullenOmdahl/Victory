@@ -926,6 +926,24 @@ impl Module {
         (icmps, selects)
     }
 
+    /// Instructions (including terminators) that [`Module::write`] writes.
+    #[cfg(test)]
+    pub fn written_instructions(&self) -> usize {
+        let plan = self.plan();
+        plan.layout
+            .iter()
+            .map(|&b| {
+                let block = &self.blocks[b];
+                let live = block
+                    .phis
+                    .iter()
+                    .chain(&block.body)
+                    .filter(|&&i| plan.live[i as usize]);
+                live.count() + 1
+            })
+            .sum()
+    }
+
     /// Calls of functions named `name` that [`Module::write`] writes.
     #[cfg(test)]
     pub fn written_calls(&self, name: &str) -> usize {
