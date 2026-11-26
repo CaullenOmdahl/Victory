@@ -113,6 +113,9 @@ struct Last {
     /// next in.
     still: u32,
     next: u64,
+    /// Subresources (and optional element row ranges) dirtied by the last
+    /// refresh; empty means every subresource whole.
+    dirty: Vec<(u32, Option<std::ops::Range<u32>>)>,
 }
 
 // SAFETY: the staging mapping is written only at submission, under
@@ -351,13 +354,58 @@ impl Staging {
                 if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                     return (0, false);
                 }
+                if last.asked == 0 {
+                    last.asked = now;
+                    last.dirty.clear();
+                    with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
+                    #[cfg(feature = "diagnostics")]
+                    crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
+                    return (size, true);
+                }
+                let changed = changed_byte_ranges(start, size, &written, last.asked);
+                if changed.is_empty() {
+                    last.asked = now;
+                    return (0, false);
+                }
+                let mut subs = Vec::new();
+                let mut read_spans = Vec::new();
+                let mut full_read = false;
+                for i in 0..self.footprints.len() {
+                    let (mip, slice) = (i as u32 % self.mips + self.skip, i as u32 / self.mips);
+                    match self.layout.touched_rows(mip, slice, &changed) {
+                        Some((rows, _)) if rows.is_empty() => continue,
+                        Some((rows, span)) => {
+                            let s = (span.start.min(size), span.end.min(size));
+                            if s.0 < s.1 {
+                                read_spans.push(s);
+                            }
+                            subs.push((i as u32, Some(rows)));
+                        }
+                        None => {
+                            full_read = true;
+                            subs.push((i as u32, None));
+                        }
+                    }
+                }
                 last.asked = now;
-                // Read through the copy, which stands unmapped pages: memory of
-                // big pools is too slow to ask page by page.
-                with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
+                if subs.is_empty() {
+                    return (0, false);
+                }
+                let read = if full_read {
+                    last.dirty.clear();
+                    with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
+                    size
+                } else {
+                    let spans = merge_ranges(read_spans);
+                    let bytes = with_tiled_spans(self.memory, size, &spans, |tiled| {
+                        self.detile_sub(tiled, &subs);
+                    });
+                    last.dirty = subs;
+                    bytes
+                };
                 #[cfg(feature = "diagnostics")]
-                crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
-                return (size, true);
+                crate::copystat::add(crate::copystat::C::TexWatched, read as u64);
+                return (read, true);
             }
             self.not_watched.store(true, Ordering::Relaxed);
         }
@@ -445,38 +493,84 @@ impl Staging {
             CHANGED[usize::from(told)].fetch_add(1, Ordering::Relaxed);
         }
         last.gen_digest = new_digest;
+        last.dirty.clear();
         self.detile(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, true)
     }
 
-    /// Records `CopyTextureRegion` for every subresource from this staging
-    /// buffer into `texture` (which must already be in `COPY_DEST`).
+    /// Records `CopyTextureRegion` for the subresources dirtied by the last
+    /// refresh (or every subresource whole) into `texture`.
     pub(crate) fn record_copies(&self, list: &ID3D12GraphicsCommandList, texture: &ID3D12Resource) {
-        for (i, footprint) in self.footprints.iter().enumerate() {
-            let to = D3D12_TEXTURE_COPY_LOCATION {
-                // SAFETY: a borrowed pointer the location never releases.
-                pResource: unsafe { std::mem::transmute_copy(texture) },
-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    SubresourceIndex: i as u32,
-                },
-            };
-            let from = D3D12_TEXTURE_COPY_LOCATION {
-                // SAFETY: as above.
-                pResource: unsafe { std::mem::transmute_copy(&self.buffer) },
-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                    PlacedFootprint: *footprint,
-                },
-            };
-            // SAFETY: an open list; both locations name live resources.
-            unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
-            #[cfg(test)]
-            self.gpu_uploads
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dirty = self
+            .last
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dirty
+            .clone();
+        if dirty.is_empty() {
+            for (i, footprint) in self.footprints.iter().enumerate() {
+                self.copy_subresource(list, texture, i, footprint, None);
+            }
+        } else {
+            for (i, rows) in dirty {
+                let idx = i as usize;
+                self.copy_subresource(list, texture, idx, &self.footprints[idx], rows);
+            }
         }
+    }
+
+    fn copy_subresource(
+        &self,
+        list: &ID3D12GraphicsCommandList,
+        texture: &ID3D12Resource,
+        i: usize,
+        footprint: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+        rows: Option<std::ops::Range<u32>>,
+    ) {
+        let to = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: a borrowed pointer the location never releases.
+            pResource: unsafe { std::mem::transmute_copy(texture) },
+            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                SubresourceIndex: i as u32,
+            },
+        };
+        let from = D3D12_TEXTURE_COPY_LOCATION {
+            // SAFETY: as above.
+            pResource: unsafe { std::mem::transmute_copy(&self.buffer) },
+            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                PlacedFootprint: *footprint,
+            },
+        };
+        let f = footprint.Footprint;
+        let block = self.layout.desc.block.max(1);
+        match rows {
+            Some(r) if r != (0..self.rows[i]) => {
+                let (top, bottom) = (r.start * block, (r.end * block).min(f.Height));
+                if top >= bottom {
+                    return;
+                }
+                let src_box = D3D12_BOX {
+                    left: 0,
+                    top,
+                    front: 0,
+                    right: f.Width,
+                    bottom,
+                    back: f.Depth,
+                };
+                // SAFETY: an open list; both locations name live resources and
+                // the box lies within the subresource footprint.
+                unsafe { list.CopyTextureRegion(&to, 0, top, 0, &from, Some(&src_box)) };
+            }
+            // SAFETY: an open list; both locations name live resources.
+            _ => unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) },
+        }
+        #[cfg(test)]
+        self.gpu_uploads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -486,6 +580,14 @@ impl Staging {
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
     fn detile(&self, tiled: &[u8]) {
+        let all: Vec<_> = (0..self.footprints.len() as u32)
+            .map(|i| (i, None))
+            .collect();
+        self.detile_sub(tiled, &all);
+    }
+
+    /// Detiles only the specified `(subresource, optional_rows)` entries.
+    fn detile_sub(&self, tiled: &[u8], subs: &[(u32, Option<std::ops::Range<u32>>)]) {
         #[cfg(feature = "diagnostics")]
         if tracing::enabled!(tracing::Level::DEBUG) {
             if tiled.iter().all(|&b| b == 0) {
@@ -496,8 +598,10 @@ impl Staging {
                 );
             }
         }
-        for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
-            let (mip, slice) = (i as u32 % self.mips + self.skip, i as u32 / self.mips);
+        for (idx, rows_range) in subs {
+            let i = *idx as usize;
+            let (footprint, rows) = (&self.footprints[i], self.rows[i]);
+            let (mip, slice) = (*idx % self.mips + self.skip, *idx / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;
@@ -505,15 +609,67 @@ impl Staging {
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            let res = match rows_range {
+                Some(r) => self.layout.detile_rows(
+                    tiled,
+                    mip,
+                    slice,
+                    linear,
+                    pitch,
+                    pitch * rows as usize,
+                    r.clone(),
+                ),
+                None => self.layout.detile(
+                    tiled,
+                    mip,
+                    slice,
+                    linear,
+                    pitch,
+                    pitch * rows as usize,
+                ),
+            };
+            if let Err(e) = res {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
         }
     }
+}
+
+fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.retain(|r| r.0 < r.1);
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (a, b) in ranges {
+        if let Some(last) = merged.last_mut()
+            && a <= last.1
+        {
+            last.1 = last.1.max(b);
+        } else {
+            merged.push((a, b));
+        }
+    }
+    merged
+}
+
+fn changed_byte_ranges(
+    start: usize,
+    size: usize,
+    written: &[(usize, u64)],
+    asked: u64,
+) -> Vec<(usize, usize)> {
+    let page = crate::watch::PAGE;
+    let end = start + size;
+    let raw = written
+        .iter()
+        .filter(|&&(_, w)| w > asked)
+        .filter_map(|&(p, _)| {
+            let a = (p * page).max(start);
+            let b = ((p + 1) * page).min(end);
+            (a < b).then_some((a - start, b - start))
+        })
+        .collect();
+    merge_ranges(raw)
 }
 
 /// Diagnostics: which textures' contents change, how often, and whether they
@@ -625,6 +781,45 @@ fn with_tiled_copy<T>(memory: *const u8, size: usize, use_copy: impl FnOnce(&[u8
             *read = Vec::new();
         }
         result
+    })
+}
+
+/// Copies only `spans` (sorted disjoint offsets within `0..size`) from
+/// `memory` into the thread-local scratch buffer before calling `use_copy`.
+fn with_tiled_spans(
+    memory: *const u8,
+    size: usize,
+    spans: &[(usize, usize)],
+    use_copy: impl FnOnce(&[u8]),
+) -> usize {
+    SCRATCH.with_borrow_mut(|read| {
+        if size > read.len() {
+            read.reserve_exact(size - read.len());
+            read.resize(size, 0);
+        }
+        let tiled = &mut read[..size];
+        let mut bytes = 0;
+        for &(a, b) in spans {
+            let b = b.min(size);
+            if a < b {
+                // SAFETY: `a..b` lies within both `tiled[..size]` and the
+                // texture's memory span.
+                unsafe {
+                    crate::host::copy_mapped(
+                        tiled.as_mut_ptr().add(a),
+                        memory.add(a),
+                        b - a,
+                        false,
+                    );
+                }
+                bytes += b - a;
+            }
+        }
+        use_copy(tiled);
+        if read.capacity() > 64 << 20 {
+            *read = Vec::new();
+        }
+        bytes
     })
 }
 
@@ -991,6 +1186,73 @@ mod tests {
         assert_eq!(first_level(Some(&view(5, 0, 9, 1.0))), 1);
         assert_eq!(first_level(Some(&view(4, 0, 7, f32::NAN))), 0);
         assert_eq!(first_level(Some(&view(1, 9, 7, 0.0))), 0);
+    }
+
+    #[test]
+    fn watched_partial_write_detiles_and_copies_touched_rows_only() {
+        let Some(host) = host() else {
+            return;
+        };
+        let layout = victory_formats::texture::Layout::new(&victory_formats::texture::Desc {
+            dimension: Dimension::Tex2d,
+            width: 512,
+            height: 512,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::LINEAR,
+        })
+        .unwrap();
+        let page = crate::watch::PAGE;
+        let pages = (layout.size as usize).div_ceil(page);
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
+        // SAFETY: allocates private write-watched memory owned by this test.
+        let address = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                pages * page,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(address, 0);
+        // SAFETY: `address` owns `pages * PAGE` write-watched bytes.
+        unsafe { std::ptr::write_bytes(address as *mut u8, 0x40, layout.size as usize) };
+        let (copy, _) = make_rgba_texture(host, 512, 512);
+        let staging = create_staging(
+            host,
+            None,
+            1,
+            std::ptr::null(),
+            &copy.texture,
+            layout.clone(),
+            address as *const u8,
+        )
+        .unwrap();
+        assert_eq!(staging.refresh_now(), (layout.size as usize, true));
+        // Modify only the 2nd page (rows 32..64).
+        let row32 = layout.offset(0, 0, 32, 0).unwrap() as usize;
+        assert_eq!(row32, page);
+        // SAFETY: one page inside the watched allocation.
+        unsafe { std::ptr::write_bytes((address + row32) as *mut u8, 0x80, page) };
+        let (read, dirty) = staging.refresh_now();
+        assert!(dirty);
+        assert_eq!(read, page);
+        let pitch = staging.footprints[0].Footprint.RowPitch as usize;
+        for row in [0usize, 31, 32, 63, 64] {
+            // SAFETY: inside staging buffer rows.
+            let b = unsafe { *staging.data.add(staging.footprints[0].Offset as usize + row * pitch) };
+            let want = if (32..64).contains(&row) { 0x80 } else { 0x40 };
+            assert_eq!(b, want, "row {row}");
+        }
+        assert_eq!(staging.last.lock().unwrap().dirty, vec![(0, Some(32..64))]);
+        // SAFETY: frees the allocation owned by this test.
+        unsafe { VirtualFree(address as *mut _, 0, MEM_RELEASE) };
     }
 
     fn make_rgba_texture(host: &Host, width: u32, height: u32) -> (Arc<HostTexture>, Texture) {
