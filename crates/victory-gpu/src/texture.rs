@@ -973,6 +973,80 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
 
 /// A staging buffer for `texture`; with `map` (the kept ones), those no
 /// list holds are released first to stay within [`budget`].
+type FootprintKey = (i32, u64, u32, u16, u16, i32, u32, i32, i32);
+
+#[derive(Clone)]
+struct CachedFootprintPlan {
+    footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    rows: Vec<u32>,
+    total: u64,
+}
+
+const FOOTPRINT_PLAN_CAP: usize = 256;
+
+static FOOTPRINT_PLANS: std::sync::LazyLock<Mutex<HashMap<FootprintKey, CachedFootprintPlan>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::with_capacity(FOOTPRINT_PLAN_CAP)));
+
+fn footprint_key(d: &D3D12_RESOURCE_DESC) -> FootprintKey {
+    (
+        d.Dimension.0,
+        d.Width,
+        d.Height,
+        d.DepthOrArraySize,
+        d.MipLevels,
+        d.Format.0,
+        d.SampleDesc.Count,
+        d.Layout.0,
+        d.Flags.0,
+    )
+}
+
+fn copyable_footprints_cached(
+    device: &ID3D12Device,
+    d: &D3D12_RESOURCE_DESC,
+    count: u32,
+) -> (Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>, Vec<u32>, u64) {
+    let key = footprint_key(d);
+    if let Some(hit) = FOOTPRINT_PLANS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .cloned()
+        && hit.footprints.len() == count as usize
+    {
+        return (hit.footprints, hit.rows, hit.total);
+    }
+    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+    let mut rows = vec![0u32; count as usize];
+    let mut total = 0;
+    // SAFETY: outputs for `count` subresources.
+    unsafe {
+        device.GetCopyableFootprints(
+            d,
+            0,
+            count,
+            0,
+            Some(footprints.as_mut_ptr()),
+            Some(rows.as_mut_ptr()),
+            None,
+            Some(&mut total),
+        );
+    }
+    let mut cache = FOOTPRINT_PLANS.lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= FOOTPRINT_PLAN_CAP && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(
+        key,
+        CachedFootprintPlan {
+            footprints: footprints.clone(),
+            rows: rows.clone(),
+            total,
+        },
+    );
+    (footprints, rows, total)
+}
+
 fn create_staging(
     host: &crate::host::Host,
     map: Option<&mut HashMap<usize, Arc<Staging>>>,
@@ -989,22 +1063,7 @@ fn create_staging(
     } else {
         u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
     };
-    let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
-    let mut rows = vec![0u32; count as usize];
-    let mut total = 0;
-    // SAFETY: outputs for `count` subresources.
-    unsafe {
-        host.device.GetCopyableFootprints(
-            &d,
-            0,
-            count,
-            0,
-            Some(footprints.as_mut_ptr()),
-            Some(rows.as_mut_ptr()),
-            None,
-            Some(&mut total),
-        );
-    }
+    let (mut footprints, rows, total) = copyable_footprints_cached(&host.device, &d, count);
     if let Some(map) = map {
         evict(map, total);
     }
@@ -1758,5 +1817,53 @@ mod host_written_tests {
         let (matched, d5) = super::check_gen_digest(&last, 0x1000, 4096, Some(oracle), false);
         assert!(!matched);
         assert!(d5.is_none());
+    }
+
+    #[test]
+    fn copyable_footprints_cache_hits_and_caps_entries() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 64,
+            Height: 64,
+            DepthOrArraySize: 1,
+            MipLevels: 4,
+            Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            Layout: D3D12_TEXTURE_LAYOUT_UNKNOWN,
+            ..Default::default()
+        };
+        FOOTPRINT_PLANS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+
+        let first = copyable_footprints_cached(&host.device, &desc, 4);
+        assert_eq!(FOOTPRINT_PLANS.lock().unwrap_or_else(|e| e.into_inner()).len(), 1);
+        let second = copyable_footprints_cached(&host.device, &desc, 4);
+        assert_eq!(first.2, second.2);
+        assert_eq!(first.1, second.1);
+
+        {
+            let mut cache = FOOTPRINT_PLANS.lock().unwrap_or_else(|e| e.into_inner());
+            for i in 0..(FOOTPRINT_PLAN_CAP as u64) {
+                cache.insert(
+                    (3, 1000 + i, 1, 1, 1, 28, 1, 0, 0),
+                    CachedFootprintPlan {
+                        footprints: Vec::new(),
+                        rows: Vec::new(),
+                        total: 0,
+                    },
+                );
+            }
+        }
+        let mut desc2 = desc;
+        desc2.Width = 128;
+        let _ = copyable_footprints_cached(&host.device, &desc2, 4);
+        assert!(
+            FOOTPRINT_PLANS.lock().unwrap_or_else(|e| e.into_inner()).len() <= FOOTPRINT_PLAN_CAP
+        );
     }
 }

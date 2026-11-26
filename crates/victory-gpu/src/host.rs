@@ -1388,12 +1388,31 @@ impl Host {
         }
     }
 
+    /// Returns the completed host fence value, or `None` when D3D12 reports
+    /// `u64::MAX` (device removed / hung).
+    fn fence_completed(fence: &ID3D12Fence) -> Option<u64> {
+        // SAFETY: a plain fence query.
+        let val = unsafe { fence.GetCompletedValue() };
+        if val == u64::MAX {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::warn!(
+                    "host fence reported u64::MAX (device removed); refusing to retire in-flight work"
+                );
+            });
+            None
+        } else {
+            Some(val)
+        }
+    }
+
     /// Finishes the unwaited submissions that have run, oldest first, and
     /// buries objects retired before them. The caller holds `submitted`:
     /// finishing puts back what shaders wrote, as a submission does.
     fn reap_completed(&self) {
-        // SAFETY: a plain fence query.
-        let completed = unsafe { self.fence.GetCompletedValue() };
+        let Some(completed) = Self::fence_completed(&self.fence) else {
+            return;
+        };
         let mut last_sub = 0u64;
         loop {
             let done = {
@@ -1444,17 +1463,20 @@ impl Host {
         if target == 0 || FINISHED_FENCE.load(Ordering::Acquire) >= target {
             return;
         }
-        // SAFETY: `fence` is ours and free-threaded; `event` belongs to caller thread.
-        unsafe {
-            if self.fence.GetCompletedValue() < target {
-                let waited = std::time::Instant::now();
+        let Some(completed) = Self::fence_completed(&self.fence) else {
+            return;
+        };
+        if completed < target {
+            let waited = std::time::Instant::now();
+            // SAFETY: `fence` is ours and free-threaded; `event` belongs to caller thread.
+            unsafe {
                 if let Err(e) = self.fence.SetEventOnCompletion(target, event) {
                     tracing::warn!(error = %e, "host fence wait failed");
                 } else {
                     WaitForSingleObject(event, INFINITE);
                 }
-                SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
+            SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         self.reap_completed();
@@ -1471,9 +1493,12 @@ impl Host {
             return;
         }
         let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        // SAFETY: the fence and event are ours; guarded by `submitted`.
-        unsafe {
-            if self.fence.GetCompletedValue() < target {
+        let Some(completed) = Self::fence_completed(&self.fence) else {
+            return;
+        };
+        if completed < target {
+            // SAFETY: the fence and event are ours; guarded by `submitted`.
+            unsafe {
                 if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
                     tracing::warn!(error = %e, "host fence wait failed");
                 } else {
@@ -1500,8 +1525,7 @@ impl Host {
 
     /// The last fence value the host GPU has reached.
     pub(crate) fn completed_fence(&self) -> u64 {
-        // SAFETY: a plain fence query.
-        unsafe { self.fence.GetCompletedValue() }
+        Self::fence_completed(&self.fence).unwrap_or(0)
     }
 
     /// Takes the submission lock, waits for any in-flight GPU work to finish,
@@ -1543,17 +1567,20 @@ impl Host {
         if target == 0 {
             return;
         }
-        // SAFETY: the fence and event are ours; caller holds `submitted`.
-        unsafe {
-            if self.fence.GetCompletedValue() < target {
-                let waited = std::time::Instant::now();
+        let Some(completed) = Self::fence_completed(&self.fence) else {
+            return;
+        };
+        if completed < target {
+            let waited = std::time::Instant::now();
+            // SAFETY: the fence and event are ours; caller holds `submitted`.
+            unsafe {
                 if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
                     tracing::warn!(error = %e, "host async drain failed");
                 } else {
                     WaitForSingleObject(self.event, INFINITE);
                 }
-                SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
             }
+            SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         self.reap_completed();
     }

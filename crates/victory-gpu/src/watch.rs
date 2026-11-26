@@ -146,6 +146,15 @@ fn known_view(start: usize) -> bool {
     g.protected.contains(&first) || g.holes.contains(&first)
 }
 
+pub(crate) fn reset_write_watch(start: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    use windows_sys::Win32::System::Memory::ResetWriteWatch;
+    // SAFETY: `start..start + len` names live title memory pages.
+    unsafe { ResetWriteWatch(start as *const _, len) };
+}
+
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
     if guarded && known_view(start) {
         return writes_guarded(start, end);

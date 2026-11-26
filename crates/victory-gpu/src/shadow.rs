@@ -689,6 +689,10 @@ impl Shadow {
             // they had (a title write there shows at the next refresh).
             let (first, last) = ((start + from).div_ceil(PAGE), (start + to) / PAGE);
             if first < last && !synced.is_empty() && mode != NOT_WATCHED {
+                static BACK_QUIET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let back_quiet = *BACK_QUIET.get_or_init(|| {
+                    std::env::var_os("VICTORY_BACK_QUIET").is_some_and(|v| v == "1")
+                });
                 let res = if mode == WATCHED_GUARDED {
                     crate::watch::writes_guarded(first * PAGE, last * PAGE)
                 } else {
@@ -697,8 +701,28 @@ impl Shadow {
                 if let Some((now, _)) = res {
                     let base = start / PAGE;
                     let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-                    for page in synced.into_iter().filter(|p| (first..last).contains(p)) {
+                    for &page in synced.iter().filter(|p| (first..last).contains(p)) {
                         copied[page - base] = now;
+                    }
+                    if back_quiet && mode == 1 {
+                        let mut sorted: Vec<usize> =
+                            synced.into_iter().filter(|p| (first..last).contains(p)).collect();
+                        sorted.sort_unstable();
+                        sorted.dedup();
+                        let mut i = 0;
+                        while i < sorted.len() {
+                            let run_start = sorted[i];
+                            let mut run_end = run_start + 1;
+                            while i + 1 < sorted.len() && sorted[i + 1] == run_end {
+                                i += 1;
+                                run_end += 1;
+                            }
+                            crate::watch::reset_write_watch(
+                                run_start * PAGE,
+                                (run_end - run_start) * PAGE,
+                            );
+                            i += 1;
+                        }
                     }
                 }
             }

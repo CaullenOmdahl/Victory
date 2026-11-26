@@ -663,6 +663,8 @@ struct Slice {
 struct Physical {
     next_page: usize,
     pages: HashMap<usize, Slice>,
+    /// Freed physical page numbers recycled before advancing `next_page` (`Marvisak #1935`).
+    free: Vec<usize>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
     /// Reservations that take physical pages: start, length.
@@ -761,8 +763,6 @@ fn allocate_physical_pages_with_cap(
         "XMemAllocatePhysicalPages"
     );
     let mut physical = physical();
-    let first = physical.next_page;
-    physical.next_page += n * FRAMES;
     let mut written = 0usize;
     for (section, chunk_pages) in sections {
         for index in 0..chunk_pages {
@@ -770,7 +770,7 @@ fn allocate_physical_pages_with_cap(
                 section: section.clone(),
                 index,
             };
-            let number = first + written * FRAMES;
+            let number = take_page_number(&mut physical);
             physical.pages.insert(number, slice);
             // SAFETY: the title passes room for `n` page numbers.
             unsafe { pages.add(written).write(number) };
@@ -778,6 +778,16 @@ fn allocate_physical_pages_with_cap(
         }
     }
     1
+}
+
+fn take_page_number(physical: &mut Physical) -> usize {
+    if let Some(recycled) = physical.free.pop() {
+        recycled
+    } else {
+        let next = physical.next_page;
+        physical.next_page += FRAMES;
+        next
+    }
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
@@ -793,7 +803,10 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
     let mut physical = physical();
     for i in 0..n {
         // SAFETY: the title passes `n` page numbers.
-        physical.pages.remove(&unsafe { *pages.add(i) });
+        let number = unsafe { *pages.add(i) };
+        if physical.pages.remove(&number).is_some() {
+            physical.free.push(number);
+        }
     }
     1
 }
@@ -2273,6 +2286,30 @@ mod tests {
         assert_eq!(XMemMapPhysicalPages(va, 5, std::ptr::null()), va);
         assert_ne!(unsafe { VirtualFree(va, 0, MEM_RELEASE) }, 0);
         assert_eq!(XMemFreePhysicalPages(5, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn freed_physical_page_numbers_are_recycled() {
+        // Test deterministic recycling directly on a local `Physical` state so parallel
+        // `xmem::tests` cannot race on the global `PHYSICAL` allocator.
+        let mut local = Physical {
+            next_page: 0x10_0000,
+            ..Default::default()
+        };
+        let p0 = take_page_number(&mut local);
+        let p1 = take_page_number(&mut local);
+        assert_eq!((p0, p1), (0x10_0000, 0x10_0000 + FRAMES));
+        local.free.push(p0);
+        let recycled = take_page_number(&mut local);
+        assert_eq!(recycled, p0);
+        assert_eq!(local.next_page, 0x10_0000 + 2 * FRAMES);
+
+        // Also exercise the live FFI alloc -> free -> alloc path.
+        let first = allocate(4);
+        assert_eq!(XMemFreePhysicalPages(4, first.as_ptr()), 1);
+        let second = allocate(4);
+        assert_eq!(second.len(), 4);
+        assert_eq!(XMemFreePhysicalPages(4, second.as_ptr()), 1);
     }
 }
 
