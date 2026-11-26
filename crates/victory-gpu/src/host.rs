@@ -56,6 +56,7 @@ struct Finish {
     back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     late: Vec<(usize, usize, usize, bool)>,
     late_refresh: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
+    card_plan: Option<crate::card::CardPlan>,
 }
 // SAFETY: host lists are free-threaded objects, run by one thread once
 // closed; the rest is ours and locked.
@@ -1536,7 +1537,7 @@ impl Host {
     /// Finishes the unwaited submissions that have run, oldest first, and
     /// buries objects retired before them. The caller holds `submitted`:
     /// finishing puts back what shaders wrote, as a submission does.
-    fn reap_completed(&self) {
+    fn reap_completed(&self, submitted: &mut u64) {
         #[cfg(feature = "diagnostics")]
         let reap_started = std::time::Instant::now();
         let Some(completed) = Self::fence_completed(&self.fence) else {
@@ -1558,8 +1559,20 @@ impl Host {
                 back,
                 late,
                 late_refresh,
+                card_plan,
             }) = done.finish.take()
             {
+                if let Some(plan) = card_plan {
+                    let copying = std::time::Instant::now();
+                    if let Some(engine_lock) = self.card_engine() {
+                        let mut engine = engine_lock.lock().unwrap_or_else(|e| e.into_inner());
+                        let written = engine.finish_back(self, plan, submitted);
+                        COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+                    } else {
+                        plan.clear_pending();
+                    }
+                    COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
+                }
                 {
                     let runs: Vec<&HostList> = lists.iter().map(|l| &**l).collect();
                     #[cfg(feature = "diagnostics")]
@@ -1622,8 +1635,8 @@ impl Host {
             }
             SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        self.reap_completed();
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.reap_completed(&mut submitted);
     }
 
     /// Whether a submission is still to be waited for and finished.
@@ -1693,8 +1706,8 @@ impl Host {
                 }
             }
         }
-        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        self.reap_completed();
+        let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+        self.reap_completed(&mut submitted);
     }
 
     #[cfg(test)]
@@ -1734,7 +1747,7 @@ impl Host {
     /// `self.submitted`.
     pub(crate) fn drain_and_signal<R>(&self, f: impl FnOnce() -> (R, bool)) -> (R, Option<u64>) {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
-        self.drain_in_flight_locked();
+        self.drain_in_flight_locked(&mut submitted);
         let (result, signal) = f();
         let fence = if signal {
             *submitted += 1;
@@ -1754,7 +1767,7 @@ impl Host {
     }
 
     /// Waits for any in-flight async submission while `self.submitted` is already held.
-    fn drain_in_flight_locked(&self) {
+    fn drain_in_flight_locked(&self, submitted: &mut u64) {
         let target = self
             .in_flight
             .lock()
@@ -1780,7 +1793,7 @@ impl Host {
             }
             SUBMISSION_US[1].fetch_add(waited.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
-        self.reap_completed();
+        self.reap_completed(submitted);
     }
 
     /// No submission runs while the result lives: its title memory is not
@@ -1909,7 +1922,7 @@ impl Host {
         } else {
             Vec::new()
         };
-        self.drain_in_flight_locked();
+        self.drain_in_flight_locked(&mut submitted);
         for (heap, _) in &ahead {
             EARLY_SLOTS.fetch_add(heap.flush_staged() as u64, Ordering::Relaxed);
         }
@@ -2021,7 +2034,7 @@ impl Host {
             && keep.is_some()
             && !each
             && async_submit()
-            && card_writes.is_empty();
+            && (card_writes.is_empty() || crate::card::fetch_inflight());
         #[cfg(feature = "diagnostics")]
         let skip_copy_wait = no_work();
         #[cfg(not(feature = "diagnostics"))]
@@ -2124,9 +2137,16 @@ impl Host {
         }
         let _ = &firsts;
         if async_signalled {
-            if let Some(plan) = card_plan {
-                plan.clear_pending();
-            }
+            let deferred_card = if let Some(plan) = card_plan {
+                if card_after_ran {
+                    Some(plan)
+                } else {
+                    plan.clear_pending();
+                    None
+                }
+            } else {
+                None
+            };
             SUBMISSION_US[0].fetch_add((prepared - started).as_micros() as u64, Ordering::Relaxed);
             self.in_flight
                 .lock()
@@ -2145,6 +2165,7 @@ impl Host {
                         back: cpu_back,
                         late: batch.late,
                         late_refresh: batch.late_refresh,
+                        card_plan: deferred_card,
                     }),
                 });
             return;

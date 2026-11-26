@@ -111,6 +111,14 @@ pub(crate) fn enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_BUFFERS").is_none_or(|v| v != "0"))
 }
 
+/// Whether async submissions may also carry `card_writes` (`CARD_COMPARE` +
+/// deferred `finish_back` in `reap_completed`, `VICTORY_CARD_FETCH_INFLIGHT=1`,
+/// off by default).
+pub(crate) fn fetch_inflight() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_FETCH_INFLIGHT").is_some_and(|v| v == "1"))
+}
+
 /// `(min_bytes, max_total_bytes)` for card buffers:
 /// `VICTORY_CARD_BUFFERS_MIN_KB` or `VICTORY_CARD_BUFFERS_MIN_MB` (default 4 MiB)
 /// and `VICTORY_CARD_BUFFERS_MB` (default `(budget / 4).max(2048 MiB)`).

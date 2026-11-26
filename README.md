@@ -116,6 +116,10 @@ Speed:
 - `VirtualQuery` results for `MEM_MAPPED` view regions and unmapped holes can be
   cached until map, commit, or title writes (`VICTORY_HOLES_ONCE=1`, off by
   default).
+- Asynchronous GPU submissions can keep running when VRAM card buffers are
+  written (`VICTORY_CARD_FETCH_INFLIGHT=1`, off by default), while texture
+  change detection uses a fast AVX2 128-bit hash (`texture.rs`) and copy-back
+  unchanged checks use AVX2 byte comparisons (`shadow.rs`).
 
 Memory the title shows at several addresses:
 - Every view of a guarded physical page is guarded with it, so a write of

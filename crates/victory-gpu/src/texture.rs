@@ -102,11 +102,140 @@ fn check_gen_digest(
     (last.gen_digest == Some(digest), Some(digest))
 }
 
+/// 128-bit fast content hash for texture change detection and detile caching.
+pub(crate) type TexHash = [u8; 16];
+
+/// Computes a fast 128-bit digest of `bytes` (`fxceless #1395`), using 256-bit
+/// AVX2 lanes when available so per-frame texture hashing avoids `blake3` overhead.
+pub(crate) fn fast_hash_128(bytes: &[u8]) -> TexHash {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *AVX2.get_or_init(|| std::is_x86_feature_detected!("avx2")) {
+            // SAFETY: runtime check verified AVX2 support.
+            return unsafe { fast_hash_128_avx2(bytes) };
+        }
+    }
+    fast_hash_128_scalar(bytes)
+}
+
+#[inline]
+fn mix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^ (x >> 31)
+}
+
+fn fast_hash_128_scalar(bytes: &[u8]) -> TexHash {
+    let mut a = 0x243f_6a88_85a3_08d3u64 ^ (bytes.len() as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut b = 0x1319_8a2e_0370_7344u64 ^ (bytes.len() as u64).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
+    let mut chunks = bytes.chunks_exact(16);
+    for c in &mut chunks {
+        let w0 = u64::from_le_bytes(c[0..8].try_into().unwrap());
+        let w1 = u64::from_le_bytes(c[8..16].try_into().unwrap());
+        a = a.wrapping_add(w0).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(27) ^ b;
+        b = b.wrapping_add(w1).wrapping_mul(0xc2b2_ae3d_27d4_eb4f).rotate_left(31) ^ a;
+    }
+    let tail = chunks.remainder();
+    let mut t0 = 0u64;
+    let mut t1 = 0u64;
+    for (i, &byte) in tail.iter().enumerate() {
+        if i < 8 {
+            t0 |= (byte as u64) << (i * 8);
+        } else {
+            t1 |= (byte as u64) << ((i - 8) * 8);
+        }
+    }
+    a = mix64(a ^ t0 ^ ((tail.len() as u64) << 56));
+    b = mix64(b ^ t1 ^ a);
+    let mut out = [0u8; 16];
+    out[0..8].copy_from_slice(&a.to_le_bytes());
+    out[8..16].copy_from_slice(&b.to_le_bytes());
+    out
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn fast_hash_128_avx2(bytes: &[u8]) -> TexHash {
+    use core::arch::x86_64::{
+        __m256i, _mm256_add_epi64, _mm256_loadu_si256, _mm256_mul_epu32, _mm256_set1_epi64x,
+        _mm256_set_epi64x, _mm256_srli_epi64, _mm256_storeu_si256, _mm256_xor_si256,
+    };
+    let len = bytes.len();
+    let mut acc0 = _mm256_set_epi64x(
+        0x243f_6a88_85a3_08d3_u64 as i64,
+        0x1319_8a2e_0370_7344_u64 as i64,
+        0xa409_3822_299f_31d0_u64 as i64,
+        0x082e_fa98_ec4e_6c89_u64 as i64,
+    );
+    let mut acc1 = _mm256_set1_epi64x((len as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) as i64);
+    let mul = _mm256_set_epi64x(
+        0x9e37_79b1_u64 as i64,
+        0x85eb_ca77_u64 as i64,
+        0xc2b2_ae3d_u64 as i64,
+        0x27d4_eb2f_u64 as i64,
+    );
+    let mut i = 0usize;
+    while i + 64 <= len {
+        // SAFETY: `i + 64 <= len` guarantees both 32-byte unaligned loads stay in bounds.
+        unsafe {
+            let v0 = _mm256_loadu_si256(bytes.as_ptr().add(i).cast::<__m256i>());
+            let v1 = _mm256_loadu_si256(bytes.as_ptr().add(i + 32).cast::<__m256i>());
+            let m0 = _mm256_mul_epu32(_mm256_xor_si256(acc0, v0), mul);
+            let m1 = _mm256_mul_epu32(_mm256_xor_si256(acc1, v1), mul);
+            acc0 = _mm256_add_epi64(_mm256_xor_si256(m0, _mm256_srli_epi64::<29>(acc0)), v1);
+            acc1 = _mm256_add_epi64(_mm256_xor_si256(m1, _mm256_srli_epi64::<31>(acc1)), v0);
+        }
+        i += 64;
+    }
+    while i + 32 <= len {
+        // SAFETY: `i + 32 <= len` keeps the 32-byte unaligned load in bounds.
+        unsafe {
+            let v0 = _mm256_loadu_si256(bytes.as_ptr().add(i).cast::<__m256i>());
+            let m0 = _mm256_mul_epu32(_mm256_xor_si256(acc0, v0), mul);
+            acc0 = _mm256_add_epi64(m0, _mm256_srli_epi64::<27>(acc1));
+            acc1 = _mm256_xor_si256(acc1, v0);
+        }
+        i += 32;
+    }
+    let mut lanes = [0u64; 8];
+    // SAFETY: `lanes` is 64 bytes (`[__m256i; 2]`), aligned or unaligned storeu works safely.
+    unsafe {
+        _mm256_storeu_si256(lanes.as_mut_ptr().cast::<__m256i>(), acc0);
+        _mm256_storeu_si256(lanes.as_mut_ptr().add(4).cast::<__m256i>(), acc1);
+    }
+    let tail = fast_hash_128_scalar(&bytes[i..]);
+    let t0 = u64::from_le_bytes(tail[0..8].try_into().unwrap());
+    let t1 = u64::from_le_bytes(tail[8..16].try_into().unwrap());
+    let a = mix64(
+        lanes[0]
+            ^ lanes[2].rotate_left(17)
+            ^ lanes[4].rotate_left(31)
+            ^ lanes[6].rotate_left(47)
+            ^ t0
+            ^ (len as u64),
+    );
+    let b = mix64(
+        lanes[1]
+            ^ lanes[3].rotate_left(19)
+            ^ lanes[5].rotate_left(37)
+            ^ lanes[7].rotate_left(53)
+            ^ t1
+            ^ a,
+    );
+    let mut out = [0u8; 16];
+    out[0..8].copy_from_slice(&a.to_le_bytes());
+    out[8..16].copy_from_slice(&b.to_le_bytes());
+    out
+}
+
 /// What a texture's staging buffer holds: the hash of the memory detiled
 /// (memory not watched), or the write-watch asking it was detiled after.
 #[derive(Default)]
 struct Last {
-    hash: Option<blake3::Hash>,
+    hash: Option<TexHash>,
     gen_digest: Option<u64>,
     asked: u64,
     /// How often in a row it had not changed, and the frame to look at it
@@ -119,11 +248,11 @@ struct Last {
     /// Number of content changes observed; textures changing >= 2 times with
     /// staging size <= `DETILE_CACHE_MAX_TEX` cache up to 4 detiled snapshots.
     changes: u32,
-    detile_cache: Vec<(blake3::Hash, Vec<u8>)>,
+    detile_cache: Vec<(TexHash, Vec<u8>)>,
 }
 
 impl Last {
-    fn cache_lookup(&mut self, hash: &blake3::Hash) -> Option<&[u8]> {
+    fn cache_lookup(&mut self, hash: &TexHash) -> Option<&[u8]> {
         let pos = self.detile_cache.iter().position(|(h, _)| h == hash)?;
         let last_idx = self.detile_cache.len() - 1;
         if pos != last_idx {
@@ -133,7 +262,7 @@ impl Last {
         self.detile_cache.last().map(|(_, bytes)| bytes.as_slice())
     }
 
-    fn cache_store(&mut self, hash: blake3::Hash, bytes: &[u8]) {
+    fn cache_store(&mut self, hash: TexHash, bytes: &[u8]) {
         if bytes.len() > DETILE_CACHE_MAX_TEX {
             return;
         }
@@ -523,7 +652,7 @@ impl Staging {
         gen_match: bool,
     ) -> (usize, bool) {
         let size = tiled.len();
-        let hash = blake3::hash(tiled);
+        let hash = fast_hash_128(tiled);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexHashed, size as u64);
         if last.hash == Some(hash) {
@@ -769,7 +898,7 @@ pub(crate) mod flips {
         }
     }
 
-    pub(super) fn note(s: &Staging, hash: &blake3::Hash, tiled: &[u8], told: bool, again: bool) {
+    pub(super) fn note(s: &Staging, hash: &TexHash, tiled: &[u8], told: bool, again: bool) {
         let frame = crate::queue::presented();
         let d = &s.layout.desc;
         let key = (
@@ -777,7 +906,7 @@ pub(crate) mod flips {
             [s.layout.size as u32, s.mips, s.footprints.len() as u32, s.skip],
         );
         let mut h = [0u8; 8];
-        h.copy_from_slice(&hash.as_bytes()[..8]);
+        h.copy_from_slice(&hash[..8]);
         let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
         let e = seen.get_or_insert_with(HashMap::new).entry(key).or_default();
         if e.hashes.is_empty() {
@@ -1955,11 +2084,11 @@ mod host_written_tests {
     #[test]
     fn detile_cache_skips_static_hits_oscillating_and_frees_on_drop() {
         let before = DETILE_CACHE_BYTES.load(Ordering::Acquire);
-        let h_a = blake3::hash(b"frame_a");
-        let h_b = blake3::hash(b"frame_b");
-        let h_c = blake3::hash(b"frame_c");
-        let h_d = blake3::hash(b"frame_d");
-        let h_e = blake3::hash(b"frame_e");
+        let h_a = fast_hash_128(b"frame_a");
+        let h_b = fast_hash_128(b"frame_b");
+        let h_c = fast_hash_128(b"frame_c");
+        let h_d = fast_hash_128(b"frame_d");
+        let h_e = fast_hash_128(b"frame_e");
         let mut last = Last::default();
 
         // First change is treated as static: not cached.
@@ -1985,5 +2114,21 @@ mod host_written_tests {
 
         drop(last);
         assert_eq!(DETILE_CACHE_BYTES.load(Ordering::Acquire), before);
+    }
+
+    #[test]
+    fn fast_texture_hash_is_deterministic_and_sensitive_to_edits_and_lengths() {
+        assert_eq!(fast_hash_128(&[]), fast_hash_128(&[]));
+        assert_ne!(fast_hash_128(&[]), fast_hash_128(&[0u8]));
+        for len in [1usize, 15, 16, 31, 32, 63, 64, 95, 96, 129, 513] {
+            let mut buf: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(37) ^ 0x5a) as u8).collect();
+            let h1 = fast_hash_128(&buf);
+            assert_eq!(h1, fast_hash_128(&buf));
+            let pos = len / 2;
+            buf[pos] ^= 1;
+            assert_ne!(h1, fast_hash_128(&buf), "bit flip at {pos} for len {len}");
+            buf.push(0);
+            assert_ne!(h1, fast_hash_128(&buf), "appended zero must alter digest for len {len}");
+        }
     }
 }

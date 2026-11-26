@@ -106,7 +106,7 @@ impl UnchangedPages {
         if *unchanged {
             return false;
         }
-        if current != before {
+        if !slices_equal(current, before) {
             return true;
         }
         // A later range can touch bytes a partial comparison missed. At
@@ -2773,7 +2773,7 @@ impl Shadow {
                 let old = unsafe { std::slice::from_raw_parts_mut(old as *mut u8, n) };
                 #[cfg(feature = "diagnostics")]
                 SPARSE_WRITES[3].fetch_add(n as u64, Ordering::Relaxed);
-                if host == old {
+                if slices_equal(host, old) {
                     continue;
                 }
                 #[cfg(feature = "diagnostics")]
@@ -2832,6 +2832,76 @@ fn merge_gpu_writes_mut(
         return unsafe { merge_gpu_writes_mut_avx2(title, host, old) };
     }
     merge_gpu_writes_mut_scalar(title, host, old)
+}
+
+/// Compares two byte slices for equality using 32-byte AVX2 comparisons when
+/// available so `UnchangedPages::differs` and `sparse_back` avoid external C
+/// `memcmp` calls across Wine.
+#[inline]
+fn slices_equal(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if use_avx2_merge() {
+        // SAFETY: `use_avx2_merge()` verified runtime AVX2 support.
+        return unsafe { slices_equal_avx2(a, b) };
+    }
+    a == b
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn slices_equal_avx2(a: &[u8], b: &[u8]) -> bool {
+    use core::arch::x86_64::{
+        __m256i, _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+    };
+    let n = a.len();
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+    let mut i = 0usize;
+    while i + 128 <= n {
+        // SAFETY: `i + 128 <= n` bounds all four 32-byte unaligned loads in both slices.
+        let same = unsafe {
+            let eq0 = _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(pa.add(i).cast::<__m256i>()),
+                _mm256_loadu_si256(pb.add(i).cast::<__m256i>()),
+            );
+            let eq1 = _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(pa.add(i + 32).cast::<__m256i>()),
+                _mm256_loadu_si256(pb.add(i + 32).cast::<__m256i>()),
+            );
+            let eq2 = _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(pa.add(i + 64).cast::<__m256i>()),
+                _mm256_loadu_si256(pb.add(i + 64).cast::<__m256i>()),
+            );
+            let eq3 = _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(pa.add(i + 96).cast::<__m256i>()),
+                _mm256_loadu_si256(pb.add(i + 96).cast::<__m256i>()),
+            );
+            let combined = _mm256_and_si256(_mm256_and_si256(eq0, eq1), _mm256_and_si256(eq2, eq3));
+            _mm256_movemask_epi8(combined) == -1i32
+        };
+        if !same {
+            return false;
+        }
+        i += 128;
+    }
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` keeps both 32-byte unaligned loads in bounds.
+        let same = unsafe {
+            let eq = _mm256_cmpeq_epi8(
+                _mm256_loadu_si256(pa.add(i).cast::<__m256i>()),
+                _mm256_loadu_si256(pb.add(i).cast::<__m256i>()),
+            );
+            _mm256_movemask_epi8(eq) == -1i32
+        };
+        if !same {
+            return false;
+        }
+        i += 32;
+    }
+    a[i..] == b[i..]
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -4534,8 +4604,31 @@ mod find_cache_tests {
                         };
                         assert_eq!(res_a, res_s, "card mismatch offset={offset} n={n}");
                         assert_eq!(c_title_b, c_title_a);
-                        assert_eq!(c_old_b, c_old_a);
+        assert_eq!(
+            c_old_b, c_old_a
+        );
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn avx2_slices_equal_matches_scalar_for_unaligned_and_short_inputs() {
+        for offset in 0..7usize {
+            for n in [0usize, 1, 7, 16, 31, 32, 33, 127, 128, 129, 255, 513] {
+                let mut a = vec![0x3Cu8; offset + n + 8];
+                let mut b = a.clone();
+                assert_eq!(
+                    super::slices_equal(&a[offset..offset + n], &b[offset..offset + n]),
+                    a[offset..offset + n] == b[offset..offset + n]
+                );
+                if n > 0 {
+                    b[offset + n - 1] ^= 0x80;
+                    assert!(!super::slices_equal(&a[offset..offset + n], &b[offset..offset + n]));
+                    b[offset + n - 1] ^= 0x80;
+                    b[offset] ^= 1;
+                    assert!(!super::slices_equal(&a[offset..offset + n], &b[offset..offset + n]));
                 }
             }
         }
