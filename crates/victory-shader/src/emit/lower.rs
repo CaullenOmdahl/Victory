@@ -6,7 +6,8 @@
 //! emitter cannot express is `Missing` with a reason, and only fails the
 //! program when something with an effect (an export, a branch) needs it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
+use crate::hash::{HashMap, HashSet};
 
 use super::UserData;
 use super::bitcode::{Attr, Bin, Cast, Rmw, Term, V, pred};
@@ -196,7 +197,7 @@ const UNTRACKED_SELECT: Why = "a select on an untracked mask";
 
 /// Semantic key `(UPPERCASE_NAME, index)` -> 4-bit absolute channel mask of
 /// arbitrary (`kind == 0`) inputs read by the paired pixel shader.
-pub(crate) type KeptOutputs = HashMap<(String, u32), u8>;
+pub(crate) type KeptOutputs = std::collections::HashMap<(String, u32), u8>;
 
 /// Keeps only arbitrary (`kind == 0`) signature elements whose semantic has at
 /// least one channel read in `keep`, trimming unread leading and trailing
@@ -244,7 +245,7 @@ pub(crate) fn lower_pruned(
 /// Whether [`lower`] can ask for the console flow ([`CONSOLE_FLOW`]) for
 /// `parts`: with numeric selects, which ask for it in more programs.
 pub(crate) fn wants_console_flow(parts: &Parts) -> bool {
-    Lower::new(parts, &HashMap::new(), true, None).wants_console_flow
+    Lower::new(parts, &HashMap::default(), true, None).wants_console_flow
 }
 
 fn lower_program(
@@ -252,7 +253,7 @@ fn lower_program(
     numeric_selects: bool,
     keep: Option<&KeptOutputs>,
 ) -> Result<Lowered, ShaderError> {
-    let mut bad = HashMap::new();
+    let mut bad = HashMap::default();
     loop {
         match Lower::new(parts, &bad, numeric_selects, keep).run() {
             Ok(l) => return Ok(l),
@@ -306,13 +307,13 @@ fn scratch_width(rest: &str) -> Option<u32> {
 /// scratch accesses can reach where the code computing their addresses
 /// bounds them, else [`SCRATCH_CAP`]; at most [`SCRATCH_MAX`].
 fn scratch_bytes(p: &Program) -> u32 {
-    let mut defs = HashMap::new();
+    let mut defs = HashMap::default();
     for i in p.blocks.iter().flat_map(|b| &b.insts) {
         for &(_, v) in &i.writes {
             defs.insert(v, i);
         }
     }
-    let mut memo = HashMap::new();
+    let mut memo = HashMap::default();
     let mut end = 0u64;
     for i in p.blocks.iter().flat_map(|b| &b.insts) {
         let name = i.name();
@@ -541,7 +542,7 @@ struct Lower<'a> {
     x: &'a Parts<'a>,
     /// SGPR spills to VGPR lanes and their reloads that nothing reads any
     /// more (see [`crate::sgpr_spill`]): not lowered.
-    dead: HashSet<Site>,
+    dead: std::collections::HashSet<Site>,
     bad: &'a HashMap<Value, Why>,
     lane_fail: FxMap<Value, Why>,
     vals: DenseMap<Val>,
@@ -1027,7 +1028,7 @@ fn half_outputs(io: &StageIo, outputs: &[SigElement]) -> HashMap<u8, (bool, Opti
     let entries = match io {
         StageIo::Vs { outputs, .. } => outputs,
         StageIo::Ms(ms) => &ms.outputs,
-        _ => return HashMap::new(),
+        _ => return HashMap::default(),
     };
     let per_vertex = || entries.iter().filter(|o| o.param & 0x80 == 0);
     let mut free: Vec<u8> = outputs
@@ -1103,12 +1104,12 @@ fn half_inputs(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, (bool, Option
         inputs: entries, ..
     } = io
     else {
-        return HashMap::new();
+        return HashMap::default();
     };
     // Keep the first fp16 entry per row (matching the previous `.find()`
     // behaviour) so duplicate rows neither overwrite earlier ones nor consume
     // an extra free partner row.
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     let mut halves: Vec<_> = entries
         .iter()
         .filter(|i| i.fp16 && seen.insert(i.row))
@@ -1130,7 +1131,7 @@ fn half_inputs(io: &StageIo, inputs: &[SigElement]) -> HashMap<u8, (bool, Option
         .collect();
     free.sort_unstable();
     free.dedup();
-    let mut out = HashMap::with_capacity(halves.len());
+    let mut out = HashMap::with_capacity_and_hasher(halves.len(), Default::default());
     for (idx, i) in halves.iter().enumerate() {
         let next_fp16 = halves.get(idx + 1).map_or(u8::MAX, |n| n.row);
         // Only take a fallback partner before the next fp16 input row so an
@@ -1178,7 +1179,7 @@ fn half_input_spills(
         .collect();
     rows.sort_by_key(|&(a, _)| a);
     let mut pending: Vec<(u8, u8, u8)> = Vec::new();
-    let mut out = HashMap::new();
+    let mut out = HashMap::default();
     for (a, b) in rows {
         let mut elems_a = row_elems(a);
         let dwords_b: u8 = b
@@ -1256,6 +1257,31 @@ impl SubDword {
             signed,
             d16,
         })
+    }
+}
+
+/// Where a program's constant table starts in its code: where its
+/// instructions end, unless a load at a fixed offset reads below that (then
+/// at `lowest`, the lowest offset any load or descriptor names).
+fn code_table_start(
+    p: &crate::ir::Program,
+    addresses: &[&crate::resource::Address],
+    lowest: u32,
+) -> u32 {
+    let code_end = p
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .map(|i| i.machine.offset + 4 * i.machine.words.len())
+        .max()
+        .unwrap_or(0) as u32;
+    let fixed_below = addresses
+        .iter()
+        .any(|a| !a.includes_base && a.dynamic.is_none() && a.offset < code_end);
+    if fixed_below {
+        lowest
+    } else {
+        lowest.max(code_end & !3)
     }
 }
 
@@ -1579,10 +1605,10 @@ impl<'a> Lower<'a> {
             made: Default::default(),
             code_table: None,
             scratch: None,
-            counters: HashMap::new(),
-            loop_exits: HashMap::new(),
-            loop_bodies: HashMap::new(),
-            finals: HashMap::new(),
+            counters: HashMap::default(),
+            loop_exits: HashMap::default(),
+            loop_bodies: HashMap::default(),
+            finals: HashMap::default(),
             abort: None,
             lane_paths: Vec::new(),
             pending_paths: Vec::new(),
@@ -1600,22 +1626,26 @@ impl<'a> Lower<'a> {
         let (g, base, len) = match self.code_table {
             Some(t) => t,
             None => {
-                let first = self
+                let addresses: Vec<&crate::resource::Address> = self
                     .x
                     .res
                     .scalar
                     .iter()
-                    .map(|s| s.1)
+                    .map(|s| &s.1)
                     .chain(self.x.res.descriptors.iter().flat_map(|d| {
                         d.source.leaves().into_iter().filter_map(|l| match l {
-                            Source::Built { address, .. } => Some(*address),
+                            Source::Built { address, .. } => Some(address),
                             _ => None,
                         })
                     }))
                     .filter(|a| a.param == CODE)
+                    .collect();
+                let lowest = addresses
+                    .iter()
                     .map(|a| if a.includes_base { 0 } else { a.offset & !3 })
                     .min()
                     .ok_or("a code table")?;
+                let first = code_table_start(self.x.p, &addresses, lowest);
                 let code = &self.x.native.code;
                 let words: Vec<u32> = code
                     .get(first as usize..)
@@ -1880,7 +1910,7 @@ impl<'a> Lower<'a> {
     /// Finds the whole-wave sections and the values they leave.
     fn find_sections(&mut self) {
         let p = self.x.p;
-        let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::new();
+        let mut inside: HashMap<Value, (usize, usize, usize)> = HashMap::default();
         for b in 0..p.blocks.len() {
             let found = super::wave::sections(p, b);
             for (&start, sec) in &found {
@@ -6365,7 +6395,7 @@ impl<'a> Lower<'a> {
             }
             return out;
         }
-        let mut rows: HashMap<u32, V> = HashMap::new();
+        let mut rows: HashMap<u32, V> = HashMap::default();
         for k in 0..count {
             let x = match constant {
                 Some(base) => {
@@ -13091,7 +13121,7 @@ impl<'a> Lower<'a> {
         let mut headers: Vec<usize> = self.counters.keys().copied().collect();
         headers.sort_unstable();
         for h in headers {
-            let mut body: HashSet<usize> = HashSet::from([h]);
+            let mut body: HashSet<usize> = [h].into_iter().collect();
             let mut work: Vec<usize> = p.blocks[h]
                 .preds
                 .iter()
@@ -13139,7 +13169,7 @@ impl<'a> Lower<'a> {
                 // Listed without values: the exit joins nothing either.
                 self.loop_exits.entry(e).or_default();
             } else if let Some(e) = single {
-                let mut written = HashSet::new();
+                let mut written = HashSet::default();
                 for &b in &body {
                     let block = &p.blocks[b];
                     let phis = block.phis.iter().map(|phi| (phi.reg, phi.value));
@@ -13151,7 +13181,7 @@ impl<'a> Lower<'a> {
                     );
                 }
                 let mut after = Vec::new();
-                let mut seen = HashSet::new();
+                let mut seen = HashSet::default();
                 for (b, block) in p.blocks.iter().enumerate() {
                     if body.contains(&b) || !reachable(self, b) {
                         continue;
@@ -13969,13 +13999,37 @@ fn interp_mode(kind: Barycentric) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::super::container::SigElement;
-    use super::{Lowered, Numeric, Parts, SubDword, buffer_format, half_shift, inline_f16, lower};
+    use super::{
+        Lowered, Numeric, Parts, SubDword, buffer_format, code_table_start, half_shift, inline_f16,
+        lower,
+    };
     use crate::native::{
         ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
     };
     use crate::{ShaderError, io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
+
+    /// A program's constant table starts after its instructions, unless a
+    /// load at a fixed offset reads below that.
+    #[test]
+    fn the_code_table_starts_after_the_instructions() {
+        let mut words = vec![0xBF80_0000, S_ENDPGM];
+        words.extend(0..1000u32);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, false, 256).unwrap();
+        let at = |offset: u32, dynamic: bool| resource::Address {
+            param: resource::CODE,
+            offset,
+            dynamic: dynamic.then_some(ir::Value(0)),
+            includes_base: false,
+        };
+        let (computed, fixed_after, fixed_inside) = (at(0, true), at(12, false), at(4, false));
+        assert_eq!(code_table_start(&p, &[&computed], 0), 8);
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_after], 0), 8);
+        assert_eq!(code_table_start(&p, &[&computed, &fixed_inside], 0), 0);
+        assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
+    }
 
     /// Mesh output size as the validator counts it (53 programs were over
     /// the limit; they now fail as unsupported).
@@ -15317,7 +15371,7 @@ mod tests {
             console_cf: false,
             per_lane_only: false,
         };
-        let bad = HashMap::new();
+        let bad = HashMap::default();
         let mut l = super::Lower::new(&parts, &bad, false, None);
         assert!(l.lower_ir().is_ok());
         assert_eq!(l.mask_data, super::MaskData::Host);

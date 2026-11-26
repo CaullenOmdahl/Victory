@@ -16,8 +16,7 @@
 //! their side effects are dropped too, and what they compute is only read
 //! through derivatives.
 
-use std::collections::{HashMap, HashSet};
-use std::hash::{BuildHasherDefault, Hasher};
+use crate::hash::{HashMap, HashSet};
 
 use crate::ShaderError;
 use crate::gfx10::{Fields, NULL, Operand};
@@ -68,8 +67,8 @@ pub struct Bools {
 }
 
 /// The tables below have small integer keys; SipHash dominated run time.
-type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
-type Set<K> = HashSet<K, BuildHasherDefault<Fx>>;
+type Map<K, V> = HashMap<K, V>;
+type Set<K> = HashSet<K>;
 
 /// A set of what a walk has met: a list scan while it is small (most lane
 /// masks are a handful of nodes), a hash set once it grows.
@@ -103,34 +102,6 @@ impl<T: Copy + Eq + std::hash::Hash> Seen<T> {
             self.set.extend(self.list.drain(..));
         }
         self.set.insert(x)
-    }
-}
-
-/// FxHash's multiply-rotate step.
-#[derive(Default)]
-pub(crate) struct Fx(u64);
-
-impl Hasher for Fx {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            self.write_u64(u64::from(b));
-        }
-    }
-
-    fn write_u32(&mut self, n: u32) {
-        self.write_u64(u64::from(n));
-    }
-
-    fn write_u64(&mut self, n: u64) {
-        self.0 = (self.0.rotate_left(5) ^ n).wrapping_mul(0x517c_c1b7_2722_0a95);
-    }
-
-    fn write_usize(&mut self, n: usize) {
-        self.write_u64(n as u64);
     }
 }
 
@@ -547,16 +518,16 @@ impl<'a> Lanes<'a> {
             incoming,
             defs,
             phis,
-            unresolved: HashSet::new(),
+            unresolved: HashSet::default(),
             b: Bools::new(),
             masks: Map::default(),
             other: Map::default(),
-            select_masks: HashMap::new(),
+            select_masks: HashMap::default(),
             scc_lane: Map::default(),
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
-            active: HashSet::new(),
+            active: HashSet::default(),
         })
     }
 

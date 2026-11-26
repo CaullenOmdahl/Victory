@@ -5,7 +5,8 @@
 //! it is written: functions, then constants (all at module level), then the
 //! instructions of `main` in block order.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
+use crate::hash::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct Ty(u32);

@@ -1,12 +1,10 @@
-use std::collections::{HashMap, HashSet};
-use std::hash::BuildHasherDefault;
 use std::ops::Index;
 
+use crate::hash::{HashMap, HashSet};
 use crate::ir::{Program, Value};
-use crate::structure::Fx;
 
-pub(super) type FxMap<K, V> = HashMap<K, V, BuildHasherDefault<Fx>>;
-pub(super) type FxSet<T> = HashSet<T, BuildHasherDefault<Fx>>;
+pub(super) type FxMap<K, V> = HashMap<K, V>;
+pub(super) type FxSet<T> = HashSet<T>;
 
 /// Dense table keyed by [`Value`], avoiding per-operand hashing in [`super::Lower`].
 pub(super) struct DenseMap<T> {
