@@ -356,7 +356,7 @@ pub(crate) struct TableLayout {
 }
 
 impl TableLayout {
-    fn build(used: &[UsedResource]) -> Vec<Self> {
+    pub(crate) fn build(used: &[UsedResource]) -> Vec<Self> {
         let mut by_slot = std::collections::BTreeMap::<u8, Vec<UsedResource>>::new();
         for &entry in used.iter().filter(|u| u.root == RootType::Table) {
             by_slot.entry(entry.slot).or_default().push(entry);

@@ -918,9 +918,14 @@ impl State {
             let writes = p.stages.iter().any(|s| s.translated().writes_memory);
             list.defer_bindless(&host_heap, writes);
         }
+        let spans = if p.stages.len() > 1 && table_stages() {
+            stage_spans(p)
+        } else {
+            Vec::new()
+        };
         for stage in &p.stages {
             let t = stage.translated();
-            if !self.tables(list, &t.used, &stage.tables, compute) {
+            if !self.tables(list, &t.used, &stage.tables, compute, &spans) {
                 return no("a table not made");
             }
             if let Some((param, dwords)) = stage.user_data {
@@ -1301,6 +1306,7 @@ impl State {
         used: &[UsedResource],
         layouts: &[TableLayout],
         compute: bool,
+        spans: &[(u8, u32, u32)],
     ) -> bool {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
         // Taken out so `self` stays free to borrow; a draw dropped below
@@ -1357,7 +1363,17 @@ impl State {
             let Some(host) = heap.host() else {
                 continue;
             };
-            let n = layout.records.last().map_or(0, |&(r, _)| r) + 1;
+            let mut n = layout.records.last().map_or(0, |&(r, _)| r) + 1;
+            if let Some(&(_, with_fresh, all)) = spans.iter().find(|s| s.0 == slot) {
+                let last_all = table + u64::from(all - 1) * 32;
+                let past = heap.index(last_all).is_some_and(|at| at >= host.count());
+                let target = if past { all } else { with_fresh };
+                if target > n
+                    && heap.index(table + u64::from(target - 1) * 32).is_some()
+                {
+                    n = target;
+                }
+            }
             let last = table + u64::from(n - 1) * 32;
             // Shaders read such a table to many lengths, and a copy for each
             // ran out of slots: the longest seen serves all.
@@ -2408,5 +2424,125 @@ mod null_root_tests {
         note_null_root("test", 3, Some(0x1234));
         note_null_root("test", 3, None);
         assert_eq!(NULL_ROOTS.load(Ordering::Relaxed), before + 2);
+    }
+}
+
+/// Whether the stages of one draw share a dynamic table they both read
+/// (`VICTORY_TABLE_STAGES=0` disables; enabled by default).
+fn table_stages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_STAGES").is_none_or(|v| v != "0"))
+}
+
+/// Per root table parameter read by the stages of `p`, the slot count
+/// up to the last entry read by any stage that forces fresh dynamic slots
+/// (`Cbv | Srv`), and up to the last entry read by any stage:
+/// `(root_slot, with_fresh, all)`.
+fn stage_spans(p: &HostPipeline) -> Vec<(u8, u32, u32)> {
+    stage_spans_from(p.stages.iter().map(|s| s.translated().used.as_slice()))
+}
+
+fn stage_spans_from<'a>(
+    stages: impl IntoIterator<Item = &'a [UsedResource]>,
+) -> Vec<(u8, u32, u32)> {
+    let mut spans: Vec<(u8, u32, u32)> = Vec::new();
+    for used in stages {
+        let mut fresh_slot = [false; 256];
+        for u in used.iter().filter(|u| {
+            u.root == RootType::Table && matches!(u.kind, ResourceType::Cbv | ResourceType::Srv)
+        }) {
+            fresh_slot[usize::from(u.slot)] = true;
+        }
+        for u in used.iter().filter(|u| u.root == RootType::Table) {
+            let n = u.table_offset_dwords / 8 + 1;
+            let with = if fresh_slot[usize::from(u.slot)] { n } else { 0 };
+            match spans.iter_mut().find(|s| s.0 == u.slot) {
+                Some(s) => {
+                    s.1 = s.1.max(with);
+                    s.2 = s.2.max(n);
+                }
+                None => spans.push((u.slot, with, n)),
+            }
+        }
+    }
+    spans
+}
+
+#[cfg(test)]
+mod table_stage_tests {
+    use super::*;
+    use crate::pipeline::host::TableLayout;
+
+    fn used_table(slot: u8, record: u32, kind: ResourceType) -> UsedResource {
+        UsedResource {
+            kind,
+            root: RootType::Table,
+            slot,
+            table_offset_dwords: record * 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+        }
+    }
+
+    #[test]
+    fn stage_spans_combines_fresh_and_all_extents() {
+        let stage0 = vec![
+            used_table(1, 2, ResourceType::Cbv),
+            used_table(2, 1, ResourceType::Uav),
+        ];
+        let stage1 = vec![
+            used_table(1, 5, ResourceType::Srv),
+            used_table(2, 4, ResourceType::Uav),
+        ];
+        assert_eq!(
+            stage_spans_from([stage0.as_slice(), stage1.as_slice()]),
+            vec![(1, 6, 6), (2, 0, 5)]
+        );
+    }
+
+    #[test]
+    fn two_stages_reading_different_depths_share_one_fresh_table() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().unwrap();
+        let stage0 = vec![used_table(0, 1, ResourceType::Cbv)];
+        let stage1 = vec![used_table(0, 4, ResourceType::Srv)];
+        let layouts0 = TableLayout::build(&stage0);
+        let layouts1 = TableLayout::build(&stage1);
+        let spans = stage_spans_from([stage0.as_slice(), stage1.as_slice()]);
+
+        #[repr(C)]
+        struct Args([u32; 4], [u64; 2]);
+        let args = Args([0, 64, 1, 0], [0, 0]);
+        let mut title_heap = std::ptr::null();
+        let heap_iid = windows::Win32::Graphics::Direct3D12::ID3D12DescriptorHeap::IID;
+        assert_eq!(
+            crate::descriptor::create_heap(
+                std::ptr::null(),
+                args.0.as_ptr().cast(),
+                (&raw const heap_iid).cast::<crate::object::Iid>(),
+                &mut title_heap,
+            ),
+            windows_sys::Win32::Foundation::S_OK
+        );
+        let base = crate::object::slot::<extern "system" fn(This) -> u64>(title_heap, 0x48)(
+            title_heap,
+        );
+
+        let mut state = State::default();
+        state.heaps = [title_heap as usize, 0];
+        state.graphics = vec![Root::Table(base)];
+        assert!(state.tables(&list, &stage0, &layouts0, false, &spans));
+        let first_made = state.made.clone();
+        assert!(state.tables(&list, &stage1, &layouts1, false, &spans));
+        assert_eq!(state.made, first_made);
+        assert_eq!(state.dynamic.len(), 1);
+        assert_eq!(state.dynamic[0].2, 5);
+        drop(state);
+        crate::object::slot::<extern "system" fn(This) -> u32>(title_heap, 0x10)(title_heap);
+        list.close();
     }
 }
