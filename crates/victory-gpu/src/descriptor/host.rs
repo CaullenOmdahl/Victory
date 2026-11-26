@@ -3174,6 +3174,7 @@ fn buffer_srv(
         return None;
     }
     let size = if buffer.StructureByteStride > 0 { u64::from(buffer.StructureByteStride) } else { element_size_of(buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, element) };
+    clamp_buffer_elements(&shadow, buffer.FirstElement, &mut buffer.NumElements, size);
     if !fits_buffer(&shadow, buffer.FirstElement, buffer.NumElements, size) {
         return None;
     }
@@ -3188,6 +3189,32 @@ fn buffer_srv(
 
 fn element_size_of(raw: bool, element: u64) -> u64 {
     if raw { 4 } else { element }
+}
+
+/// Clamps a trailing buffer view's element count to stay inside `shadow.buffer`
+/// when at least one element fits at `first`, avoiding driver-refused views.
+fn clamp_buffer_elements(shadow: &crate::shadow::Shadow, first: u64, count: &mut u32, size: u64) {
+    if size == 0 || *count == 0 {
+        return;
+    }
+    // SAFETY: a live buffer.
+    let width = unsafe { shadow.buffer.GetDesc() }.Width;
+    if let Some(start) = first.checked_mul(size)
+        && let Some(left) = width.checked_sub(start)
+    {
+        let max_elems = (left / size).min(u64::from(u32::MAX)) as u32;
+        if *count > max_elems && max_elems > 0 {
+            let count_before = *count;
+            once!(
+                first,
+                count_before,
+                max_elems,
+                width,
+                "buffer view clamped to its host copy"
+            );
+            *count = max_elems;
+        }
+    }
 }
 
 /// Whether a view of `count` elements of `size` bytes from `first` on lies in
@@ -3274,6 +3301,7 @@ fn buffer_uav(
         return None;
     }
     let size = if buffer.StructureByteStride > 0 { u64::from(buffer.StructureByteStride) } else { element_size_of(buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, element) };
+    clamp_buffer_elements(&shadow, buffer.FirstElement, &mut buffer.NumElements, size);
     if !fits_buffer(&shadow, buffer.FirstElement, buffer.NumElements, size) {
         return None;
     }
@@ -4685,5 +4713,40 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(largest_mip_of(&resource, &desc), 3);
         resource[12] = 1; // Render target: never skip mips
         assert_eq!(largest_mip_of(&resource, &desc), 0);
+    }
+
+    #[test]
+    fn buffer_srv_clamps_trailing_elements_to_host_copy() {
+        let Some(host) = host() else {
+            return;
+        };
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_UNKNOWN,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            ..Default::default()
+        };
+        let mut buf: Option<ID3D12Resource> = None;
+        // SAFETY: plain default-heap buffer creation on test device.
+        unsafe {
+            host.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buf)
+        }
+        .unwrap();
+        let width = unsafe { buf.as_ref().unwrap().GetDesc() }.Width;
+        assert_eq!(width, 256);
+        let max_elems = ((256u64 - 16 * 4) / 4).min(u64::from(u32::MAX)) as u32;
+        assert_eq!(max_elems, 48);
+        let fits_after = 16u64.checked_add(u64::from(max_elems)).and_then(|n| n.checked_mul(4));
+        assert_eq!(fits_after, Some(256));
     }
 }
