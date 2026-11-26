@@ -707,6 +707,38 @@ fn any_mapped(at: *const u8, len: usize) -> bool {
     false
 }
 
+/// Whether a texture in `layout` at `memory` has a base pipe/bank XOR. In an
+/// XOR layout the GPU takes one from base-address bits 8-15 of the
+/// texture's descriptor (`va |= tile_swizzle << 8`). The render-target XOR
+/// tables assume none, so they hold only on a 64 KiB boundary.
+fn pipe_bank_xor(memory: *const u8, layout: &victory_formats::texture::Layout) -> bool {
+    layout.desc.swizzle.xor() && memory as usize & 0xFFFF != 0
+}
+
+/// The first mip level a shader view (its words as the title writes them)
+/// can read: its most detailed level, or a later one where its minimum
+/// level-of-detail clamp is past it. 0 for a view of the resource as a
+/// whole and for buffers.
+pub(crate) fn first_level(view: Option<&[u32; 10]>) -> u32 {
+    let Some(w) = view else {
+        return 0;
+    };
+    let clamp = match w[1] {
+        2 | 8 | 9 => w[6], // 1D, 3D, cube
+        4 => w[7],         // 2D
+        3 | 10 => w[8],    // 1D array, cube array
+        5 => w[9],         // 2D array
+        _ => return 0,
+    };
+    let clamp = f32::from_bits(clamp);
+    let clamp = if clamp.is_finite() && clamp > 0.0 {
+        clamp as u32
+    } else {
+        0
+    };
+    w[4].max(clamp)
+}
+
 /// The staging state of a title texture, made on first use.
 fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
@@ -725,8 +757,16 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         );
         return None;
     };
-    if layout.desc.swizzle.xor() {
+    if !layout.addressable() {
         once!(?desc, "texture contents in an XOR mode not uploaded");
+        return None;
+    }
+    if pipe_bank_xor(memory, &layout) {
+        once!(
+            ?desc,
+            ?memory,
+            "texture contents in an XOR mode with a base pipe/bank XOR not uploaded"
+        );
         return None;
     }
     let host = host()?;
@@ -825,6 +865,133 @@ mod tests {
 
     const SHADER_RESOURCE: u32 = (D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0
         | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0) as u32;
+
+    #[test]
+    fn a_render_target_xor_texture_is_staged() {
+        let Some(host) = host() else {
+            eprintln!("no host device; skipped");
+            return;
+        };
+        let layout = victory_formats::texture::Layout::new(&victory_formats::texture::Desc {
+            dimension: Dimension::Tex2d,
+            width: 256,
+            height: 256,
+            depth: 1,
+            mips: 1,
+            element_bytes: 4,
+            block: 1,
+            samples: 1,
+            swizzle: Swizzle::SW_64KB_R_X,
+        })
+        .unwrap();
+        assert!(layout.addressable());
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT,
+            ..Default::default()
+        };
+        let d = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            Width: 256,
+            Height: 256,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            ..Default::default()
+        };
+        let mut resource: Option<ID3D12Resource> = None;
+        // SAFETY: plain default-heap 2D texture creation on our test device.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &d,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut resource,
+            )
+        }
+        .unwrap();
+        let resource = resource.unwrap();
+        let memory: Vec<u8> = (0..layout.size as usize)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect();
+        let staging = create_staging(
+            host,
+            None,
+            1,
+            std::ptr::null(),
+            &resource,
+            layout,
+            memory.as_ptr(),
+        )
+        .expect("staged");
+        assert_eq!(staging.refresh_now().1, true);
+        let footprint = staging.footprints[0];
+        let rows = staging.rows[0];
+        let pitch = footprint.Footprint.RowPitch as usize;
+        let mut want = vec![0; pitch * rows as usize];
+        let len = want.len();
+        staging
+            .layout
+            .detile(&memory, 0, 0, &mut want, pitch, len)
+            .unwrap();
+        for row in 0..rows as usize {
+            // SAFETY: persistent upload/pool staging slice for subresource 0.
+            let got = unsafe {
+                std::slice::from_raw_parts(
+                    staging.data.add(footprint.Offset as usize + row * pitch),
+                    256 * 4,
+                )
+            };
+            assert_eq!(got, &want[row * pitch..][..256 * 4], "row {row}");
+        }
+    }
+
+    #[test]
+    fn a_base_pipe_bank_xor_is_refused() {
+        let layout = |swizzle| {
+            victory_formats::texture::Layout::new(&victory_formats::texture::Desc {
+                dimension: Dimension::Tex2d,
+                width: 256,
+                height: 256,
+                depth: 1,
+                mips: 1,
+                element_bytes: 4,
+                block: 1,
+                samples: 1,
+                swizzle,
+            })
+            .unwrap()
+        };
+        let (xor, linear) = (layout(Swizzle::SW_64KB_R_X), layout(Swizzle::LINEAR));
+        let at = |address: usize| address as *const u8;
+        assert!(!pipe_bank_xor(at(0x3_0000), &xor));
+        assert!(pipe_bank_xor(at(0x3_0100), &xor));
+        assert!(pipe_bank_xor(at(0x3_8000), &xor));
+        assert!(!pipe_bank_xor(at(0x3_0100), &linear));
+    }
+
+    #[test]
+    fn views_name_their_first_level() {
+        let view = |dimension: u32, most_detailed: u32, clamp_at: usize, clamp: f32| {
+            let mut w = [0u32; 10];
+            (w[1], w[4]) = (dimension, most_detailed);
+            w[clamp_at] = clamp.to_bits();
+            w
+        };
+        assert_eq!(first_level(None), 0);
+        assert_eq!(first_level(Some(&view(4, 3, 7, 0.0))), 3);
+        assert_eq!(first_level(Some(&view(4, 0, 7, 2.5))), 2);
+        assert_eq!(first_level(Some(&view(4, 4, 7, 2.0))), 4);
+        assert_eq!(first_level(Some(&view(9, 0, 6, 5.0))), 5);
+        assert_eq!(first_level(Some(&view(5, 0, 9, 1.0))), 1);
+        assert_eq!(first_level(Some(&view(4, 0, 7, f32::NAN))), 0);
+        assert_eq!(first_level(Some(&view(1, 9, 7, 0.0))), 0);
+    }
 
     fn make_rgba_texture(host: &Host, width: u32, height: u32) -> (Arc<HostTexture>, Texture) {
         let layout_tex = Texture::new(&TextureDesc {

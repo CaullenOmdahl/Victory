@@ -168,6 +168,20 @@ pub(crate) fn detile(
         copy_linear_detile(&plan, tiled, linear);
         return Ok(());
     }
+    if layout.desc.swizzle == Swizzle::SW_64KB_R_X {
+        let m = plan.mip_info;
+        let step = 16 / plan.element_bytes;
+        for y in 0..m.height {
+            for x in (0..m.width).step_by(step) {
+                let at = x as usize * plan.element_bytes;
+                let len = 16.min(plan.row_bytes - at);
+                let src = layout.render_xor_offset(&m, x, y) as usize;
+                let dst = y as usize * plan.row_pitch + at;
+                linear[dst..][..len].copy_from_slice(&tiled[src..][..len]);
+            }
+        }
+        return Ok(());
+    }
     if layout.thick {
         copy_thick_detile(&plan, tiled, linear);
         return Ok(());
@@ -207,6 +221,20 @@ pub(crate) fn tile(
     )?;
     if layout.desc.swizzle == Swizzle::LINEAR {
         copy_linear_tile(&plan, tiled, linear);
+        return Ok(());
+    }
+    if layout.desc.swizzle == Swizzle::SW_64KB_R_X {
+        let m = plan.mip_info;
+        let step = 16 / plan.element_bytes;
+        for y in 0..m.height {
+            for x in (0..m.width).step_by(step) {
+                let at = x as usize * plan.element_bytes;
+                let len = 16.min(plan.row_bytes - at);
+                let dst = layout.render_xor_offset(&m, x, y) as usize;
+                let src = y as usize * plan.row_pitch + at;
+                tiled[dst..][..len].copy_from_slice(&linear[src..][..len]);
+            }
+        }
         return Ok(());
     }
     if layout.thick {

@@ -3543,15 +3543,23 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
 /// The largest mip of a placed 2D texture (or array, or cube) that a shader
 /// view reads, if the host texture can do without the larger ones.
 fn largest_mip(resource: &[u32; 14], desc: &[u32; 16]) -> u32 {
+    if cfg!(test) {
+        return 0;
+    }
+    largest_mip_of(resource, desc)
+}
+
+fn largest_mip_of(resource: &[u32; 14], desc: &[u32; 16]) -> u32 {
     const TEXTURE2D: u32 = 3;
     // Textures, arrays, cubes and arrays of cubes: their descriptions start
-    // with the largest mip.
-    if resource[0] != TEXTURE2D || !matches!(desc[1], 4 | 5 | 9 | 10) || cfg!(test) {
+    // with the largest mip (or their minimum LOD clamp).
+    if resource[0] != TEXTURE2D || !matches!(desc[1], 4 | 5 | 9 | 10) {
         return 0;
     }
     let (width, height) = (resource[4], resource[6]);
     let (format, mips) = (resource[8], resource[7] >> 16);
-    let mut first = desc[4].min(mips.saturating_sub(1));
+    let mut first = crate::texture::first_level(desc[..10].try_into().ok())
+        .min(mips.saturating_sub(1));
     let block = (70..=84).contains(&format) || (94..=99).contains(&format);
     let fits = |k: u32| {
         (width >> k) > 0
@@ -4660,5 +4668,22 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!((a, b), (4, 4 + 50));
         heap.release(b + spare - 70, 10);
         assert_eq!(heap.dynamic(20), Some(4 + spare - 20));
+    }
+
+    #[test]
+    fn largest_mip_respects_min_lod_clamp() {
+        let mut resource = [0u32; 14];
+        resource[0] = 3;
+        resource[4] = 256;
+        resource[6] = 256;
+        resource[7] = 9 << 16;
+        resource[8] = 28;
+        let mut desc = [0u32; 16];
+        desc[1] = 4; // Texture2D
+        desc[4] = 0; // MostDetailedMip
+        desc[7] = 3.0f32.to_bits(); // ResourceMinLODClamp
+        assert_eq!(largest_mip_of(&resource, &desc), 3);
+        resource[12] = 1; // Render target: never skip mips
+        assert_eq!(largest_mip_of(&resource, &desc), 0);
     }
 }
