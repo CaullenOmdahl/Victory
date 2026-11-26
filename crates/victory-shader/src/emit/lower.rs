@@ -2450,11 +2450,13 @@ impl<'a> Lower<'a> {
         // path straight past the `s_sleep` spin loop into the critical section.
         let uses_pops = self.s.pixel
             && self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|inst| {
-                matches!(
-                    &inst.fields,
-                    Fields::Sop { src, .. } if src.contains(&Operand::Const(239))
-                )
+                inst.name() == "s_endpgm_ordered_ps_done"
+                    || matches!(
+                        &inst.fields,
+                        Fields::Sop { src, .. } if src.contains(&Operand::Const(239))
+                    )
             });
+        self.s.root_uavs_rov = uses_pops;
         for &(reg, v) in &self.x.p.inputs {
             let val = match reg {
                 Reg::S(_) if self.params.contains_key(&v) => continue, // loaded on first use

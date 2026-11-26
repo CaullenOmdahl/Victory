@@ -28,6 +28,8 @@ pub(crate) mod flags {
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     /// UAVs in a vertex, geometry or mesh program.
     pub const UAVS_EVERY_STAGE: u64 = 1 << 16;
+    /// Rasterizer-ordered views in a pixel program (`SFI0` `0x1000`).
+    pub const ROVS: u64 = 1 << 18;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
@@ -97,6 +99,8 @@ pub(crate) struct Shader {
     pub written_root_uavs: Vec<u8>,
     /// Whether they are globally coherent.
     pub root_uavs_shared: bool,
+    /// Whether pixel-shader root UAVs are lowered as ROVs (POPS shaders).
+    pub root_uavs_rov: bool,
     /// Handle of the runtime stride table (`t0`, [`STRIDE_SPACE`]), if read.
     pub stride_table: Option<V>,
     pub flags: u64,
@@ -165,6 +169,7 @@ impl Shader {
             root_uavs: Vec::new(),
             written_root_uavs: Vec::new(),
             root_uavs_shared: false,
+            root_uavs_rov: false,
             stride_table: None,
             flags: 0,
             nonuniform_handles: 0,
@@ -344,7 +349,13 @@ impl Shader {
         );
         self.root_uavs_shared |= shared;
         let shared = if shared { 0x4000 } else { 0 };
-        let h = self.annotate(block, h, 0x1000 | 11 | shared, 0);
+        let rov = if self.pixel && self.root_uavs_rov {
+            self.flags |= flags::ROVS;
+            0x2000
+        } else {
+            0
+        };
+        let h = self.annotate(block, h, 0x1000 | 11 | shared | rov, 0);
         self.flags |= flags::RAW_BUFFERS;
         self.root_uavs.push((slot, h));
         h
@@ -644,6 +655,8 @@ impl Shader {
                 let u = self.m.undef(p);
                 let f = self.m.bool(false);
                 let f_md = self.m.md_value(f);
+                let rov = self.m.bool(self.pixel && self.root_uavs_rov);
+                let rov_md = self.m.md_value(rov);
                 let mut list = Vec::new();
                 for (n, &(slot, _)) in self.root_uavs.clone().iter().enumerate() {
                     let reg = u32::from(slot);
@@ -657,7 +670,7 @@ impl Shader {
                         Some(i32c(&mut self, 11)),
                         Some(shared_md),
                         Some(f_md),
-                        Some(f_md),
+                        Some(rov_md),
                         None,
                     ];
                     list.push(Some(self.m.md_node(ops)));
@@ -851,6 +864,9 @@ impl Shader {
         let mut features = 0u64;
         if self.flags & flags::UAVS_EVERY_STAGE != 0 {
             features |= 0x4;
+        }
+        if self.flags & flags::ROVS != 0 {
+            features |= 0x1000;
         }
         if self.flags & flags::DOUBLES != 0 {
             features |= 0x1;
@@ -1057,6 +1073,32 @@ mod tests {
         assert_eq!(s.inputs[1].interp, 1);
         let dxil = s.finish();
         assert!(!dxil.is_empty());
+    }
+
+    #[test]
+    fn pops_pixel_shader_root_uav_declares_rov_flag_and_property() {
+        let mut s = Shader::new(true);
+        s.root_uavs_rov = true;
+        let u = s.root_uav_handle(0, false);
+        assert!(s.annotations.iter().any(|&(p0, _)| p0 & 0x2000 != 0));
+        assert_ne!(s.flags & flags::ROVS, 0);
+        let b = s.entry;
+        let (or, zero, one) = (s.m.i32(2), s.m.i32(0), s.m.i32(1));
+        let iu = s.m.undef(s.t.i32);
+        let i32t = s.t.i32;
+        s.op(b, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &[u, or, zero, iu, iu, one]);
+        s.m.terminate(b, Term::Ret);
+        let dxil = s.finish();
+        let count = u32::from_le_bytes(dxil[28..32].try_into().unwrap()) as usize;
+        let sfi0 = (0..count)
+            .find_map(|i| {
+                let off = u32::from_le_bytes(dxil[32 + i * 4..36 + i * 4].try_into().unwrap()) as usize;
+                (&dxil[off..off + 4] == b"SFI0").then(|| {
+                    u64::from_le_bytes(dxil[off + 8..off + 16].try_into().unwrap())
+                })
+            })
+            .expect("SFI0 chunk");
+        assert_ne!(sfi0 & 0x1000, 0);
     }
 
     /// Of three root UAVs, the one only read (a raw load) is not written;

@@ -439,3 +439,37 @@ fn opcodes() {
         assert_eq!(inst.name(), Some(name));
     }
 }
+
+#[test]
+fn integer_atomics_inc_dec_rsub_mskor() {
+    let ds2 = |op: u8, vdst: u8, addr: u8, data0: u8, data1: u8| -> [u32; 2] {
+        [
+            0x36 << 26 | (op as u32) << 18,
+            (vdst as u32) << 24 | (data1 as u32) << 16 | (data0 as u32) << 8 | addr as u32,
+        ]
+    };
+    let atomics: &[(&str, u8, bool)] = &[
+        ("ds_rsub_u32", 0x02, false),
+        ("ds_inc_u32", 0x03, false),
+        ("ds_dec_u32", 0x04, false),
+        ("ds_mskor_b32", 0x0c, false),
+        ("ds_rsub_rtn_u32", 0x22, true),
+        ("ds_inc_rtn_u32", 0x23, true),
+        ("ds_dec_rtn_u32", 0x24, true),
+        ("ds_mskor_rtn_b32", 0x2c, true),
+    ];
+    for &(name, op, rtn) in atomics {
+        let mut body = vec![v_mov_b32(7, int(0))];
+        body.extend_from_slice(&ds(DS_WRITE_B32, 0, 7, 1, 0));
+        body.push(S_WAITCNT_0);
+        body.push(S_BARRIER);
+        body.extend_from_slice(&ds2(op, if rtn { 5 } else { 0 }, 7, 2, 3));
+        body.push(S_WAITCNT_0);
+        if !rtn {
+            body.extend_from_slice(&ds(DS_READ_B32, 5, 7, 0, 0));
+            body.push(S_WAITCNT_0);
+        }
+        let shader = build_cs(&body, LANES);
+        assert!(!shader.dxil.is_empty(), "{name} failed to lower");
+    }
+}
