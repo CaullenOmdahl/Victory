@@ -130,6 +130,8 @@ pub(crate) struct Lowered {
     #[cfg(test)]
     binary_i32_opcodes: Vec<i64>,
     #[cfg(test)]
+    dot4_opcodes: Vec<i64>,
+    #[cfg(test)]
     icmps_and_selects: (usize, usize),
 }
 
@@ -2176,6 +2178,8 @@ impl<'a> Lower<'a> {
             cbuf_stats: self.s.m.cbuf_load_stats(),
             #[cfg(test)]
             binary_i32_opcodes: self.s.m.written_call_opcodes("dx.op.binary.i32"),
+            #[cfg(test)]
+            dot4_opcodes: self.s.m.written_call_opcodes("dx.op.dot4AddPacked.i32"),
             #[cfg(test)]
             icmps_and_selects: self.s.m.written_icmps_and_selects(),
             stride_table,
@@ -9967,8 +9971,8 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// Integer dot products, including the optional output saturation in
-    /// VOP3P (LLVM AMDGPUUsage's sdot/udot intrinsics).
+    /// Integer dot products, including optional output saturation in VOP3P
+    /// and SM 6.4 `dx.op.dot4AddPacked.i32` lowering for 4x8-bit forms.
     fn integer_dot(&mut self, inst: &Inst, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else { unreachable!() };
         let name = inst.name();
@@ -9987,6 +9991,31 @@ impl<'a> Lower<'a> {
         } else {
             self.src(inst, 2)?
         };
+        if width == 8 {
+            let (x0, x1) = if implicit {
+                (a, b)
+            } else {
+                (
+                    self.pack_dot4_bytes(a, v.opsel & 1 != 0, v.opsel_hi & 1 != 0),
+                    self.pack_dot4_bytes(b, v.opsel >> 1 & 1 != 0, v.opsel_hi >> 1 & 1 != 0),
+                )
+            };
+            let sum = if signed && v.clamp {
+                // dot4 with acc=0 stays within [-65024, +65536] and cannot overflow i32.
+                let zero = self.s.m.i32(0);
+                let prod = self.dot4_packed(c, zero, x0, x1, true);
+                self.sat_i32_add(prod, d)
+            } else {
+                let sum = self.dot4_packed(c, d, x0, x1, signed);
+                if !signed && v.clamp {
+                    self.sat_u32_add(sum, d)
+                } else {
+                    sum
+                }
+            };
+            self.write(inst, Reg::V(reg), sum, guard);
+            return Ok(());
+        }
         let mut sum = if v.clamp { self.extend64(d, signed) } else { d };
         for i in 0..32 / width {
             // dot2 has independent low/high half selects for each input.
@@ -10015,6 +10044,128 @@ impl<'a> Lower<'a> {
         }
         self.write(inst, Reg::V(reg), sum, guard);
         Ok(())
+    }
+
+    fn pack_dot4_bytes(&mut self, x: V, lo: bool, hi: bool) -> V {
+        if (lo, hi) == (false, true) {
+            return x;
+        }
+        if let Some(val) = self.s.m.eval_u32(x) {
+            let (top, bottom) = (val >> 16, val & 0xFFFF);
+            let packed = ((if hi { top } else { bottom }) << 16)
+                | (if lo { top } else { bottom });
+            return self.s.m.i32(packed);
+        }
+        let c = self.cur;
+        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
+        let top = self.s.m.bin(c, Bin::LShr, x, k16);
+        let bottom = self.s.m.bin(c, Bin::And, x, low);
+        let hi_v = self.s.m.bin(c, Bin::Shl, if hi { top } else { bottom }, k16);
+        self.s.m.bin(c, Bin::Or, if lo { top } else { bottom }, hi_v)
+    }
+
+    fn sat_u32_add(&mut self, sum: V, acc: V) -> V {
+        let c = self.cur;
+        // Maximum 4x u8*u8 sum is <= 260,100 < 2^32, so wrapping occurs iff sum < acc.
+        let wrapped = self.s.m.cmp(c, pred::IULT, sum, acc);
+        let max_u = self.s.m.i32(u32::MAX);
+        self.s.m.select(c, wrapped, max_u, sum)
+    }
+
+    fn sat_i32_add(&mut self, d: V, acc: V) -> V {
+        let d64 = self.extend64(d, true);
+        let a64 = self.extend64(acc, true);
+        let sum = self.s.m.bin(self.cur, Bin::Add, d64, a64);
+        let clamped = self.clamp_int(sum, 64, i64::from(i32::MIN), i64::from(i32::MAX), true);
+        self.s.m.cast(self.cur, Cast::Trunc, clamped, self.s.t.i32)
+    }
+
+    /// Lowers `acc + dot4(a, b)` for packed 4x i8 (`signed = true`) or 4x u8.
+    /// Constant multiplicands expand in scalar ops rather than calling
+    /// `dx.op.dot4AddPacked`, avoiding 16-bit constant broadcast miscompilation.
+    fn dot4_packed(&mut self, c: usize, acc: V, a: V, b: V, signed: bool) -> V {
+        match (self.s.m.eval_u32(a), self.s.m.eval_u32(b)) {
+            (Some(ka), Some(kb)) => {
+                let dot = (0..4).fold(0i32, |s, k| {
+                    let (x, y) = if signed {
+                        (
+                            i32::from((ka >> (8 * k)) as i8),
+                            i32::from((kb >> (8 * k)) as i8),
+                        )
+                    } else {
+                        (
+                            ((ka >> (8 * k)) & 0xFF) as i32,
+                            ((kb >> (8 * k)) & 0xFF) as i32,
+                        )
+                    };
+                    s.wrapping_add(x * y)
+                });
+                if dot == 0 {
+                    acc
+                } else {
+                    let kd = self.s.m.i32(dot as u32);
+                    self.s.m.bin(c, Bin::Add, acc, kd)
+                }
+            }
+            (Some(k), None) => self.dot4_const(c, acc, b, k, signed),
+            (None, Some(k)) => self.dot4_const(c, acc, a, k, signed),
+            (None, None) => self.s.op(
+                c,
+                "dot4AddPacked.i32",
+                Attr::ReadNone,
+                self.s.t.i32,
+                if signed { 163 } else { 164 },
+                &[acc, a, b],
+            ),
+        }
+    }
+
+    fn dot4_const(&mut self, c: usize, mut acc: V, var: V, k: u32, signed: bool) -> V {
+        let mut k24 = None;
+        let mut mask = None;
+        for byte in 0..4u32 {
+            let w = if signed {
+                i32::from((k >> (8 * byte)) as i8)
+            } else {
+                ((k >> (8 * byte)) & 0xFF) as i32
+            };
+            if w == 0 {
+                continue;
+            }
+            let lane = if signed {
+                let k24_v = *k24.get_or_insert_with(|| self.s.m.i32(24));
+                let left = (3 - byte) * 8;
+                let aligned = if left == 0 {
+                    var
+                } else {
+                    let kl = self.s.m.i32(left);
+                    self.s.m.bin(c, Bin::Shl, var, kl)
+                };
+                self.s.m.bin(c, Bin::AShr, aligned, k24_v)
+            } else {
+                let m = *mask.get_or_insert_with(|| self.s.m.i32(0xFF));
+                let shifted = if byte == 0 {
+                    var
+                } else {
+                    let ks = self.s.m.i32(byte * 8);
+                    self.s.m.bin(c, Bin::LShr, var, ks)
+                };
+                self.s.m.bin(c, Bin::And, shifted, m)
+            };
+            let prod = match w {
+                1 => lane,
+                -1 => {
+                    acc = self.s.m.bin(c, Bin::Sub, acc, lane);
+                    continue;
+                }
+                _ => {
+                    let kw = self.s.m.i32(w as u32);
+                    self.s.m.bin(c, Bin::Mul, lane, kw)
+                }
+            };
+            acc = self.s.m.bin(c, Bin::Add, acc, prod);
+        }
+        acc
     }
 
     /// Sum of the unsigned absolute differences of the packed elements.

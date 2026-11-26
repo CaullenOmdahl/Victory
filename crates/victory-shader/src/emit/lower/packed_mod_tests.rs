@@ -150,3 +150,54 @@ fn min3_max3_med3_use_dxil_integer_min_max() {
         );
     }
 }
+
+#[test]
+fn dot4_lowers_to_dxil_dot4_add_packed_and_expands_constants() {
+    let vop3p = |op: u32, clamp: u32, opsel: u32, opsel_hi: u32, s0: u32, s1: u32, s2: u32| -> [u32; 2] {
+        [
+            0xCC00_0000 | (op << 16) | (clamp << 15) | (opsel << 11) | 2,
+            (opsel_hi << 27) | (s2 << 18) | (s1 << 9) | s0,
+        ]
+    };
+    let runtime_prefix = [
+        0x3402_0081u32, // v_lshlrev_b32 v1, 1, v0
+        0x4A04_0082,    // v_add_nc_u32 v2, 2, v0
+        0x4A06_0083,    // v_add_nc_u32 v3, 3, v0
+    ];
+    let with_runtime = |tail: &[u32]| {
+        let mut w = runtime_prefix.to_vec();
+        w.extend_from_slice(tail);
+        lower_packed(&w).unwrap()
+    };
+
+    // Signed VOP3P v_dot4_i32_i8 (0x16) and unsigned v_dot4_u32_u8 (0x17) emit opcode 163 / 164.
+    let dot4_i = with_runtime(&vop3p(0x16, 0, 0, 3, 256, 257, 259));
+    assert_eq!(dot4_i.dot4_opcodes, vec![163]);
+
+    let dot4_u = with_runtime(&vop3p(0x17, 0, 0, 3, 256, 257, 259));
+    assert_eq!(dot4_u.dot4_opcodes, vec![164]);
+
+    // VOP2 v_dot4c_i32_i8 (0x0D) with implicit runtime v2 accumulator emits opcode 163.
+    let dot4c = with_runtime(&[(0x0Du32 << 25) | (2 << 17) | (1 << 9) | 256]);
+    assert_eq!(dot4c.dot4_opcodes, vec![163]);
+
+    // Clamped signed and unsigned forms keep emitting dot4AddPacked.i32.
+    let dot4_i_clamp = with_runtime(&vop3p(0x16, 1, 0, 3, 256, 257, 259));
+    assert_eq!(dot4_i_clamp.dot4_opcodes, vec![163]);
+    let dot4_u_clamp = with_runtime(&vop3p(0x17, 1, 0, 3, 256, 257, 259));
+    assert_eq!(dot4_u_clamp.dot4_opcodes, vec![164]);
+
+    // Non-default opsel / opsel_hi on v_dot4_u32_u8 swaps halves cleanly.
+    let dot4_opsel = with_runtime(&vop3p(0x17, 0, 1, 2, 256, 257, 259));
+    assert_eq!(dot4_opsel.dot4_opcodes, vec![164]);
+
+    // Constant multiplicand (`v1 = 0x0000_8000`) expands via scalar ops instead of dot4AddPacked.
+    let mov_lit_v1 = [0x7E02_02FFu32, 0x0000_8000];
+    let mut const_i = mov_lit_v1.to_vec();
+    const_i.extend_from_slice(&vop3p(0x16, 0, 0, 3, 256, 257, 259));
+    let lowered_const = with_runtime(&const_i);
+    assert!(
+        lowered_const.dot4_opcodes.is_empty(),
+        "constant dot4 multiplicand must expand without dot4AddPacked"
+    );
+}
