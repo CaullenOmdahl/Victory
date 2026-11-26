@@ -732,6 +732,65 @@ impl Module {
         }
     }
 
+    /// The first word of the resource properties on an annotated handle.
+    fn resource_props0(&self, handle: V) -> Option<i64> {
+        let V::Inst(i) = handle else { return None };
+        let Op::Call(f, args) = &self.insts[i as usize].op else {
+            return None;
+        };
+        if self.funcs[*f as usize].name != "dx.op.annotateHandle" {
+            return None;
+        }
+        let [_, _, V::Const(props)] = args[..] else {
+            return None;
+        };
+        let Const::Aggregate(fields) = &self.consts[props as usize].1 else {
+            return None;
+        };
+        self.int_value(V::Const(*fields.first()?))
+    }
+
+    /// What the handle of a 64-bit atomic is: `(typed, from the heap)`, from
+    /// the annotation (kinds 1-10 are typed resources) and the handle's
+    /// source, looking through selects and phis.
+    fn atomic64_handle_kinds(&self, start: V) -> (bool, bool) {
+        let mut stack = vec![start];
+        let mut seen = Vec::new();
+        let (mut typed, mut heap) = (false, false);
+        while let Some(v) = stack.pop() {
+            let V::Inst(i) = v else { continue };
+            if seen.contains(&i) {
+                continue;
+            }
+            seen.push(i);
+            match &self.insts[i as usize].op {
+                Op::Call(f, args) if self.funcs[*f as usize].name == "dx.op.annotateHandle" => {
+                    if let Some(&V::Const(props)) = args.get(2)
+                        && let Const::Aggregate(fields) = &self.consts[props as usize].1
+                        && let Some(&first) = fields.first()
+                        && let Some(props0) = self.int_value(V::Const(first))
+                    {
+                        typed |= (1..=10).contains(&(props0 & 0xFF));
+                    }
+                    if let Some(&raw) = args.get(1) {
+                        stack.push(raw);
+                    }
+                }
+                Op::Call(f, _)
+                    if self.funcs[*f as usize]
+                        .name
+                        .starts_with("dx.op.createHandleFromHeap") =>
+                {
+                    heap = true;
+                }
+                Op::Select(_, t, f) => stack.extend([*t, *f]),
+                Op::Phi(inc) => stack.extend(inc.iter().map(|x| x.0)),
+                _ => {}
+            }
+        }
+        (typed, heap)
+    }
+
     /// What the instructions [`Module::write`] writes use, of what the
     /// shader flags declare (which must match it, or the validator refuses
     /// the module: "Flags must match usage").
@@ -763,6 +822,24 @@ impl Module {
                     u.sampler_heap |= sampler;
                 }
                 u.wave |= name.starts_with("dx.op.wave") || name.starts_with("dx.op.quad");
+                if !u.typed_uav_loads
+                    && (name.starts_with("dx.op.bufferLoad.")
+                        || name.starts_with("dx.op.textureLoad."))
+                {
+                    u.typed_uav_loads = args
+                        .get(1)
+                        .and_then(|&h| self.resource_props0(h))
+                        .is_some_and(|p| p & 0x1000 != 0 && (1..=10).contains(&(p & 0xFF)));
+                }
+                if matches!(
+                    name,
+                    "dx.op.atomicBinOp.i64" | "dx.op.atomicCompareExchange.i64"
+                ) && let Some(&handle) = args.get(1)
+                {
+                    let (typed, from_heap) = self.atomic64_handle_kinds(handle);
+                    u.atomic64_typed |= typed;
+                    u.atomic64_heap |= from_heap;
+                }
             }
         }
         u
@@ -1494,6 +1571,12 @@ pub struct Uses {
     pub int64: bool,
     /// Native 16-bit floats or integers.
     pub native16: bool,
+    /// Loads from typed unordered access views.
+    pub typed_uav_loads: bool,
+    /// 64-bit integer atomics on typed resources.
+    pub atomic64_typed: bool,
+    /// 64-bit integer atomics on resources from the descriptor heap.
+    pub atomic64_heap: bool,
 }
 
 /// What [`Module::write`] writes ([`Module::plan`]).
@@ -2182,6 +2265,50 @@ mod tests {
         let _ = (m.call(live, sink, vec![t]), h);
         let u = m.uses();
         assert!(u.int64 && !u.heap && !u.sampler_heap, "{u:?}");
+    }
+
+    #[test]
+    fn uses_tracks_atomic64_typed_and_heap_flags() {
+        let build = |kind: u32, name: &str, taken: bool| {
+            let (mut m, b, _sink) = module(3);
+            let [entry, live, dead] = b[..] else { unreachable!() };
+            let (i32t, i64t, handle_t) = (m.int(32), m.int(64), m.int(8));
+            let props_ty = m.named_struct("props", vec![i32t, i32t]);
+            let annotate_ty = m.func_ty(handle_t, vec![i32t, handle_t, props_ty]);
+            let annotate =
+                m.function("dx.op.annotateHandle", annotate_ty, Some(Attr::ReadNone), false);
+            let i1t = m.int(1);
+            let heap_ty = m.func_ty(handle_t, vec![i32t, i32t, i1t, i1t]);
+            let heap = m.function(
+                "dx.op.createHandleFromHeap",
+                heap_ty,
+                Some(Attr::ReadNone),
+                false,
+            );
+            let atomic_ty = m.func_ty(i64t, vec![i32t, handle_t, i32t, i32t, i32t, i32t, i64t]);
+            let atomic = m.function(name, atomic_ty, Some(Attr::NoUnwind), false);
+            let (op, zero, or, no, yes) =
+                (m.i32(218), m.i32(0), m.i32(2), m.bool(false), m.bool(true));
+            m.terminate(entry, Term::CondBr(yes, live, dead));
+            m.terminate(live, Term::Ret);
+            m.terminate(dead, Term::Ret);
+            let at = if taken { live } else { dead };
+            let raw = m.call(at, heap, vec![op, zero, no, no]);
+            let (annotate_op, p0, p1) = (m.i32(216), m.i32(kind), m.i32(0x105));
+            let props = m.aggregate(props_ty, &[p0, p1]);
+            let h = m.call(at, annotate, vec![annotate_op, raw, props]);
+            let (atomic_op, undef, value) = (m.i32(78), m.undef(i32t), m.int_const(i64t, 1));
+            let _ = m.call(at, atomic, vec![atomic_op, h, or, undef, undef, undef, value]);
+            let u = m.uses();
+            let _ = m.write();
+            (u.atomic64_typed, u.atomic64_heap)
+        };
+        assert_eq!(build(2 | 0x1000, "dx.op.atomicBinOp.i64", false), (false, false));
+        assert_eq!(build(11 | 0x1000, "dx.op.atomicBinOp.i64", true), (false, true));
+        assert_eq!(
+            build(2 | 0x1000, "dx.op.atomicCompareExchange.i64", true),
+            (true, true)
+        );
     }
 
     #[test]

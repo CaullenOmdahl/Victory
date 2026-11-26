@@ -506,6 +506,9 @@ impl Shader {
             (flags::SAMPLER_HEAP, uses.sampler_heap),
             (flags::WAVE_OPS, uses.wave),
             (flags::INT64, uses.int64),
+            (flags::TYPED_UAV_LOADS, uses.typed_uav_loads),
+            (flags::ATOMIC_TYPED64, uses.atomic64_typed),
+            (flags::ATOMIC_HEAP64, uses.atomic64_heap),
             (
                 flags::LOW_PRECISION | flags::NATIVE_LOW_PRECISION,
                 uses.native16,
@@ -1041,5 +1044,80 @@ mod tests {
         assert_eq!(s.inputs[1].interp, 1);
         let dxil = s.finish();
         assert!(!dxil.is_empty());
+    }
+
+    #[test]
+    fn typed_uav_load_flags_follow_dce() {
+        use super::super::bitcode::Term;
+        use crate::dxbc::{Container, FourCC};
+
+        for (texture, store, read) in [
+            (false, false, false),
+            (false, true, false),
+            (false, true, true),
+            (true, false, false),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            let mut s = Shader::new(false);
+            s.threads = Some([1, 1, 1]);
+            if !read {
+                s.flags |= flags::TYPED_UAV_LOADS;
+            }
+            let b = s.entry;
+            let zero = s.m.i32(0);
+            let iu = s.m.undef(s.t.i32);
+            let kind = if texture { 2 } else { 10 };
+            let h = s.heap_handle(b, zero, false, false, (kind | 0x1000, 0x409));
+            let (load, load_op, load_args) = if texture {
+                ("textureLoad.f32", 66, vec![h, iu, zero, zero, iu, iu, iu, iu])
+            } else {
+                ("bufferLoad.f32", 68, vec![h, zero, iu])
+            };
+            let r = s.op(b, load, Attr::ReadOnly, s.t.res_ret, load_op, &load_args);
+            if store {
+                let v = if read { s.m.extract(b, r, 0) } else { s.m.f32(0) };
+                let mask = s.m.i8(0xF);
+                let (name, op, args) = if texture {
+                    ("textureStore.f32", 67, vec![h, zero, zero, iu, v, v, v, v, mask])
+                } else {
+                    ("bufferStore.f32", 69, vec![h, zero, iu, v, v, v, v, mask])
+                };
+                s.op(b, name, Attr::NoUnwind, s.t.void, op, &args);
+            }
+            s.m.terminate(b, Term::Ret);
+            let case = format!("{load}, store={store}, read={read}");
+            assert_eq!(s.m.written_calls(&format!("dx.op.{load}")), usize::from(read), "{case}");
+            let dxil = s.finish();
+            let container = Container::parse(&dxil).unwrap();
+            let part = container.part(FourCC::SFI0).unwrap();
+            let features = u64::from_le_bytes(part.data.try_into().unwrap());
+            assert_eq!(features & 0x800 != 0, read, "{case}: typed UAV loads");
+        }
+    }
+
+    #[test]
+    fn a_64_bit_atomic_on_an_untaken_path_declares_no_atomic64_features() {
+        use super::super::bitcode::Term;
+        use crate::dxbc::{Container, FourCC};
+
+        let mut s = Shader::new(false);
+        s.threads = Some([1, 1, 1]);
+        s.flags |= flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64;
+        let (entry, live, dead) = (s.entry, s.m.new_block(), s.m.new_block());
+        let yes = s.m.bool(true);
+        s.m.terminate(entry, Term::CondBr(yes, live, dead));
+        s.m.terminate(live, Term::Ret);
+        s.m.terminate(dead, Term::Ret);
+        let zero = s.m.i32(0);
+        let h = s.heap_handle(dead, zero, false, false, (2 | 0x1000, 0x105));
+        let i64t = s.m.int(64);
+        let (or, iu, one) = (s.m.i32(2), s.m.undef(s.t.i32), s.m.int_const(i64t, 1));
+        s.op(dead, "atomicBinOp.i64", Attr::NoUnwind, i64t, 78, &[h, or, iu, iu, iu, one]);
+        let dxil = s.finish();
+        let container = Container::parse(&dxil).unwrap();
+        let part = container.part(FourCC::SFI0).unwrap();
+        let features = u64::from_le_bytes(part.data.try_into().unwrap());
+        assert_eq!(features & 0x1040_0000, 0, "untaken atomic64 flags leaked: {features:#x}");
     }
 }

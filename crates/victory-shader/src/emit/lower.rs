@@ -9591,8 +9591,11 @@ impl<'a> Lower<'a> {
             return self.write_half(inst, r, guard);
         }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
+        // Float-source conversions (`v_cvt_{u16,i16}_f16`) apply `abs`/`neg`
+        // via `half_fsrc`, while integer-source ops reject them.
         let saturates = matches!(name, "v_mad_i16" | "v_mad_u16");
-        if v.clamp && !saturates || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        let float_src = matches!(name, "v_cvt_u16_f16" | "v_cvt_i16_f16");
+        if v.clamp && !saturates || v.omod != 0 || (!float_src && (v.abs != 0 || v.neg != 0)) {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = match name {
@@ -11531,7 +11534,6 @@ impl<'a> Lower<'a> {
             let width = if wide { 2 } else { 1 };
             let vals = self.vgprs(inst, data, if compare { 2 * width } else { width })?;
             let (ty, component) = if wide {
-                self.s.flags |= flags::INT64 | flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64;
                 (self.s.m.int(64), 0x107) // one uint64_t in an R32G32_UINT view
             } else {
                 (self.s.t.i32, 0x105)
@@ -12178,8 +12180,6 @@ impl<'a> Lower<'a> {
             let mip = if name == "image_load_mip" || matches!(kind, 3 | 8) {
                 addr_val(self, coords)?
             } else if uav {
-                // Our declarations have four channels.
-                self.s.flags |= flags::TYPED_UAV_LOADS;
                 iu
             } else {
                 self.s.m.i32(0)
@@ -12622,9 +12622,6 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *d else {
                 return Err("buffer atomic data");
             };
-            if wide {
-                self.s.flags |= flags::INT64 | flags::ATOMIC_HEAP64;
-            }
             let active = if wide || matches!(op, "sub" | "inc" | "dec" | "csub") {
                 let bounds = self.buffer_bounds(h, index, off, stride, 4 * u32::from(words));
                 Some(self.buffer_store_guard(bounds, guard))
@@ -12751,9 +12748,6 @@ impl<'a> Lower<'a> {
         let r = if typed {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
-            }
-            if uav {
-                self.s.flags |= flags::TYPED_UAV_LOADS;
             }
             let h = self.handle(site, src, false, (10 | u, 0x409))?;
             let index = index.unwrap_or(self.s.m.i32(0));
