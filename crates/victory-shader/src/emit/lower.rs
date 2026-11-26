@@ -22,6 +22,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod tables;
 #[cfg(test)]
+mod packed_mod_tests;
+#[cfg(test)]
 mod user_data_tests;
 use tables::{DenseMap, FxMap, FxSet, value_count};
 
@@ -125,6 +127,10 @@ pub(crate) struct Lowered {
     /// Written `cbufferLoadLegacy.i32` calls and extracts in the module.
     #[cfg(test)]
     pub cbuf_stats: super::bitcode::CbufStats,
+    #[cfg(test)]
+    binary_i32_opcodes: Vec<i64>,
+    #[cfg(test)]
+    icmps_and_selects: (usize, usize),
 }
 
 pub(crate) struct Parts<'a> {
@@ -2168,6 +2174,10 @@ impl<'a> Lower<'a> {
             annotations: std::mem::take(&mut self.s.annotations),
             #[cfg(test)]
             cbuf_stats: self.s.m.cbuf_load_stats(),
+            #[cfg(test)]
+            binary_i32_opcodes: self.s.m.written_call_opcodes("dx.op.binary.i32"),
+            #[cfg(test)]
+            icmps_and_selects: self.s.m.written_icmps_and_selects(),
             stride_table,
             dxil: self.s.finish(),
             user_data,
@@ -9738,6 +9748,9 @@ impl<'a> Lower<'a> {
         {
             return Err("a packed half FMA of constants");
         }
+        if v.omod != 0 || v.abs != 0 || v.neg != 0 || v.opsel != 0 {
+            return Err("modifiers on a packed 16-bit operation");
+        }
         let c = self.cur;
         let f32t = self.s.t.f32;
         let old = inst.read(Reg::V(reg)).ok_or("an unread destination")?;
@@ -9774,7 +9787,12 @@ impl<'a> Lower<'a> {
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
             _ => return Err("a packed 16-bit operation"),
         };
-        if v.omod != 0 || !float && (v.clamp || v.neg != 0 || v.neg_hi != 0) {
+        if v.omod != 0
+            || v.sdwa.is_some()
+            || v.abs != 0
+            || (op == "fmac_f16" && (v.neg != 0 || v.opsel != 0))
+            || !float && (v.clamp || v.neg != 0 || v.neg_hi != 0)
+        {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
@@ -9922,21 +9940,29 @@ impl<'a> Lower<'a> {
     }
 
     fn int3(&mut self, op: &str, signed: bool, a: V, b: V, d: V) -> V {
-        let (lt, gt) = if signed { (pred::SLT, pred::SGT) } else { (pred::IULT, pred::IUGT) };
+        let (min, max) = if signed {
+            (38, 37) // IMin / IMax
+        } else {
+            (40, 39) // UMin / UMax
+        };
+        let c = self.cur;
+        let pick = |l: &mut Self, opcode, x, y| {
+            l.s.op(c, "binary.i32", Attr::ReadNone, l.s.t.i32, opcode, &[x, y])
+        };
         match op {
             "min3" => {
-                let t = self.int_pick(lt, a, b);
-                self.int_pick(lt, t, d)
+                let t = pick(self, min, a, b);
+                pick(self, min, t, d)
             }
             "max3" => {
-                let t = self.int_pick(gt, a, b);
-                self.int_pick(gt, t, d)
+                let t = pick(self, max, a, b);
+                pick(self, max, t, d)
             }
             _ => {
-                let lo = self.int_pick(lt, a, b);
-                let hi = self.int_pick(gt, a, b);
-                let t = self.int_pick(lt, hi, d);
-                self.int_pick(gt, lo, t)
+                let lo = pick(self, min, a, b);
+                let hi = pick(self, max, a, b);
+                let t = pick(self, min, hi, d);
+                pick(self, max, lo, t)
             }
         }
     }
