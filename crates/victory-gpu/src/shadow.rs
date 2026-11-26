@@ -3062,7 +3062,7 @@ impl BufferMap {
 }
 
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BufferMap> = Mutex::new(BufferMap::new());
+static BUFFERS: std::sync::RwLock<BufferMap> = std::sync::RwLock::new(BufferMap::new());
 static BUFFER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn buffer_generation() -> u64 {
@@ -3094,8 +3094,12 @@ thread_local! {
     static FIND_CACHE: RefCell<FindCache> = RefCell::new(FindCache::default());
 }
 
-fn buffers() -> std::sync::MutexGuard<'static, BufferMap> {
-    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+fn buffers() -> std::sync::RwLockWriteGuard<'static, BufferMap> {
+    BUFFERS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn buffers_read() -> std::sync::RwLockReadGuard<'static, BufferMap> {
+    BUFFERS.read().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
@@ -3135,7 +3139,7 @@ pub(crate) fn in_buffer(address: u64, len: u64) -> bool {
     let Some(end) = address.checked_add(len.max(1)) else {
         return false;
     };
-    buffers().containing(address, end).is_some()
+    buffers_read().containing(address, end).is_some()
 }
 
 /// The copy of a title buffer holding `[address, address + len)`: of one
@@ -3200,6 +3204,17 @@ fn find_copy_inner(address: u64, len: u64) -> Option<(Arc<Shadow>, bool)> {
     if let Some(copy) = sparse(address, end) {
         return Some((copy, false));
     }
+    // Shared read fast path: most lookups hit an already-allocated shadow.
+    {
+        let map = buffers_read();
+        let Some(key) = map.containing_prefer_made(address, end) else {
+            drop(map);
+            return loose(address, end).map(|s| (s, false));
+        };
+        if let Some(shadow) = map.entries.get(&key).and_then(|e| e.shadow.clone()) {
+            return Some((shadow, true));
+        }
+    }
     let mut map = buffers();
     let key = map.containing_prefer_made(address, end);
     let Some(key) = key else {
@@ -3257,7 +3272,7 @@ fn find_copy_inner(address: u64, len: u64) -> Option<(Arc<Shadow>, bool)> {
 /// Where the innermost title buffer holding `address` ends, if one does.
 pub(crate) fn buffer_end(address: u64) -> Option<u64> {
     let end = address.checked_add(1)?;
-    buffers().containing(address, end).map(|(_, e)| e.end)
+    buffers_read().containing(address, end).map(|(_, e)| e.end)
 }
 
 pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
@@ -3265,7 +3280,7 @@ pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
     // faults.
     let end = address
         .checked_add(1)
-        .and_then(|e| buffers().containing(address, e).map(|(_, entry)| entry.end));
+        .and_then(|e| buffers_read().containing(address, e).map(|(_, entry)| entry.end));
     if let Some(end) = end {
         return direct(address, end).or_else(|| find_copy(address, 1));
     }
@@ -3432,7 +3447,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// For device-removed reports: the copy of title memory whose host range
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
-    let mut all: Vec<(u64, u64, u64)> = buffers()
+    let mut all: Vec<(u64, u64, u64)> = buffers_read()
         .entries
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))

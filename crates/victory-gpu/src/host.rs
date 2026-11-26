@@ -158,6 +158,11 @@ pub(crate) fn retire<T: 'static>(object: T) {
     });
 }
 
+fn bury_aside_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BURY_ASIDE").is_none_or(|v| v != "0"))
+}
+
 /// Drops what waited for submissions up to `finished` and is old enough
 /// in presented frames.
 fn bury(finished: u64) {
@@ -178,7 +183,35 @@ fn bury(finished: u64) {
             .count();
         retired.drain(..n).collect()
     };
-    drop(done);
+    if done.is_empty() {
+        return;
+    }
+    if !bury_aside_enabled() {
+        drop(done);
+        return;
+    }
+    static TO: std::sync::OnceLock<Option<Mutex<std::sync::mpsc::Sender<Vec<Retired>>>>> =
+        std::sync::OnceLock::new();
+    let to = TO.get_or_init(|| {
+        let (to, from) = std::sync::mpsc::channel::<Vec<Retired>>();
+        std::thread::Builder::new()
+            .name("victory-bury".into())
+            .spawn(move || {
+                for done in from {
+                    drop(done);
+                }
+            })
+            .ok()
+            .map(|_| Mutex::new(to))
+    });
+    match to {
+        Some(to) => {
+            if let Err(e) = to.lock().unwrap_or_else(|e| e.into_inner()).send(done) {
+                drop(e.0);
+            }
+        }
+        None => drop(done),
+    }
 }
 
 /// Time spent in submissions since the last frame-rate line, in
