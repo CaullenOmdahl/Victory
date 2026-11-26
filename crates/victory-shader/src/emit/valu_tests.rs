@@ -2709,3 +2709,159 @@ fn v_swaprel_b32_constant_m0_swaps_distant_ranges() {
         );
     });
 }
+
+#[test]
+fn v_cube_denormals_and_zero_match_rdna2() {
+    const V_CUBESC_F32: u16 = 0x145;
+    const V_CUBETC_F32: u16 = 0x146;
+    const V_CUBEMA_F32: u16 = 0x147;
+
+    let cube = |op: u16, clamp: bool| {
+        let [w0, w1] = vop3_mod(op, 0, vgpr(1), vgpr(2), vgpr(3), 0, 0, 0, clamp);
+        build_valu_cs(&[w0, w1])
+    };
+
+    // v_cubesc_f32 preserves subnormal payload bits on +/-z faces (z = +/-1.0 is major axis).
+    let sc_cases: &[([u32; 4], u32)] = &[
+        ([0x0000_0001, 0, 0x3f80_0000, 0], 0x0000_0001),
+        ([0x0000_0001, 0, 0xbf80_0000, 0], 0x8000_0001),
+        ([0x8000_0001, 0, 0x3f80_0000, 0], 0x8000_0001),
+        ([0x8000_0001, 0, 0xbf80_0000, 0], 0x0000_0001),
+        ([0x007f_ffff, 0, 0x3f80_0000, 0], 0x007f_ffff),
+        ([0x8000_0000, 0x8000_0000, 0x8000_0000, 0], 0x8000_0000),
+    ];
+    let sc_inputs: Vec<[u32; 4]> = sc_cases.iter().map(|c| c.0).collect();
+    run_cases(&cube(V_CUBESC_F32, false), &sc_inputs, |backend, i, inp, got| {
+        let want = sc_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cubesc_f32({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+
+    // v_cubesc_f32 with clamp keeps positive subnormals while saturating normal values > 1.0 or < 0.0.
+    let sc_clamp_cases: &[([u32; 4], u32)] = &[
+        ([0x0000_0001, 0, 0x3f80_0000, 0], 0x0000_0001),
+        ([0x007f_ffff, 0, 0x3f80_0000, 0], 0x007f_ffff),
+        ([0x8000_0001, 0, 0x3f80_0000, 0], 0x0000_0000),
+        ([0x4000_0000, 0, 0x4040_0000, 0], 0x3f80_0000),
+    ];
+    let sc_clamp_inputs: Vec<[u32; 4]> = sc_clamp_cases.iter().map(|c| c.0).collect();
+    run_cases(&cube(V_CUBESC_F32, true), &sc_clamp_inputs, |backend, i, inp, got| {
+        let want = sc_clamp_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cubesc_f32 clamp({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+
+    // v_cubetc_f32 preserves subnormals on raw selected coordinate bits (with sign flip when negated).
+    let tc_cases: &[([u32; 4], u32)] = &[
+        ([0, 0x0000_0007, 0x3f80_0000, 0], 0x8000_0007),
+        ([0, 0x8000_0007, 0x3f80_0000, 0], 0x0000_0007),
+        ([0x3f80_0000, 0x0000_0007, 0, 0], 0x8000_0007),
+        ([0x8000_0000, 0x8000_0000, 0x8000_0000, 0], 0x0000_0000),
+        ([0x0000_0000, 0x0000_0000, 0x8000_0000, 0], 0x8000_0000),
+    ];
+    let tc_inputs: Vec<[u32; 4]> = tc_cases.iter().map(|c| c.0).collect();
+    run_cases(&cube(V_CUBETC_F32, false), &tc_inputs, |backend, i, inp, got| {
+        let want = tc_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cubetc_f32({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+
+    // v_cubema_f32 returns +0 (never -0) when the major axis is +/-0 or a denormal.
+    let ma_cases: &[([u32; 4], u32)] = &[
+        ([0x8000_0000, 0x8000_0000, 0x8000_0000, 0], 0x0000_0000),
+        ([0x0000_0000, 0x0000_0000, 0x8000_0000, 0], 0x0000_0000),
+        ([0x8000_0007, 0x0000_0000, 0x0000_0000, 0], 0x0000_0000),
+        ([0x007f_ffff, 0x8000_0001, 0x0000_0000, 0], 0x0000_0000),
+        ([0x0000_0000, 0x0000_0000, 0x3f80_0000, 0], 0x4000_0000),
+    ];
+    let ma_inputs: Vec<[u32; 4]> = ma_cases.iter().map(|c| c.0).collect();
+    run_cases(&cube(V_CUBEMA_F32, false), &ma_inputs, |backend, i, inp, got| {
+        let want = ma_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_cubema_f32({:#010x}, {:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1], inp[2],
+        );
+    });
+}
+
+#[test]
+fn v_log_f32_near_unity_matches_rdna2_1ulp() {
+    fn log2_reference(t: f64) -> f64 {
+        let z = t / (2.0 + t);
+        let square = z * z;
+        let mut series = 1.0_f64 / 15.0;
+        for divisor in [13.0_f64, 11.0, 9.0, 7.0, 5.0, 3.0, 1.0] {
+            series = 1.0 / divisor + square * series;
+        }
+        (2.0 * z * series) / std::f64::consts::LN_2
+    }
+
+    let shader = build_valu_cs(&[vop1(0x027, 0, vgpr(1))]);
+
+    // Exact bit-level contracts: log2(1.0) == +0.0, log2(+-0) == -inf, log2(+inf) == +inf.
+    let exact: &[([u32; 4], u32)] = &[
+        ([0x3f80_0000, 0, 0, 0], 0x0000_0000),
+        ([0x0000_0000, 0, 0, 0], 0xff80_0000),
+        ([0x8000_0000, 0, 0, 0], 0xff80_0000),
+        ([0x7f80_0000, 0, 0, 0], 0x7f80_0000),
+    ];
+    let exact_inputs: Vec<[u32; 4]> = exact.iter().map(|c| c.0).collect();
+    run_cases(&shader, &exact_inputs, |backend, i, inp, got| {
+        let want = exact[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_log_f32({:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0],
+        );
+    });
+
+    // Near-unity 1-ULP contract inside |x - 1| <= 1/8 (edges, hardest points from VIC-0018, neighbors).
+    let near_unity_bits: &[u32] = &[
+        0x3f60_0000, // 1 - 1/8 (lower band edge)
+        0x3f60_0fbc,
+        0x3f6a_c0c7,
+        0x3f70_0000, // 1 - 2^-4
+        0x3f75_257d,
+        0x3f7c_0000, // 1 - 2^-6
+        0x3f7c_2956,
+        0x3f7d_3e0c,
+        0x3f7d_553a,
+        0x3f7e_3274,
+        0x3f7f_ffff, // 1.0 - 1 ULP
+        0x3f80_0001, // 1.0 + 1 ULP
+        0x3f81_64d2,
+        0x3f82_0000, // 1 + 2^-6
+        0x3f83_9333,
+        0x3f85_5333,
+        0x3f85_aac3,
+        0x3f88_0000, // 1 + 2^-4
+        0x3f8b_95c2,
+        0x3f8c_ba39,
+        0x3f8f_d878,
+        0x3f90_0000, // 1 + 1/8 (upper band edge)
+    ];
+    let inputs: Vec<[u32; 4]> = near_unity_bits.iter().map(|&x| [x, 0, 0, 0]).collect();
+    run_cases(&shader, &inputs, |backend, _, inp, got| {
+        let x = f32::from_bits(inp[0]);
+        let y_ref = log2_reference(f64::from(x) - 1.0);
+        let exponent = ((y_ref.to_bits() >> 52) & 0x7ff) as i32 - 1023;
+        let ulp = 2f64.powi(exponent - 23);
+        let y_got = f64::from(f32::from_bits(got));
+        let err_ulps = (y_got - y_ref).abs() / ulp;
+        assert!(
+            err_ulps <= 1.0 + 1e-6,
+            "{backend}: v_log_f32({x} = {:#010x}) = {y_got} ({got:#010x}), ref={y_ref}, err={err_ulps:.4} ULP",
+            inp[0],
+        );
+    });
+}

@@ -3824,6 +3824,63 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// RDNA2 requires 1 ULP and exact +0 at unity (ISA, p. 141). Near unity, DXIL Log has
+    /// a looser absolute bound. For |x - 1| <= 1/8 we split t = x - 1 so C1 * hi is
+    /// exact in binary32, and group the degree-eight terms into even and odd Horner
+    /// chains in t * t. The ordered select retains DXIL Log outside the band.
+    fn log_f32(&mut self, x: V) -> V {
+        let c = self.cur;
+
+        // t = x - 1, its high part with the low twelve fraction bits cleared, and the exact remainder.
+        let one = self.s.m.f32(0x3F80_0000);
+        let t = self.s.m.bin(c, Bin::Sub, x, one);
+        let keep_high = self.s.m.i32(0xFFFF_F000);
+        let t_bits = self.as_int(t);
+        let high_bits = self.s.m.bin(c, Bin::And, t_bits, keep_high);
+        let hi = self.as_float(high_bits);
+        let lo = self.s.m.bin(c, Bin::Sub, t, hi);
+
+        // Split log2(e) into C1 and D, then use the Taylor coefficients b8 through b2.
+        let c1 = self.s.m.f32(0x3FB8_B000);
+        let (b8, b7, b6, b5, b4, b3, b2, d) = (
+            self.s.m.f32(0xBE38_AA3B),
+            self.s.m.f32(0x3E53_0BB1),
+            self.s.m.f32(0xBE76_384F),
+            self.s.m.f32(0x3E93_BB63),
+            self.s.m.f32(0xBEB8_AA3B),
+            self.s.m.f32(0x3EF6_384F),
+            self.s.m.f32(0xBF38_AA3B),
+            self.s.m.f32(0xB938_9AD4),
+        );
+
+        // H = even(t*t) + t * odd(t*t), then (C1 * hi) + ((t * H) + (C1 * lo)): one rounding at full
+        // magnitude, and at x == 1 the zeros of these products add to +0 under ties-to-even.
+        let q = self.s.m.bin(c, Bin::Mul, t, t);
+        let (mut even, mut odd) = (b7, b8);
+        for (ce, co) in [(b5, b6), (b3, b4), (d, b2)] {
+            let pe = self.s.m.bin(c, Bin::Mul, q, even);
+            let po = self.s.m.bin(c, Bin::Mul, q, odd);
+            even = self.s.m.bin(c, Bin::Add, pe, ce);
+            odd = self.s.m.bin(c, Bin::Add, po, co);
+        }
+        let odd = self.s.m.bin(c, Bin::Mul, t, odd);
+        let h = self.s.m.bin(c, Bin::Add, even, odd);
+        let series = self.s.m.bin(c, Bin::Mul, t, h);
+        let carried = self.s.m.bin(c, Bin::Mul, c1, lo);
+        let correction = self.s.m.bin(c, Bin::Add, series, carried);
+        let kept = self.s.m.bin(c, Bin::Mul, c1, hi);
+        let near_one = self.s.m.bin(c, Bin::Add, kept, correction);
+
+        // Ordered <= on |t|: a NaN, an infinity and everything outside the band keep DXIL's answer.
+        let clear_sign = self.s.m.i32(0x7FFF_FFFF);
+        let magnitude_bits = self.s.m.bin(c, Bin::And, t_bits, clear_sign);
+        let magnitude = self.as_float(magnitude_bits);
+        let band = self.s.m.f32(0x3E00_0000); // 1/8, inclusive at both ends
+        let inside_band = self.s.m.cmp(c, pred::OLE, magnitude, band);
+        let host_log = self.unary(23, x); // DXIL's own answer: kept outside the band exactly as before
+        self.s.m.select(c, inside_band, near_one, host_log)
+    }
+
     /// A 32-bit denormal as the console's float mode reads it: a zero of its
     /// sign, decided on the bits (the host's own denormal mode varies).
     fn ftz(&mut self, f: V) -> V {
@@ -4521,7 +4578,18 @@ impl<'a> Lower<'a> {
         if v.clamp {
             f = self.unary(7, f);
         }
-        let Some(Operand::Vector { reg, .. }) = v.dst else {
+        self.store_float(inst, v.dst, f, guard)
+    }
+
+    /// Store a float after its instruction's output modifiers have been applied.
+    fn store_float(
+        &mut self,
+        inst: &Inst,
+        dst: Option<Operand>,
+        f: V,
+        guard: Option<V>,
+    ) -> Result<(), Why> {
+        let Some(Operand::Vector { reg, .. }) = dst else {
             return Err("a float result outside a VGPR");
         };
         let x = self.as_int(f);
@@ -8555,8 +8623,31 @@ impl<'a> Lower<'a> {
             "v_cubeid_f32" | "v_cubesc_f32" | "v_cubetc_f32" | "v_cubema_f32" => {
                 // Cube-map face coordinates (AMD's ISA): the major axis is z
                 // when |z| >= |x| and |z| >= |y|, else y when |y| >= |x|,
-                // else x.
-                let (x, y, z) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                // else x. Denormal coordinates read as zeros of their sign for
+                // major-axis and sign selection; `v_cubesc`/`v_cubetc` pick
+                // and bit-negate the raw operand bits, while `v_cubema`
+                // flushes a zero or denormal result to +0.
+                let (rx, ry, rz) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                // The coordinate bits `v_cubesc`/`v_cubetc` select: the input
+                // modifiers on bits (abs clears the sign, neg flips it), so a
+                // denormal survives however the host's float abs/neg treats it.
+                let bits = |l: &mut Self, k: usize| -> Result<V, Why> {
+                    let op = *v.src.get(k).ok_or("a missing operand")?;
+                    let mut b = match (k, l.src0) {
+                        (0, Some(x)) => x,
+                        _ => l.operand(inst, &op)?,
+                    };
+                    if v.abs >> k & 1 != 0 {
+                        let m = l.s.m.i32(0x7FFF_FFFF);
+                        b = l.s.m.bin(c, Bin::And, b, m);
+                    }
+                    if v.neg >> k & 1 != 0 {
+                        let m = l.s.m.i32(0x8000_0000);
+                        b = l.s.m.bin(c, Bin::Xor, b, m);
+                    }
+                    Ok(b)
+                };
+                let (x, y, z) = (self.ftz(rx), self.ftz(ry), self.ftz(rz));
                 let (ax, ay, az) = (self.unary(6, x), self.unary(6, y), self.unary(6, z));
                 let zx = self.s.m.cmp(c, pred::OGE, az, ax);
                 let zy = self.s.m.cmp(c, pred::OGE, az, ay);
@@ -8564,9 +8655,9 @@ impl<'a> Lower<'a> {
                 let ymaj = self.s.m.cmp(c, pred::OGE, ay, ax);
                 let zero = self.s.m.f32(0);
                 let neg = |l: &mut Self, v: V| l.s.m.cmp(c, pred::OLT, v, zero);
-                let minus = |l: &mut Self, v: V| {
-                    let z = l.s.m.f32(0x8000_0000);
-                    l.s.m.bin(c, Bin::Sub, z, v)
+                let neg_bits = |l: &mut Self, bits: V| {
+                    let sign = l.s.m.i32(0x8000_0000);
+                    l.s.m.bin(c, Bin::Xor, bits, sign)
                 };
                 let pick = |l: &mut Self, zv: V, yv: V, xv: V| {
                     let t = l.s.m.select(c, ymaj, yv, xv);
@@ -8590,25 +8681,52 @@ impl<'a> Lower<'a> {
                         pick(self, zf, yf, xf)
                     }
                     "v_cubesc_f32" => {
+                        let (ix, iz) = (bits(self, 0)?, bits(self, 2)?);
                         let (nz, nx) = (neg(self, z), neg(self, x));
-                        let (mx, mz) = (minus(self, x), minus(self, z));
-                        let zf = self.s.m.select(c, nz, mx, x);
-                        let xf = self.s.m.select(c, nx, z, mz);
-                        pick(self, zf, x, xf)
+                        // Select the coordinate and its sign adjustment separately, so
+                        // the selected result stays integer data even when subnormal.
+                        let (sign, keep) = (self.s.m.i32(0x8000_0000), self.s.m.i32(0));
+                        let zmask = self.s.m.select(c, nz, sign, keep);
+                        let xmask = self.s.m.select(c, nx, keep, sign);
+                        let raw = pick(self, ix, ix, iz);
+                        let mask = pick(self, zmask, keep, xmask);
+                        let bits = self.s.m.bin(c, Bin::Xor, raw, mask);
+                        self.as_float(bits)
                     }
                     "v_cubetc_f32" => {
+                        let (iy, iz) = (bits(self, 1)?, bits(self, 2)?);
                         let ny = neg(self, y);
-                        let (my, mz) = (minus(self, y), minus(self, z));
-                        let yf = self.s.m.select(c, ny, mz, z);
-                        pick(self, my, yf, my)
+                        let (my, mz) = (neg_bits(self, iy), neg_bits(self, iz));
+                        let yf = self.s.m.select(c, ny, mz, iz);
+                        let bits = pick(self, my, yf, my);
+                        self.as_float(bits)
                     }
                     _ => {
                         let t = pick(self, z, y, x);
                         let two = self.s.m.f32(2.0f32.to_bits());
-                        self.s.m.bin(c, Bin::Mul, t, two)
+                        let p = self.s.m.bin(c, Bin::Mul, t, two);
+                        let p_bits = self.as_int(p);
+                        let (exp, kzero) = (self.s.m.i32(0x7F80_0000), self.s.m.i32(0));
+                        let e = self.s.m.bin(c, Bin::And, p_bits, exp);
+                        let tiny = self.s.m.cmp(c, pred::EQ, e, kzero);
+                        let bits = self.s.m.select(c, tiny, kzero, p_bits);
+                        self.as_float(bits)
                     }
                 };
-                float(self, r)
+                if v.clamp && v.omod == 0 && matches!(name, "v_cubesc_f32" | "v_cubetc_f32") {
+                    // A selected positive subnormal survives cube clamp on RDNA2.
+                    // For the other bit patterns use the ordinary float clamp.
+                    let bits = self.as_int(r);
+                    let min_normal = self.s.m.i32(0x0080_0000);
+                    let keep = self.s.m.cmp(c, pred::IULT, bits, min_normal);
+                    let saturated = self.unary(7, r);
+                    let clipped = self.as_int(saturated);
+                    let bits = self.s.m.select(c, keep, bits, clipped);
+                    let result = self.as_float(bits);
+                    self.store_float(inst, v.dst, result, guard)
+                } else {
+                    float(self, r)
+                }
             }
             "v_movrels_b32" | "v_movreld_b32" | "v_movrelsd_b32" => {
                 // M0 indexes the source (movrels), the destination (movreld)
@@ -9002,6 +9120,9 @@ impl<'a> Lower<'a> {
                         let flushed = self.ftz(a);
                         self.unary(op, flushed)
                     }
+                    // RDNA2 holds `v_log_f32` to 1 ULP and to exact +0 at the input 1.0; DXIL's bound
+                    // near unity is absolute only, so that one instruction gets its own lowering.
+                    _ if name == "v_log_f32" => self.log_f32(a),
                     _ => self.unary(op, a),
                 };
                 float(self, r)
