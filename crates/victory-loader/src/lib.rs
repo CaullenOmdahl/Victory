@@ -27,7 +27,9 @@ mod crash;
 mod hooks;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod patch;
+pub mod frame_rate;
 pub mod prepare;
+pub mod resolution;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;

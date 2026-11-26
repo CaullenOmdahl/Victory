@@ -80,6 +80,10 @@ mod wc;
 
 #[cfg(windows)]
 pub use host::on_failure;
+/// Frames the title has begun (its frame waits that ended), for logs.
+pub fn frames_begun() -> u64 {
+    frame::current()
+}
 pub use memstat::report as memory_report;
 #[cfg(windows)]
 pub use texture::{PageGenOracle, set_page_gen_oracle};
