@@ -4030,11 +4030,14 @@ impl Batch {
     }
 
     fn flush(&mut self) {
-        for (shadow, spans) in std::mem::take(&mut self.refreshes) {
-            for &(from, to) in spans.as_slice() {
-                update(&shadow, from, to - from);
+        let refreshes = std::mem::take(&mut self.refreshes);
+        in_parallel(&refreshes, 2, |chunk| {
+            for (shadow, spans) in chunk {
+                for &(from, to) in spans.as_slice() {
+                    update(shadow, from, to - from);
+                }
             }
-        }
+        });
         let mut pieces = std::mem::take(&mut self.pieces);
         if pieces.is_empty() {
             return;
