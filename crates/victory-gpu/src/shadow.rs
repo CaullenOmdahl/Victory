@@ -399,14 +399,17 @@ impl Shadow {
                     merge_gpu_writes_card(title_slice, staging_old, gpu_new);
                 if let Some((dirty_start, dirty_end)) = dirty_span {
                     let dirty_len = dirty_end - dirty_start;
-                    if mode != 1 {
-                        crate::watch::open_for_sync_write(title_addr + dirty_start, dirty_len);
+                    let dst = title_addr + dirty_start;
+                    if mode == 1 || !crate::watch::write_beside(dst, &title_slice[dirty_start..dirty_end]) {
+                        if mode != 1 {
+                            crate::watch::open_for_sync_write(dst, dirty_len);
+                        }
+                        crate::host::write_mapped(
+                            dst as *mut u8,
+                            title_slice[dirty_start..].as_ptr(),
+                            dirty_len,
+                        );
                     }
-                    crate::host::write_mapped(
-                        (title_addr + dirty_start) as *mut u8,
-                        title_slice[dirty_start..].as_ptr(),
-                        dirty_len,
-                    );
                     written += dirty_len;
                 }
                 if cpu_modified {
@@ -694,14 +697,19 @@ impl Shadow {
                             merge_gpu_writes_mut(title_slice, host, old)
                         {
                             let dirty_len = dirty_end - dirty_start;
-                            if mode != 1 {
-                                crate::watch::open_for_sync_write(start + at + dirty_start, dirty_len);
+                            let dst = start + at + dirty_start;
+                            if mode == 1
+                                || !crate::watch::write_beside(dst, &title_slice[dirty_start..dirty_end])
+                            {
+                                if mode != 1 {
+                                    crate::watch::open_for_sync_write(dst, dirty_len);
+                                }
+                                crate::host::write_mapped(
+                                    dst as *mut u8,
+                                    title_slice[dirty_start..].as_ptr(),
+                                    dirty_len,
+                                );
                             }
-                            crate::host::write_mapped(
-                                (start + at + dirty_start) as *mut u8,
-                                title_slice[dirty_start..].as_ptr(),
-                                dirty_len,
-                            );
                             written += dirty_len;
                         }
                         synced.push((start + at) / PAGE);
@@ -2640,12 +2648,15 @@ impl Shadow {
                 }
                 if let Some((dirty_start, dirty_end)) = merge_gpu_writes_mut(&mut buf[..n], host, old) {
                     let dirty_len = dirty_end - dirty_start;
-                    crate::watch::open_for_sync_write(at + dirty_start, dirty_len);
-                    crate::host::write_mapped(
-                        (at + dirty_start) as *mut u8,
-                        buf[dirty_start..].as_ptr(),
-                        dirty_len,
-                    );
+                    let dst = at + dirty_start;
+                    if !crate::watch::write_beside(dst, &buf[dirty_start..dirty_end]) {
+                        crate::watch::open_for_sync_write(dst, dirty_len);
+                        crate::host::write_mapped(
+                            dst as *mut u8,
+                            buf[dirty_start..].as_ptr(),
+                            dirty_len,
+                        );
+                    }
                     written.fetch_add(dirty_len, Ordering::Relaxed);
                 }
             }

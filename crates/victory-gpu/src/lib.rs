@@ -91,8 +91,9 @@ pub use pipeline::{WarmStats, needed_shader_hashes};
 pub use texture::{PageGenOracle, set_page_gen_oracle};
 #[cfg(windows)]
 pub use watch::{
-    release_title_allocation, title_memory_committed, title_memory_remapped, title_memory_view,
-    title_memory_view_gone, title_memory_written, writing as kernel_will_write,
+    PageWriter, release_title_allocation, title_memory_committed, title_memory_remapped,
+    title_memory_view, title_memory_view_gone, title_memory_written, use_page_writer,
+    writing as kernel_will_write,
 };
 #[cfg(windows)]
 pub use wc::title_memory_reserved;

@@ -964,6 +964,47 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
     Some(runs)
 }
 
+/// Writes title memory `[at, at + len)` where one title view of physical
+/// pages shows all of it: `write` gets the address of those bytes in our
+/// persistent view of the section (`Section::persistent_ptr`), which no guard
+/// covers. Releases the mapping lock before committing/copying so parallel
+/// copy-back workers do not serialize on `physical`; `View::persistent` keeps
+/// the `Arc<Section>` alive and guards against concurrent persistent writes.
+/// False, with `write` not called, where no physical-page view shows `[at, at + len)`.
+pub fn write_beside(at: usize, len: usize, write: &mut dyn FnMut(*mut u8)) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let Some(end) = at.checked_add(len) else {
+        return false;
+    };
+    let (view_slice, offset) = {
+        let physical = physical();
+        let Some((&base, &(size, ref slice))) = physical.views.range(..=at).next_back() else {
+            return false;
+        };
+        if end > base + size {
+            return false;
+        }
+        let offset = slice.index * PAGE + (at - base);
+        (
+            Slice {
+                section: slice.section.clone(),
+                index: offset / PAGE,
+            },
+            offset,
+        )
+    };
+    let page_count = (offset % PAGE + len).div_ceil(PAGE);
+    let Some(mut view) = View::persistent(&view_slice, page_count) else {
+        return false;
+    };
+    let ptr = view.bytes_at(offset % PAGE, len).as_mut_ptr();
+    write(ptr);
+    view_slice.section.bump_range(view_slice.index, page_count);
+    true
+}
+
 /// Copies `data` into physical pages, from `offset` bytes into the first,
 /// whether or not they are mapped anywhere (DirectStorage destinations).
 /// One view per run of consecutive pages, not one per page: each view
@@ -2356,6 +2397,59 @@ mod tests {
         assert!(map_alias(va as u64, 0, (3 * PAGE) as u64));
         assert_ne!(unsafe { VirtualFree(va, 0, MEM_RELEASE) }, 0);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn writes_beside_land_through_guarded_views() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        let pages = allocate(2);
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                2 * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b) = (reserve() as usize, reserve() as usize);
+        assert!(a != 0 && b != 0);
+        assert_eq!(XMemMapPhysicalPages(a as _, 2, pages.as_ptr()), a as _);
+        assert_eq!(XMemMapPhysicalPages(b as _, 1, pages[1..].as_ptr()), b as _);
+        let mut old = 0;
+        // SAFETY: our view, made read-only as a guard makes it.
+        assert_ne!(
+            unsafe { VirtualProtect(a as _, 2 * PAGE, PAGE_READONLY, &mut old) },
+            0
+        );
+        let put = |at: usize, len: usize| {
+            write_beside(at, len, &mut |to| {
+                // SAFETY: `len` writable bytes the writer gives.
+                unsafe { std::ptr::write_bytes(to, 9, len) }
+            })
+        };
+        assert!(put(a + PAGE + 8, 4));
+        // SAFETY: both mappings, readable.
+        unsafe {
+            assert_eq!(
+                std::slice::from_raw_parts((a + PAGE + 8) as *const u8, 4),
+                [9; 4]
+            );
+            assert_eq!(
+                std::slice::from_raw_parts((b + 8) as *const u8, 4),
+                [9; 4]
+            );
+            assert_eq!(((a + PAGE + 12) as *const u8).read(), 0);
+        }
+        assert!(!put(b + PAGE - 2, 4), "past the end of the view at b");
+        let private = [0u8; 4];
+        assert!(!put(private.as_ptr() as usize, 4), "not a view of pages");
+        assert_eq!(private, [0; 4]);
+        // SAFETY: as above.
+        assert_eq!(unsafe { ((b + PAGE - 2) as *const u8).read() }, 0);
+        assert_eq!(XMemMapPhysicalPages(b as _, 1, std::ptr::null()), b as _);
+        assert_eq!(XMemMapPhysicalPages(a as _, 2, std::ptr::null()), a as _);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 }
 

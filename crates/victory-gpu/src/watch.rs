@@ -1083,6 +1083,124 @@ pub(crate) fn open_for_sync_write(at: usize, len: usize) {
     }
 }
 
+/// The runtime's writer of title memory beside the guards
+/// (`victory_hle`'s `xmem::write_beside`): calls the closure with the
+/// address of title memory `[at, at + len)` in a persistent view of its own
+/// of the physical pages behind it, which no guard covers, and no mapping
+/// there changes meanwhile; false where no physical-page view shows the range.
+pub type PageWriter = fn(at: usize, len: usize, write: &mut dyn FnMut(*mut u8)) -> bool;
+
+static PAGE_WRITER: std::sync::OnceLock<PageWriter> = std::sync::OnceLock::new();
+static BESIDE_WRITES: AtomicU64 = AtomicU64::new(0);
+static BESIDE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Sets the runtime's [`PageWriter`].
+pub fn use_page_writer(writer: PageWriter) {
+    let _ = PAGE_WRITER.set(writer);
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn take_beside_stats() -> (u64, u64) {
+    (
+        BESIDE_WRITES.swap(0, Ordering::Relaxed),
+        BESIDE_BYTES.swap(0, Ordering::Relaxed),
+    )
+}
+
+/// Marks guarded blocks covering `[at, at + len)` and any aliased guarded
+/// views of those physical pages dirty (without unprotecting or opening them)
+/// and bumps their region epochs so overlapping buffers and aliased views
+/// observe the updated physical bytes while keeping `PAGE_READONLY` guards
+/// armed. Avoids allocating or taking the write lock when no protected block
+/// or bounded-size alias needs updating.
+fn note_beside_write(at: usize, len: usize) {
+    let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
+    let mut alias_blocks = Vec::new();
+    if view_guard() {
+        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(views) = views.as_ref() {
+            for block in first..last {
+                let shown = views.shown(block * BLOCK);
+                if (2..=MANY_VIEWS).contains(&shown.len()) {
+                    for &alias in shown {
+                        let ab = alias / BLOCK;
+                        if ab != block {
+                            alias_blocks.push(ab);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    {
+        let g = guards_read();
+        let needs_local = g.protected.range(first..last).any(|b| g.clean.contains(b) || !g.dirty.contains(b));
+        let needs_alias = alias_blocks
+            .iter()
+            .any(|ab| g.protected.contains(ab) && (g.clean.contains(ab) || !g.dirty.contains(ab)));
+        if !needs_local && !needs_alias {
+            return;
+        }
+    }
+    let mut g = guards_mut();
+    let mut touched = false;
+    for block in first..last {
+        if g.protected.contains(&block) {
+            g.clean.remove(&block);
+            g.dirty.insert(block);
+            touched = true;
+        }
+    }
+    if touched {
+        bump_region_epochs(at, at + len);
+    }
+    for ab in alias_blocks {
+        if g.protected.contains(&ab) {
+            g.clean.remove(&ab);
+            g.dirty.insert(ab);
+            bump_region_epochs(ab * BLOCK, (ab + 1) * BLOCK);
+        }
+    }
+}
+
+/// With `VICTORY_COPY_BACK_BESIDE=1`: writes `bytes` into title memory at
+/// `at` through the runtime's [`PageWriter`], so no guard is opened and put
+/// back (`VirtualProtect` / TLB shootdowns skipped); the title's views stay
+/// guarded and show the new bytes through the same physical pages. False,
+/// with nothing written, where the switch is off or no physical-page view
+/// shows `[at, at + bytes.len())`.
+pub(crate) fn write_beside(at: usize, bytes: &[u8]) -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("VICTORY_COPY_BACK_BESIDE").is_some_and(|v| v == "1"));
+    let Some(writer) = PAGE_WRITER.get().filter(|_| *ON) else {
+        return false;
+    };
+    write_through(at, bytes, |write| writer(at, bytes.len(), write))
+}
+
+/// [`write_beside`] through `writer`, which calls its argument with the
+/// writable persistent address for `bytes.len()` bytes, or returns false.
+fn write_through(
+    at: usize,
+    bytes: &[u8],
+    writer: impl FnOnce(&mut dyn FnMut(*mut u8)) -> bool,
+) -> bool {
+    if bytes.is_empty() {
+        return true;
+    }
+    let ok = writer(&mut |to| {
+        // SAFETY: the writer provides a valid, committed, writable pointer for
+        // `bytes.len()` bytes whose persistent mapping remains alive until it returns.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to, bytes.len()) };
+    });
+    if ok {
+        note_beside_write(at, bytes.len());
+        BESIDE_WRITES.fetch_add(1, Ordering::Relaxed);
+        BESIDE_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+    }
+    ok
+}
+
 /// Releases a complete private title allocation and invalidates its tracked
 /// pages. Query every protection region: a guarded allocation is not
 /// necessarily described by a single `VirtualQuery` result (`Marvisak #2824`).
@@ -1871,5 +1989,80 @@ mod tests {
         drop(_wrapped);
         // Huge range >= WW_SHARDS * stripe locks every shard once in ascending order.
         assert_eq!(ww_shard_indices(0, (WW_SHARDS + 4) * stripe), (0..WW_SHARDS).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_write_beside_keeps_the_guards_and_writes_through() {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, MEMORY_BASIC_INFORMATION,
+            MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, PAGE_READONLY, UnmapViewOfFile,
+            VirtualQuery,
+        };
+        let protection = |at: usize| {
+            // SAFETY: plain data filled in by VirtualQuery.
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: valid query address in our own address space.
+            unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+            info.Protect
+        };
+        // SAFETY: one 2-block pagefile section mapped three times (two guarded
+        // title views + one unguarded persistent-like writer view).
+        let (section, a, b, w) = unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                (2 * BLOCK) as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let a = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            let b = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            let w = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, 2 * BLOCK).Value as usize;
+            assert!(a != 0 && b != 0 && w != 0);
+            title_memory_view(a, 2 * BLOCK, section as usize, 0);
+            title_memory_view(b, 2 * BLOCK, section as usize, 0);
+            (section, a, b, w)
+        };
+        let page = |view: usize, block: usize| (view + block * BLOCK) / PAGE;
+        assert_eq!(guard(a, a + 2 * BLOCK), Some(vec![page(a, 0), page(a, 1)]));
+        assert_eq!(guard(b, b + 2 * BLOCK), Some(vec![page(b, 0), page(b, 1)]));
+        assert_eq!(guard(a, a + 2 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(b, b + 2 * BLOCK), Some(Vec::new()));
+
+        let ep_a0 = block_epoch(a);
+        let ep_b0 = block_epoch(b);
+        assert!(!write_through(a + 32, &[5; 16], |_| false));
+        assert_eq!(block_epoch(a), ep_a0);
+        assert_eq!(block_epoch(b), ep_b0);
+        assert_eq!(guard(a, a + 2 * BLOCK), Some(Vec::new()));
+        assert_eq!(guard(b, b + 2 * BLOCK), Some(Vec::new()));
+
+        assert!(write_through(a + 32, &[5; 16], |write| {
+            write((w + 32) as *mut u8);
+            true
+        }));
+        // SAFETY: `a` and `b` are readable mapped views backed by the written section.
+        unsafe {
+            assert_eq!(std::slice::from_raw_parts((a + 32) as *const u8, 16), [5; 16]);
+            assert_eq!(std::slice::from_raw_parts((b + 32) as *const u8, 16), [5; 16]);
+        }
+        assert_eq!(protection(a), PAGE_READONLY);
+        assert_eq!(protection(b), PAGE_READONLY);
+        assert_ne!(block_epoch(a), ep_a0);
+        assert_ne!(block_epoch(b), ep_b0);
+        assert_eq!(guard(a, a + 2 * BLOCK), Some(vec![page(a, 0)]));
+        assert_eq!(guard(b, b + 2 * BLOCK), Some(vec![page(b, 0)]));
+        assert_eq!(protection(a), PAGE_READONLY);
+        assert_eq!(protection(b), PAGE_READONLY);
+
+        drop_views(&[a, b]);
+        // SAFETY: releases our third test view and section handle.
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: w as *mut _ });
+            CloseHandle(section);
+        }
     }
 }

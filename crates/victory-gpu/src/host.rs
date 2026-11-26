@@ -5100,6 +5100,7 @@ struct Presenter {
 struct Meter {
     since: std::time::Instant,
     frames: u32,
+    log_frames: u32,
     drawn: u64,
     logged: std::time::Instant,
     /// The caption the window had, once read.
@@ -5112,6 +5113,7 @@ impl Meter {
         Meter {
             since: now,
             frames: 0,
+            log_frames: 0,
             drawn: crate::draw::drawn(),
             logged: now,
             caption: None,
@@ -5123,6 +5125,7 @@ impl Meter {
         #[cfg(feature = "diagnostics")]
         tracing::debug!(target: "victory_gpu::frame", token = crate::frame::current(), "present");
         self.frames += 1;
+        self.log_frames += 1;
         #[cfg(feature = "diagnostics")]
         TIMED_FRAMES.fetch_add(1, Ordering::Relaxed);
         let elapsed = self.since.elapsed();
@@ -5210,6 +5213,16 @@ impl Meter {
                 );
                 crate::texture::flips::log();
                 crate::copystat::log(frames);
+                let beside_frames = f64::from(self.log_frames.max(1));
+                self.log_frames = 0;
+                if std::env::var_os("VICTORY_COPY_BACK_BESIDE").is_some_and(|v| v == "1") {
+                    let (beside_writes, beside_bytes) = crate::watch::take_beside_stats();
+                    tracing::info!(
+                        "copy-back beside (VICTORY_COPY_BACK_BESIDE=1): {:.1} writes/frame, {:.2} MB/frame",
+                        beside_writes as f64 / beside_frames,
+                        beside_bytes as f64 / 1e6 / beside_frames
+                    );
+                }
                 for (why, n) in drops.iter().take(40) {
                     tracing::info!(
                         "dropped {:.1}/frame without a host pipeline: {why}",
