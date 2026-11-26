@@ -265,6 +265,7 @@ struct Fresh {
     n: u32,
     at: usize,
     first: u32,
+    half_hash: u64,
 }
 
 /// A hash that is mixed already, used as it is.
@@ -288,9 +289,9 @@ impl std::hash::Hasher for Plain {
 /// A quick hash of `table` and its `n` records. It only finds the table
 /// made before: the records are compared too, so a collision costs a copy,
 /// not wrong descriptors.
-fn table_hash(table: u64, n: u32) -> u64 {
+fn table_hash(table: u64, n: u32, half_hash: u64) -> u64 {
     let mix = |h: u64, x: u64| (h.rotate_left(5) ^ x).wrapping_mul(0x517c_c1b7_2722_0a95);
-    let h = (0..n).fold(table, |h, k| {
+    let h = (0..n).fold(mix(table, half_hash), |h, k| {
         let [a, b, c] = record(table, k);
         mix(mix(h, u64::from(a) | u64::from(b) << 32), u64::from(c))
     });
@@ -957,7 +958,7 @@ impl State {
         };
         for stage in &p.stages {
             let t = stage.translated();
-            if !self.tables(list, &t.used, &stage.tables, compute, &spans) {
+            if !self.tables(list, &t.used, &stage.tables, &t.host.half_views, compute, &spans) {
                 return no("a table not made");
             }
             if let Some((param, dwords)) = stage.user_data {
@@ -1355,11 +1356,12 @@ impl State {
     /// within a list. Returns the fresh tables' new byte offsets by root
     /// parameter in `self.made`, or `false` when the draw must be dropped (a
     /// constant table found no dynamic slots).
-    fn tables(
+    pub(crate) fn tables(
         &mut self,
         list: &HostList,
         used: &[UsedResource],
         layouts: &[TableLayout],
+        half: &[(u8, u32)],
         compute: bool,
         spans: &[(u8, u32, u32)],
     ) -> bool {
@@ -1375,6 +1377,25 @@ impl State {
             .filter(|u| matches!(u.kind, ResourceType::Cbv | ResourceType::Srv))
         {
             fresh.insert(u.slot);
+        }
+        // Tables holding a buffer view moved 16 bits a channel (`half_views`)
+        // are made afresh too when the title's view is a 16-bit float or
+        // signed format, so the unsigned twin stays separate from the title's.
+        for &(slot, at) in half {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            if crate::descriptor::host::half_view(&view).is_some() {
+                fresh.insert(slot);
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
+            }
         }
         // Tables reaching past a host heap smaller than the title's (the
         // host's limit, 1,000,000 views on NVIDIA, 2,048 samplers anywhere)
@@ -1436,6 +1457,21 @@ impl State {
                     n = target;
                 }
             }
+            // Descriptors the shader moves halves through may lie past the
+            // range starts in `layout.records`.
+            for &(_, at) in half.iter().filter(|&&(s, _)| s == slot) {
+                n = n.max(at / 8 + 1);
+            }
+            let has_half = half.iter().any(|&(s, _)| s == slot);
+            let half_hash = if has_half {
+                let mut hh = 1u64;
+                for k in 0..n {
+                    hh = hh.rotate_left(1) ^ u64::from(half.contains(&(slot, k * 8)));
+                }
+                hh
+            } else {
+                0
+            };
             let last = table + u64::from(n - 1) * 32;
             // Shaders read such a table to many lengths, and a copy for each
             // ran out of slots: the longest seen serves all.
@@ -1446,7 +1482,7 @@ impl State {
                 }
                 continue;
             }
-            let records: Vec<[u32; 3]> = if n >= LARGE {
+            let records: Vec<[u32; 3]> = if !has_half && n >= LARGE {
                 (0..n)
                     // SAFETY: descriptor slots in title memory.
                     .map(|k| unsafe {
@@ -1457,12 +1493,14 @@ impl State {
                 Vec::new()
             };
             let needed = layout.records.last().map_or(0, |&(r, _)| r as usize) + 1;
-            let same = self.large_tables.get(&table).and_then(|made| {
-                made.iter()
-                    .find(|(r, _)| r.len() >= needed && r[..needed] == records[..needed.min(records.len())])
-                    .map(|&(_, first)| first)
-            });
-            if n >= LARGE
+            let same = (!has_half).then(|| {
+                self.large_tables.get(&table).and_then(|made| {
+                    made.iter()
+                        .find(|(r, _)| r.len() >= needed && r[..needed] == records[..needed.min(records.len())])
+                        .map(|&(_, first)| first)
+                })
+            }).flatten();
+            if !has_half && n >= LARGE
                 && let Some(first) = same
             {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
@@ -1476,10 +1514,11 @@ impl State {
                 continue;
             }
             // The table and what its entries hold (record words).
-            let key = table_hash(table, n);
+            let key = table_hash(table, n, half_hash);
             let same = self.fresh_tables.get(&key).filter(|f| {
                 f.table == table
                     && f.n == n
+                    && f.half_hash == half_hash
                     && self.fresh_records[f.at..f.at + n as usize]
                         .iter()
                         .enumerate()
@@ -1512,8 +1551,17 @@ impl State {
             };
             let at = self.fresh_records.len();
             self.fresh_records.extend((0..n).map(|k| record(table, k)));
-            self.fresh_tables.insert(key, Fresh { table, n, at, first });
-            if n >= LARGE {
+            self.fresh_tables.insert(
+                key,
+                Fresh {
+                    table,
+                    n,
+                    at,
+                    first,
+                    half_hash,
+                },
+            );
+            if !has_half && n >= LARGE {
                 self.large_tables.entry(table).or_default().push((records, first));
             }
             self.dynamic
@@ -1540,7 +1588,14 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        if has_half
+                            && half.contains(&(slot, k * 8))
+                            && let Some(shown) = crate::descriptor::host::half_view(&view)
+                        {
+                            host.make_at(index, &shown);
+                        } else {
+                            host.make_at(index, &view);
+                        }
                         if let Some(u) = used {
                             readable(list, u, &view);
                         }
@@ -1560,6 +1615,11 @@ impl State {
         }
         self.made = made;
         true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dynamic_table_offset(&self, slot: u8) -> Option<u32> {
+        self.made.iter().find(|&&(s, _)| s == slot).map(|&(_, off)| off)
     }
 
     /// The first draws, at debug level: what they bind and read
@@ -2611,9 +2671,9 @@ mod table_stage_tests {
         let mut state = State::default();
         state.heaps = [title_heap as usize, 0];
         state.graphics = vec![Root::Table(base)];
-        assert!(state.tables(&list, &stage0, &layouts0, false, &spans));
+        assert!(state.tables(&list, &stage0, &layouts0, &[], false, &spans));
         let first_made = state.made.clone();
-        assert!(state.tables(&list, &stage1, &layouts1, false, &spans));
+        assert!(state.tables(&list, &stage1, &layouts1, &[], false, &spans));
         assert_eq!(state.made, first_made);
         assert_eq!(state.dynamic.len(), 1);
         assert_eq!(state.dynamic[0].2, 5);
@@ -2639,6 +2699,7 @@ mod table_stage_tests {
                 n: 2,
                 at: 0,
                 first: 3,
+                half_hash: 0,
             },
         );
         state.fresh_records.push([1, 2, 3]);

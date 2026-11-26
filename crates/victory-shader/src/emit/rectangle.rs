@@ -163,6 +163,7 @@ mod tests {
             written_root_uavs: Vec::new(),
             stride_table: false,
             write_marks: false,
+            half_views: Vec::new(),
         }
     }
 

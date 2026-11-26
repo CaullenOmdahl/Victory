@@ -23,6 +23,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod f64;
 mod half;
+#[path = "halves.rs"]
+mod halves;
 mod marks;
 mod reciprocal;
 mod rsqrt;
@@ -119,6 +121,9 @@ pub(crate) struct Lowered {
     pub root_uavs: Vec<u8>,
     /// Root UAVs among `root_uavs` an operation may write.
     pub written_root_uavs: Vec<u8>,
+    /// Table descriptors `(slot, dword_offset)` whose buffer moves 16-bit
+    /// channels as unsigned integers.
+    pub half_views: Vec<(u8, u32)>,
     pub stride_table: bool,
     pub write_marks: bool,
     pub user_data: Vec<UserData>,
@@ -584,6 +589,8 @@ struct Lower<'a> {
     params: FxMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    half_views: std::collections::BTreeSet<(u8, u32)>,
+    halves_only: std::collections::BTreeSet<(u8, u32)>,
     root_addrs: Vec<(u8, V, V)>,
     samplers: Vec<[u32; 4]>,
     descriptors: FxMap<(Site, bool), &'a Source>,
@@ -1615,6 +1622,8 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            half_views: Default::default(),
+            halves_only: Default::default(),
             root_addrs: Vec::new(),
             samplers: Vec::new(),
             descriptors: x
@@ -2279,11 +2288,13 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self) -> Result<Lowered, Stop> {
+        self.halves_only = self.places_read_as_halves();
         let user_data = self.lower_ir()?;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let written_root_uavs = std::mem::take(&mut self.s.written_root_uavs);
+        let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let stride_table = self.s.stride_table.is_some();
         let write_marks = self.s.write_marks.is_some();
         let cmp_samplers = self.s.cmp_samplers;
@@ -2293,6 +2304,7 @@ impl<'a> Lower<'a> {
             root_srvs,
             root_uavs,
             written_root_uavs,
+            half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -7005,7 +7017,13 @@ impl<'a> Lower<'a> {
                     let props = if un.starts_with("buffer_load_format")
                         || un.starts_with("buffer_store_format")
                     {
-                        (10 | u, 0x409)
+                        // Unsigned integers where the access moves halves.
+                        let halves = self.table_place(&src).is_some_and(|p| {
+                            self.halves_only.contains(&p)
+                                && (un.contains("_format_d16_")
+                                    || self.format_load_read_as_halves(ui))
+                        });
+                        (10 | u, if halves { 0x405 } else { 0x409 })
                     } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
                     {
                         (12 | u, stride)
@@ -7729,6 +7747,18 @@ impl<'a> Lower<'a> {
                     .is_some_and(|rp| rp.root == RootType::ResourceHeap),
                 _ => false,
             })
+    }
+
+    /// The table descriptor `src` is, as (root parameter, dword in the
+    /// table), when loaded from a fixed place in a table.
+    fn table_place(&self, src: &Source) -> Option<(u8, u32)> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let a = self.scalar.get(load)?;
+        let rp = self.x.native.layout.get(a.param)?;
+        (rp.root == RootType::Table && a.dynamic.is_none())
+            .then(|| (rp.slot, a.offset / 4 + u32::from(*first)))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -13181,11 +13211,20 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
+        let place = typed.then(|| self.table_place(src)).flatten().filter(|p| {
+            self.halves_only.contains(p) && (d16 || self.format_load_read_as_halves(inst))
+        });
+        let halves = place.is_some();
+        if let Some(place) = place {
+            self.half_views.insert(place);
+        }
         if store {
             let regs = if d16 { count.div_ceil(2) } else { count };
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
             if d16 {
+                // Through a view of a table each half is stored as it is
+                // (`halves`). Reached another way:
                 // shortcut: d16 data is taken as f16 (integer formats would
                 // keep 16 bits), widened for the 32-bit float store.
                 let mut wide = Vec::new();
@@ -13194,6 +13233,11 @@ impl<'a> Lower<'a> {
                     if k % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(c, Bin::LShr, x, k16);
+                    }
+                    if halves {
+                        let low = self.s.m.i32(0xffff);
+                        wide.push(self.s.m.bin(c, Bin::And, x, low));
+                        continue;
                     }
                     let f32t = self.s.t.f32;
                     let f = self
@@ -13205,20 +13249,37 @@ impl<'a> Lower<'a> {
             }
             let mut args = Vec::new();
             let (op, name, mark_byte_off, mark_elem_idx, mark_bytes) = if typed {
-                // shortcut: typed stores are taken to write a float format.
-                // The channels the opcode leaves out are written as 0: the
-                // validator has typed stores write all four.
+                // shortcut: typed stores are taken to write a float format
+                // unless routed through `half_views`. The channels the opcode
+                // leaves out are written as 0: the validator has typed stores
+                // write all four.
                 if *offen || *offset != 0 || matches!(off, V::Inst(_)) {
                     return Err("a typed buffer store at an offset");
                 }
-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
+                let component = if halves { 0x405 } else { 0x409 };
+                args.push(self.handle(site, src, false, (10 | u, component))?);
                 let elem = index.unwrap_or(self.s.m.i32(0));
                 args.extend([elem, iu]);
                 for x in vals {
-                    args.push(self.as_float(x));
+                    args.push(if halves { x } else { self.as_float(x) });
                 }
-                args.resize(3 + 4, self.s.m.f32(0));
-                (69, "bufferStore.f32", self.s.m.i32(0), Some(elem), 16u32)
+                let pad = if halves {
+                    self.s.m.i32(0)
+                } else {
+                    self.s.m.f32(0)
+                };
+                args.resize(3 + 4, pad);
+                (
+                    69,
+                    if halves {
+                        "bufferStore.i32"
+                    } else {
+                        "bufferStore.f32"
+                    },
+                    self.s.m.i32(0),
+                    Some(elem),
+                    16u32,
+                )
             } else {
                 let byte_off = match index {
                     Some(index) => {
@@ -13279,16 +13340,30 @@ impl<'a> Lower<'a> {
             if *offen || matches!(off, V::Inst(_)) || *offset != 0 {
                 return Err("a typed buffer load at an offset");
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
             let index = index.unwrap_or(self.s.m.i32(0));
-            self.s.op(
-                c,
-                "bufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                68,
-                &[h, index, iu],
-            )
+            if halves {
+                let h = self.handle(site, src, false, (10 | u, 0x405))?;
+                let i32t = self.s.t.i32;
+                let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+                self.s.op(
+                    c,
+                    "bufferLoad.i32",
+                    Attr::ReadOnly,
+                    ret,
+                    68,
+                    &[h, index, iu],
+                )
+            } else {
+                let h = self.handle(site, src, false, (10 | u, 0x409))?;
+                self.s.op(
+                    c,
+                    "bufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    68,
+                    &[h, index, iu],
+                )
+            }
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
@@ -13335,16 +13410,21 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
+            // Two f16 channels per VGPR (an odd last high half 0); through
+            // a view of a table, the 16 bits of each as they are.
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    let h = if halves {
+                        let low = self.s.m.i32(0xffff);
+                        self.s.m.bin(c, Bin::And, f, low)
+                    } else {
+                        self.s
+                            .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                    };
                     x = Some(match x {
                         Some(hi) => {
                             let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
@@ -13359,7 +13439,8 @@ impl<'a> Lower<'a> {
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
-            let x = self.as_int(x);
+            // Integers already when loaded through `half_views`.
+            let x = if halves { x } else { self.as_int(x) };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())

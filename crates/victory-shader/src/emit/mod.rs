@@ -316,6 +316,10 @@ pub struct HostShader {
     /// True when the shader emits GPU write-marks into `u0` in
     /// [`WRITE_MARKS_SPACE`].
     pub write_marks: bool,
+    /// Table descriptors `(slot, dword_offset)` whose buffer the shader moves
+    /// 16-bit channels through as unsigned integers (shown with unsigned
+    /// twin views when the title's view is 16-bit float/signed).
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -991,6 +995,7 @@ fn emit_program_pruned(
         written_root_uavs: l.written_root_uavs,
         stride_table: l.stride_table,
         write_marks: l.write_marks,
+        half_views: l.half_views,
     })
 }
 
@@ -1338,6 +1343,7 @@ mod tests {
             written_root_uavs: Vec::new(),
             stride_table: false,
             write_marks: false,
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1352,6 +1358,7 @@ mod tests {
                 written_root_uavs: Vec::new(),
                 stride_table: false,
                 write_marks: false,
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -1988,6 +1995,7 @@ mod tests {
                 written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
                 write_marks: l.write_marks,
+                half_views: l.half_views,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let out = host
@@ -2137,6 +2145,7 @@ mod tests {
                 written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
                 write_marks: l.write_marks,
+                half_views: l.half_views,
             };
             let data: Vec<u32> = (0..16).map(|k| 0xC0DE_0000 + k).collect();
             for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -2291,6 +2300,7 @@ mod tests {
                 written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
                 write_marks: l.write_marks,
+                half_views: l.half_views,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -2460,6 +2470,7 @@ mod tests {
                 written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
                 write_marks: l.write_marks,
+                half_views: l.half_views,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let srv_data: Vec<u32> = (100..112).collect();
@@ -2620,6 +2631,7 @@ mod tests {
                 written_root_uavs: l.written_root_uavs,
                 stride_table: l.stride_table,
                 write_marks: l.write_marks,
+                half_views: l.half_views,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let out = host

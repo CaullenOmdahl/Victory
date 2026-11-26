@@ -251,6 +251,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
     }
     word(&mut out, u32::from(s.stride_table));
     word(&mut out, u32::from(s.write_marks));
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -311,6 +316,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
     let written_root_uavs = r.list()?;
     let stride_table = r.word()? != 0;
     let write_marks = r.word()? != 0;
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -323,6 +333,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         written_root_uavs,
         stride_table,
         write_marks,
+        half_views,
     })
 }
 
@@ -353,6 +364,7 @@ mod tests {
             written_root_uavs: vec![4],
             stride_table: true,
             write_marks: true,
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 

@@ -185,6 +185,7 @@ fn build_cs(body: &[u32], outputs: &[u8]) -> HostShader {
         written_root_uavs: lowered.written_root_uavs,
         stride_table: lowered.stride_table,
         write_marks: lowered.write_marks,
+        half_views: lowered.half_views,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         let mut copy = shader.dxil.clone();

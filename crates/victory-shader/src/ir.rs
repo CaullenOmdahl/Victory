@@ -918,6 +918,27 @@ fn effects(
     lanes: u8,
     vgprs: u16,
 ) -> Result<Option<Effects>, ShaderError> {
+    effects_inner(inst, fields, name, lanes, vgprs, true)
+}
+
+/// Operand registers an instruction explicitly reads (excluding VGPR
+/// destinations implicitly kept across disabled `EXEC` lanes).
+pub(crate) fn operand_reads(p: &Program, inst: &Inst) -> Vec<Reg> {
+    let lanes = if p.wave64 { 2 } else { 1 };
+    effects_inner(&inst.machine, &inst.fields, inst.name(), lanes, p.vgprs, false)
+        .ok()
+        .flatten()
+        .map_or_else(Vec::new, |(reads, _)| reads)
+}
+
+fn effects_inner(
+    inst: &Instruction,
+    fields: &Fields,
+    name: &'static str,
+    lanes: u8,
+    vgprs: u16,
+    include_preserved: bool,
+) -> Result<Option<Effects>, ShaderError> {
     if DROPPED.contains(&name) {
         return Ok(None);
     }
@@ -1193,8 +1214,10 @@ fn effects(
         if !matches!(name, "v_readlane_b32" | "v_writelane_b32") {
             r.extend(mask(EXEC));
         }
-        // Lanes disabled in EXEC (or untouched by `v_writelane_b32`) keep the old value.
-        r.extend(w.iter().filter(|w| matches!(w, Reg::V(_))));
+        if include_preserved {
+            // Lanes disabled in EXEC (or untouched by `v_writelane_b32`) keep the old value.
+            r.extend(w.iter().filter(|w| matches!(w, Reg::V(_))));
+        }
     }
     let mut seen: RegSet = [0; REGS.div_ceil(64)];
     r.retain(|&reg| {

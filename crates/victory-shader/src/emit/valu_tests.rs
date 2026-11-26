@@ -2008,6 +2008,7 @@ fn build_lanes_cs(body: &[u32]) -> Result<HostShader, String> {
         written_root_uavs: lowered.written_root_uavs,
         stride_table: lowered.stride_table,
         write_marks: lowered.write_marks,
+        half_views: lowered.half_views,
     })
 }
 
