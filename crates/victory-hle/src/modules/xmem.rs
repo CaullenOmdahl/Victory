@@ -929,10 +929,31 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     write_physical_with(Mapping::Default, pages, offset, data)
 }
 
+fn shown_runs(runs: &[(Slice, usize)]) -> Vec<(usize, usize)> {
+    let physical = physical();
+    let mut shown = Vec::new();
+    for (slice, n) in runs {
+        let (from, to) = (slice.index, slice.index + n);
+        for (&base, (size, view)) in &physical.views {
+            let (first, last) = (view.index, view.index + size / PAGE);
+            if first < to && from < last && Arc::ptr_eq(&view.section, &slice.section) {
+                let (a, b) = (from.max(first), to.min(last));
+                shown.push((base + (a - first) * PAGE, (b - a) * PAGE));
+            }
+        }
+    }
+    shown
+}
+
 fn write_physical_with(mapping: Mapping, pages: &[usize], offset: usize, data: &[u8]) -> bool {
     let Some(runs) = runs(pages, offset, data.len()) else {
         return false;
     };
+    // Open guarded blocks before writing through DirectStorage mappings so
+    // the watch saves original bytes and holds the blocks open during writes.
+    for (at, len) in shown_runs(&runs) {
+        victory_gpu::kernel_will_write(at, len);
+    }
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
         let Some(mut view) = mapping.view(slice, *n) else {
@@ -988,22 +1009,7 @@ pub(crate) fn physical_written(pages: &[usize], offset: usize, len: usize) {
     let Some(runs) = runs(pages, offset, len) else {
         return;
     };
-    let shown: Vec<(usize, usize)> = {
-        let physical = physical();
-        let mut shown = Vec::new();
-        for (slice, n) in &runs {
-            let (from, to) = (slice.index, slice.index + n);
-            for (&base, (size, view)) in &physical.views {
-                let (first, last) = (view.index, view.index + size / PAGE);
-                if first < to && from < last && Arc::ptr_eq(&view.section, &slice.section) {
-                    let (a, b) = (from.max(first), to.min(last));
-                    shown.push((base + (a - first) * PAGE, (b - a) * PAGE));
-                }
-            }
-        }
-        shown
-    };
-    for (at, len) in shown {
+    for (at, len) in shown_runs(&runs) {
         victory_gpu::title_memory_written(at, len);
     }
 }
@@ -1052,8 +1058,12 @@ fn page_window_with(
     let [(slice, n)] = runs.as_slice() else {
         return None;
     };
+    let view = mapping.view(slice, *n)?;
+    for (at, shown_len) in shown_runs(&runs) {
+        victory_gpu::kernel_will_write(at, shown_len);
+    }
     Some(PageWindow {
-        view: mapping.view(slice, *n)?,
+        view,
         within: offset % PAGE,
         len,
         section: slice.section.clone(),
