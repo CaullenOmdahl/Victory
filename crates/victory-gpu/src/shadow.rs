@@ -2519,14 +2519,28 @@ static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new(
 static BUFFER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn buffer_generation() -> u64 {
-    BUFFER_GENERATION.load(Ordering::Acquire)
+    BUFFER_GENERATION.load(Ordering::SeqCst)
 }
 
-#[derive(Default)]
+const FIND_CACHE_LIMIT: usize = 8192;
+
+fn lookup_cache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LOOKUP_CACHE").is_none_or(|v| v != "0"))
+}
+
 struct FindCache {
     generation: u64,
-    key: (u64, u64),
-    shadow: Weak<Shadow>,
+    map: std::collections::HashMap<(u64, u64), Weak<Shadow>>,
+}
+
+impl Default for FindCache {
+    fn default() -> Self {
+        Self {
+            generation: u64::MAX,
+            map: std::collections::HashMap::new(),
+        }
+    }
 }
 
 thread_local! {
@@ -2540,7 +2554,6 @@ fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     let mut map = buffers();
-    BUFFER_GENERATION.fetch_add(1, Ordering::Release);
     let before = map.insert(
         (start, resource),
         Entry {
@@ -2548,6 +2561,9 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
             shadow: None,
         },
     );
+    // Counted after the insert while holding `BUFFERS`, so concurrent readers
+    // cannot cache pre-insert table results under the new generation.
+    BUFFER_GENERATION.fetch_add(1, Ordering::SeqCst);
     drop(map);
     // A buffer made again at the same place and address: its old copy may
     // still be named by lists and descriptors, as one the title released.
@@ -2560,7 +2576,7 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 pub(crate) fn unregister(resource: usize, start: u64) {
     let mut map = buffers();
     let gone = if map.contains_key(&(start, resource)) {
-        BUFFER_GENERATION.fetch_add(1, Ordering::Release);
+        BUFFER_GENERATION.fetch_add(1, Ordering::SeqCst);
         map.remove(&(start, resource))
     } else {
         None
@@ -2598,16 +2614,19 @@ pub(crate) fn find(address: u64, len: u64) -> Option<Arc<Shadow>> {
 }
 
 fn cached_lookup(address: u64, len: u64) -> Option<Arc<Shadow>> {
+    if !lookup_cache() {
+        return find_copy_inner(address, len).map(|(shadow, _)| shadow);
+    }
     let generation = buffer_generation();
     let key = (address, len.max(1));
     let cached = FIND_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         if cache.generation != generation {
-            cache.shadow = Weak::new();
+            cache.map.clear();
             cache.generation = generation;
             return None;
         }
-        (cache.key == key).then(|| cache.shadow.upgrade()).flatten()
+        cache.map.get(&key).and_then(Weak::upgrade)
     });
     if cached.is_some() && buffer_generation() == generation {
         return cached;
@@ -2618,11 +2637,13 @@ fn cached_lookup(address: u64, len: u64) -> Option<Arc<Shadow>> {
             let mut cache = cache.borrow_mut();
             let now = buffer_generation();
             if now != generation {
-                cache.shadow = Weak::new();
+                cache.map.clear();
                 cache.generation = now;
             } else {
-                cache.key = key;
-                cache.shadow = Arc::downgrade(&shadow);
+                if cache.map.len() >= FIND_CACHE_LIMIT {
+                    cache.map.clear();
+                }
+                cache.map.insert(key, Arc::downgrade(&shadow));
             }
         });
     }
@@ -3195,5 +3216,35 @@ mod find_cache_tests {
             buffer_generation()
         );
         unregister(SECOND, address);
+    }
+
+    #[test]
+    fn a_pending_registration_invalidates_readers_of_the_old_table() {
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let resource = start as usize;
+        let table = buffers();
+        let initial = BUFFER_GENERATION.load(Ordering::Acquire);
+        let ready = std::sync::Barrier::new(2);
+        let observed = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                ready.wait();
+                register(resource, start, 8);
+            });
+            ready.wait();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(50);
+            while BUFFER_GENERATION.load(Ordering::Acquire) == initial
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::yield_now();
+            }
+            let count = BUFFER_GENERATION.load(Ordering::Acquire);
+            assert!(!table.contains_key(&(start, resource)));
+            drop(table);
+            count
+        });
+        let committed = BUFFER_GENERATION.load(Ordering::Acquire);
+        unregister(resource, start);
+        assert_ne!(committed, observed, "the old table still has the current generation");
     }
 }

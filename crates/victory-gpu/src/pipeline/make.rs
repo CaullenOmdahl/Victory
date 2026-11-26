@@ -48,6 +48,8 @@ pub(crate) struct Pending {
     /// whether a draw has used it yet.
     key: String,
     used: AtomicBool,
+    /// First title frame that waited for it (`u64::MAX`: none yet).
+    waited_frame: AtomicU64,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -75,6 +77,7 @@ impl Pending {
             replaced: AtomicBool::new(false),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            waited_frame: AtomicU64::new(u64::MAX),
         }
     }
 
@@ -337,6 +340,24 @@ pub(crate) fn take_waited_ms() -> f64 {
     (WAITS[0].take(now) + WAITS[1].take(now)).as_secs_f64() * 1000.0
 }
 
+/// Whether a pipeline is waited for in every frame that draws with it
+/// (`VICTORY_PIPELINE_WAIT_EVERY_FRAME=1`), not just the first frame with budget.
+fn wait_every_frame() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_WAIT_EVERY_FRAME").is_some_and(|v| v == "1"))
+}
+
+/// Claims `frame` as the single frame in which `p` may be waited for.
+fn claim_wait(p: &Pending, frame: u64) -> bool {
+    if wait_every_frame() {
+        return true;
+    }
+    match p.waited_frame.compare_exchange(u64::MAX, frame, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => true,
+        Err(first) => first == frame,
+    }
+}
+
 /// Waits for `p` while frame `frame` has budget of its kind left.
 fn wait(p: &Pending, frame: u64) {
     let kind = usize::from(p.screen);
@@ -357,8 +378,12 @@ fn wait_within(waits: &Waits, budget: Duration, p: &Pending, frame: u64) {
             self.0.end(Instant::now());
         }
     }
-    let end = waits.begin(frame, Instant::now(), budget);
+    let now = Instant::now();
+    let end = waits.begin(frame, now, budget);
     let _under = Under(waits);
+    if end <= now || !claim_wait(p, frame) {
+        return;
+    }
     let (lock, done) = &DONE;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !stuck(p) {
@@ -602,5 +627,26 @@ mod tests {
             let over = (*began).max(first + budget) + slack;
             assert!(*began + *waited <= over, "{waits:?}");
         }
+    }
+
+    #[test]
+    fn a_pipeline_is_waited_for_in_one_frame_only() {
+        let p = Pending::new(Vec::new(), None);
+        p.queued.store(true, Ordering::Relaxed);
+        let frame = crate::frame::current();
+        p.waited_frame.store(frame.wrapping_add(1), Ordering::Relaxed);
+        let p = Arc::new(p);
+        let started = Instant::now();
+        assert!(ready(&p).is_none());
+        assert!(started.elapsed() < Duration::from_millis(50), "waited {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn the_first_frame_claims_the_wait() {
+        let p = Pending::new(Vec::new(), None);
+        assert!(claim_wait(&p, 7));
+        assert!(claim_wait(&p, 7));
+        assert!(!claim_wait(&p, 8));
+        assert_eq!(p.waited_frame.load(Ordering::Relaxed), 7);
     }
 }
