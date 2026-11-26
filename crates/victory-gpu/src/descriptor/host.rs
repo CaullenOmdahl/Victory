@@ -1597,7 +1597,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.min(65_536).next_multiple_of(256),
+            SizeInBytes: constant_view_size(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -1906,7 +1906,7 @@ impl HostHeap {
         bounce_active: bool,
     ) -> Option<CbvMaterialized> {
         let host = host()?;
-        let aligned = capped.next_multiple_of(256);
+        let aligned = constant_view_size(capped);
         if address.is_multiple_of(256)
             && let Some(shadow) = crate::shadow::find(address, u64::from(capped))
             && shadow.gpu(address).is_multiple_of(256)
@@ -3274,6 +3274,21 @@ fn without_mips(d: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, skip: u32) {
     }
 }
 
+/// The size of a constant buffer view the host takes: 256-byte steps, and
+/// at most 4,096 vectors (65,536 bytes, `D3D12_REQ_CONSTANT_BUFFER_ELEMENT_COUNT`).
+/// `CreateConstantBufferView` with a larger size is an invalid call.
+fn constant_view_size(size: u32) -> u32 {
+    const MOST: u32 = 4096 * 16;
+    if size > MOST {
+        once!(
+            size,
+            "a constant buffer view over 64 KiB, made 64 KiB (the host takes no more)"
+        );
+        return MOST;
+    }
+    size.max(1).next_multiple_of(256)
+}
+
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
@@ -3296,7 +3311,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: capped.next_multiple_of(256),
+                SizeInBytes: constant_view_size(size),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -3645,6 +3660,19 @@ mod tests {
         desc: HeapDesc,
         addr: u64,
         size: u64,
+    }
+
+    /// A constant view is made in 256-byte steps and at most 64 KiB, the
+    /// most the host takes.
+    #[test]
+    fn constant_views_are_at_most_64_kib() {
+        assert_eq!(constant_view_size(16), 256);
+        assert_eq!(constant_view_size(256), 256);
+        assert_eq!(constant_view_size(65_536), 65_536);
+        assert_eq!(constant_view_size(1_306_368), 65_536);
+        assert_eq!(constant_view_size(65_537), 65_536);
+        assert_eq!(constant_view_size(u32::MAX), 65_536);
+        assert_eq!(constant_view_size(u32::MAX - 100), 65_536);
     }
 
     fn make_shader_heap(count: u32) -> (This, u64) {

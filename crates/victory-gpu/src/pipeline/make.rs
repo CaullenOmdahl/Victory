@@ -22,6 +22,7 @@
 //! for screen passes) are guesses; another pass the title runs only once
 //! and whose pipeline takes longer is lost.
 
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -78,9 +79,28 @@ impl Pending {
     }
 
     fn make(&self) {
+        self.make_with(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+    }
+
+    fn make_with(&self, create: impl FnOnce() -> Option<HostPipeline>) {
         let _ = self.begun.set(Instant::now());
         // Not `get_or_init`: a worker lost in it would leave it locked.
-        let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+        let made = match catch_unwind(AssertUnwindSafe(create)) {
+            Ok(made) => made,
+            Err(payload) => {
+                let message = payload
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("unknown panic payload");
+                tracing::error!(
+                    shaders = ?self.shaders,
+                    panic = message,
+                    "a panic while making a pipeline: it is refused"
+                );
+                None
+            }
+        };
         let _ = self.made.set(made);
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -459,6 +479,13 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_panic_refuses_the_pipeline() {
+        let p = Pending::new(Vec::new(), None);
+        p.make_with(|| panic!("pipeline creation panicked"));
+        assert!(matches!(p.made.get(), Some(None)));
+    }
 
     /// A first use queues the pipeline and, within the budget, gets the
     /// worker's answer (here: no host pipeline for no shaders).
