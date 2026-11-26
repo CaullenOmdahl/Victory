@@ -2946,13 +2946,123 @@ unsafe fn merge_gpu_writes_card_avx2(
     ((first < last).then_some((first, last)), cpu_modified)
 }
 
+// Small buffers are common. Once a backward search is a page away from
+// the requested end, only entries in the long-buffer index can reach it.
+const SHORT_BUFFER: u64 = PAGE as u64;
+
 struct Entry {
     end: u64,
     shadow: Option<Arc<Shadow>>,
 }
 
+struct BufferMap {
+    entries: BTreeMap<(u64, usize), Entry>,
+    long_ends: BTreeMap<(u64, usize), u64>,
+    // Releasing a buffer can leave this bound larger than necessary.
+    longest: u64,
+}
+
+impl BufferMap {
+    const fn new() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            long_ends: BTreeMap::new(),
+            longest: 0,
+        }
+    }
+
+    fn register(&mut self, resource: usize, start: u64, len: u64) -> Option<Entry> {
+        let key = (start, resource);
+        let end = start.saturating_add(len);
+        self.longest = self.longest.max(len);
+        let previous = self.entries.insert(key, Entry { end, shadow: None });
+        if len > SHORT_BUFFER {
+            self.long_ends.insert(key, end);
+        } else if previous.is_some() {
+            self.long_ends.remove(&key);
+        }
+        previous
+    }
+
+    fn unregister(&mut self, resource: usize, start: u64) -> Option<Entry> {
+        let key = (start, resource);
+        self.long_ends.remove(&key);
+        self.entries.remove(&key)
+    }
+
+    fn containing(&self, address: u64, end: u64) -> Option<(&(u64, usize), &Entry)> {
+        let last = (address, usize::MAX);
+        let mut earlier = self.entries.range(..=last).rev();
+        let nearest = earlier.next()?;
+        if nearest.1.end >= end {
+            return Some(nearest);
+        }
+        let nearby = end.saturating_sub(SHORT_BUFFER);
+        if let Some(hit) = earlier
+            .take_while(|(key, _)| key.0 >= nearby)
+            .find(|(_, entry)| entry.end >= end)
+        {
+            return Some(hit);
+        }
+        let earliest = end.saturating_sub(self.longest);
+        let (key, _) = self
+            .long_ends
+            .range(..=last)
+            .rev()
+            .take_while(|(key, _)| key.0 >= earliest)
+            .find(|(_, limit)| **limit >= end)?;
+        self.entries.get_key_value(key)
+    }
+
+    /// Picks a buffer covering `[address, end)`, preferring one whose shadow
+    /// copy already exists so inner sub-buffers share an enclosing copy.
+    fn containing_prefer_made(&self, address: u64, end: u64) -> Option<(u64, usize)> {
+        let last = (address, usize::MAX);
+        let mut first = None;
+        let mut earlier = self.entries.range(..=last).rev();
+        if let Some((k, e)) = earlier.next()
+            && e.end >= end
+        {
+            if e.shadow.is_some() {
+                return Some(*k);
+            }
+            first = Some(*k);
+        }
+        let nearby = end.saturating_sub(SHORT_BUFFER);
+        for (k, e) in earlier.take_while(|(k, _)| k.0 >= nearby) {
+            if e.end >= end {
+                if first.is_none() {
+                    first = Some(*k);
+                }
+                if e.shadow.is_some() {
+                    return Some(*k);
+                }
+            }
+        }
+        let earliest = end.saturating_sub(self.longest);
+        for (k, &limit) in self
+            .long_ends
+            .range(..=last)
+            .rev()
+            .take_while(|(k, _)| k.0 >= earliest)
+        {
+            if limit >= end
+                && let Some(e) = self.entries.get(k)
+            {
+                if first.is_none() {
+                    first = Some(*k);
+                }
+                if e.shadow.is_some() {
+                    return Some(*k);
+                }
+            }
+        }
+        first
+    }
+}
+
 /// Title buffers by (start address, resource), with their copy once made.
-static BUFFERS: Mutex<BTreeMap<(u64, usize), Entry>> = Mutex::new(BTreeMap::new());
+static BUFFERS: Mutex<BufferMap> = Mutex::new(BufferMap::new());
 static BUFFER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 fn buffer_generation() -> u64 {
@@ -2984,20 +3094,14 @@ thread_local! {
     static FIND_CACHE: RefCell<FindCache> = RefCell::new(FindCache::default());
 }
 
-fn buffers() -> std::sync::MutexGuard<'static, BTreeMap<(u64, usize), Entry>> {
+fn buffers() -> std::sync::MutexGuard<'static, BufferMap> {
     BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
     let mut map = buffers();
-    let before = map.insert(
-        (start, resource),
-        Entry {
-            end: start + len,
-            shadow: None,
-        },
-    );
+    let before = map.register(resource, start, len);
     // Counted after the insert while holding `BUFFERS`, so concurrent readers
     // cannot cache pre-insert table results under the new generation.
     BUFFER_GENERATION.fetch_add(1, Ordering::SeqCst);
@@ -3012,12 +3116,12 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
     let mut map = buffers();
-    let gone = if map.contains_key(&(start, resource)) {
+    let gone = map.unregister(resource, start);
+    if gone.is_some() {
+        // Counted after the remove while holding `BUFFERS`, so concurrent readers
+        // cannot cache pre-remove table results under the new generation.
         BUFFER_GENERATION.fetch_add(1, Ordering::SeqCst);
-        map.remove(&(start, resource))
-    } else {
-        None
-    };
+    }
     drop(map);
     if let Some(shadow) = gone.and_then(|e| e.shadow) {
         shadow.gone.store(true, Ordering::Relaxed);
@@ -3031,11 +3135,7 @@ pub(crate) fn in_buffer(address: u64, len: u64) -> bool {
     let Some(end) = address.checked_add(len.max(1)) else {
         return false;
     };
-    buffers()
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .any(|(_, e)| e.end >= end)
+    buffers().containing(address, end).is_some()
 }
 
 /// The copy of a title buffer holding `[address, address + len)`: of one
@@ -3101,28 +3201,12 @@ fn find_copy_inner(address: u64, len: u64) -> Option<(Arc<Shadow>, bool)> {
         return Some((copy, false));
     }
     let mut map = buffers();
-    let mut first = None;
-    let mut made = None;
-    for (k, e) in map
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .filter(|(_, e)| e.end >= end)
-    {
-        if first.is_none() {
-            first = Some(*k);
-        }
-        if e.shadow.is_some() {
-            made = Some(*k);
-            break;
-        }
-    }
-    let key = made.or(first);
+    let key = map.containing_prefer_made(address, end);
     let Some(key) = key else {
         drop(map);
         return loose(address, end).map(|s| (s, false));
     };
-    let entry = map.get_mut(&key)?;
+    let entry = map.entries.get_mut(&key)?;
     if entry.shadow.is_none() {
         let len = entry.end - key.0;
         let size = len.next_multiple_of(1 << 16);
@@ -3172,23 +3256,16 @@ fn find_copy_inner(address: u64, len: u64) -> Option<(Arc<Shadow>, bool)> {
 /// through the view is a GPU page fault.
 /// Where the innermost title buffer holding `address` ends, if one does.
 pub(crate) fn buffer_end(address: u64) -> Option<u64> {
-    buffers()
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .map(|(_, e)| e.end)
-        .find(|&e| e > address)
+    let end = address.checked_add(1)?;
+    buffers().containing(address, end).map(|(_, e)| e.end)
 }
 
 pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
     // To the end of the innermost buffer holding it: a window ending sooner
     // faults.
-    let end = buffers()
-        .range(..=(address, usize::MAX))
-        .rev()
-        .take(64)
-        .map(|(_, e)| e.end)
-        .find(|&e| e > address);
+    let end = address
+        .checked_add(1)
+        .and_then(|e| buffers().containing(address, e).map(|(_, entry)| entry.end));
     if let Some(end) = end {
         return direct(address, end).or_else(|| find_copy(address, 1));
     }
@@ -3356,6 +3433,7 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
 /// starts closest below host GPU address `va`, and where `va` is in it.
 pub(crate) fn near(va: u64) -> String {
     let mut all: Vec<(u64, u64, u64)> = buffers()
+        .entries
         .values()
         .filter_map(|e| e.shadow.as_deref().map(|s| (s.gpu, s.start, s.len)))
         .collect();
@@ -4011,7 +4089,7 @@ mod find_cache_tests {
                 std::thread::yield_now();
             }
             let count = BUFFER_GENERATION.load(Ordering::Acquire);
-            assert!(!table.contains_key(&(start, resource)));
+            assert!(!table.entries.contains_key(&(start, resource)));
             drop(table);
             count
         });
@@ -4217,5 +4295,79 @@ mod find_cache_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod buffer_map_tests {
+    use super::{BUFFER_GENERATION, BufferMap, SHORT_BUFFER, register, unregister};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn a_long_buffer_still_covers_the_query_after_many_shorter_buffers() {
+        let mut map = BufferMap::new();
+        map.register(0, 0, SHORT_BUFFER);
+        for start in 1..=300 {
+            map.register(1, start, 1);
+        }
+        assert_eq!(
+            map.containing(300, 301).map(|(key, _)| *key),
+            Some((300, 1))
+        );
+        assert_eq!(
+            map.containing(300, 302).map(|(key, _)| *key),
+            Some((0, 0))
+        );
+        assert!(map.containing(SHORT_BUFFER, SHORT_BUFFER + 1).is_none());
+        map.unregister(0, 0);
+        assert!(map.containing(300, 302).is_none());
+    }
+
+    #[test]
+    fn the_long_buffer_index_tracks_replacement_and_removal() {
+        let mut map = BufferMap::new();
+        map.register(1, 0, 8 * SHORT_BUFFER);
+        map.register(2, SHORT_BUFFER, 4 * SHORT_BUFFER);
+        for i in 0..300 {
+            map.register(3, 2 * SHORT_BUFFER + i, 1);
+        }
+        let query = |m: &BufferMap| {
+            m.containing(3 * SHORT_BUFFER, 3 * SHORT_BUFFER + 1)
+                .map(|(key, _)| *key)
+        };
+        assert_eq!(query(&map), Some((SHORT_BUFFER, 2)));
+        map.register(2, SHORT_BUFFER, 1);
+        assert_eq!(query(&map), Some((0, 1)));
+        map.unregister(1, 0);
+        assert_eq!(query(&map), None);
+        map.register(2, SHORT_BUFFER, 4 * SHORT_BUFFER);
+        assert_eq!(query(&map), Some((SHORT_BUFFER, 2)));
+    }
+
+    #[test]
+    fn containing_prefer_made_finds_outer_buffer_past_many_shorter_ones() {
+        let mut map = BufferMap::new();
+        map.register(0, 0, 4 * SHORT_BUFFER);
+        for start in 1..=300 {
+            map.register(1, start, 1);
+        }
+        assert_eq!(map.containing_prefer_made(300, 302), Some((0, 0)));
+    }
+
+    #[test]
+    fn unregister_only_bumps_generation_when_removing_an_entry() {
+        let slot = 0u64;
+        let start = (&raw const slot) as u64;
+        let resource = start as usize;
+        unregister(resource, start);
+        let gen0 = BUFFER_GENERATION.load(Ordering::Acquire);
+        unregister(resource, start);
+        assert_eq!(BUFFER_GENERATION.load(Ordering::Acquire), gen0);
+
+        register(resource, start, 64);
+        let gen1 = BUFFER_GENERATION.load(Ordering::Acquire);
+        assert_ne!(gen1, gen0);
+        unregister(resource, start);
+        assert_ne!(BUFFER_GENERATION.load(Ordering::Acquire), gen1);
     }
 }
