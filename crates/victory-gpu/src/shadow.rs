@@ -1730,8 +1730,11 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
 
 /// Where the unmapped title memory `address` is in ends, if it is.
 fn unmapped(address: usize) -> Option<usize> {
+    if let Some(end) = crate::watch::cached_unmapped_end(address) {
+        return Some(end);
+    }
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
     };
     // SAFETY: the query looks at an address and fills a local structure.
     unsafe {
@@ -1740,8 +1743,16 @@ fn unmapped(address: usize) -> Option<usize> {
         if VirtualQuery(address as *const _, &mut info, size) != size {
             return Some((address | (CHUNK as usize - 1)) + 1);
         }
-        (info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS)
-            .then(|| info.BaseAddress as usize + info.RegionSize)
+        if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
+            let lo = info.BaseAddress as usize;
+            let hi = lo.saturating_add(info.RegionSize);
+            if info.Type == MEM_MAPPED {
+                crate::watch::record_unmapped_hole(lo, hi);
+            }
+            Some(hi)
+        } else {
+            None
+        }
     }
 }
 

@@ -113,6 +113,9 @@ Speed:
 - Single-view guard faults and re-arming `VirtualProtect` calls can run off the
   global guard lock under 1 MiB stripe locks (`VICTORY_PORT_GUARD=1`, off by
   default).
+- `VirtualQuery` results for `MEM_MAPPED` view regions and unmapped holes can be
+  cached until map, commit, or title writes (`VICTORY_HOLES_ONCE=1`, off by
+  default).
 
 Memory the title shows at several addresses:
 - Every view of a guarded physical page is guarded with it, so a write of

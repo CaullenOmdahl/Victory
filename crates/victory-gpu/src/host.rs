@@ -4980,7 +4980,11 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     if !title_dst
         && len >= 64 << 10
-        && crate::watch::has_known_hole(src as usize, (src as usize).saturating_add(len))
+        && (crate::watch::has_known_hole(src as usize, (src as usize).saturating_add(len))
+            || crate::watch::has_cached_unmapped_hole(
+                src as usize,
+                (src as usize).saturating_add(len),
+            ))
     {
         read_sparse(src, dst, len);
         #[cfg(feature = "diagnostics")]
@@ -5003,16 +5007,28 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
 }
 
 /// After a failed bulk read into host memory, skip contiguous holes. Never
-/// cache the query across copies: the title may remap the same address.
+/// cache the query across copies unless `VICTORY_HOLES_ONCE=1` is active (in
+/// which case holes clear on map/unmap/commit).
 fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
+        MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualQuery,
     };
     let mut offset = 0;
     while offset < len {
         let at = src.wrapping_add(offset);
         let to = dst.wrapping_add(offset);
         let remaining = len - offset;
+        if let Some(hole_end) = crate::watch::cached_unmapped_end(at as usize) {
+            let n = hole_end.saturating_sub(at as usize).min(remaining);
+            if n > 0 {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
+                // SAFETY: `to` is a writable host staging slice covering `remaining` bytes.
+                unsafe { to.write_bytes(0, n) };
+                offset += n;
+                continue;
+            }
+        }
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
@@ -5023,6 +5039,11 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
             break;
         }
         if info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS {
+            if info.Type == MEM_MAPPED {
+                let lo = info.BaseAddress as usize;
+                let hi = lo.saturating_add(info.RegionSize);
+                crate::watch::record_unmapped_hole(lo, hi);
+            }
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::Unmapped, n as u64);
             // SAFETY: this path is only used with a writable host destination.
@@ -5579,6 +5600,7 @@ impl Meter {
                 crate::port_cbv::log(frames);
                 crate::heap_worker::log(frames);
                 crate::watch::log_port_guard(frames);
+                crate::watch::log_holes_once(frames);
                 crate::copystat::log(frames);
                 let beside_frames = f64::from(self.log_frames.max(1));
                 self.log_frames = 0;

@@ -587,6 +587,173 @@ pub(crate) fn log_port_guard(frames: f64) {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Per-thread override for [`holes_once`] in unit tests.
+    pub(crate) static HOLES_ONCE_HERE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether unmapped hole and guardable-view `VirtualQuery` intervals are
+/// cached across frames until `title_memory_remapped` / `title_memory_committed`
+/// (`VICTORY_HOLES_ONCE=1`, off by default).
+pub(crate) fn holes_once() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = HOLES_ONCE_HERE.get() {
+        return enabled;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOLES_ONCE").is_some_and(|v| v == "1"))
+}
+
+static HOLE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static GUARDABLE_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_holes_once(frames: f64) {
+    if !holes_once() {
+        return;
+    }
+    let holes = HOLE_CACHE_HITS.swap(0, Ordering::Relaxed);
+    let views = GUARDABLE_CACHE_HITS.swap(0, Ordering::Relaxed);
+    if holes + views > 0 {
+        tracing::info!(
+            "holes_once (VICTORY_HOLES_ONCE=1) per frame: {:.1} unmapped hole hits, {:.1} view region hits (VirtualQuery skipped)",
+            holes as f64 / frames,
+            views as f64 / frames,
+        );
+    }
+}
+
+#[derive(Default)]
+struct HoleCache {
+    /// Byte intervals `[lo, hi)` proven unmapped (`!MEM_COMMIT || PAGE_NOACCESS`).
+    unmapped: BTreeMap<usize, usize>,
+    /// Block intervals `[first_block, last_block)` proven guardable (`view_run`).
+    guardable: BTreeMap<usize, usize>,
+}
+
+static HOLE_CACHE: RwLock<HoleCache> = RwLock::new(HoleCache {
+    unmapped: BTreeMap::new(),
+    guardable: BTreeMap::new(),
+});
+
+impl HoleCache {
+    fn insert(map: &mut BTreeMap<usize, usize>, mut lo: usize, mut hi: usize) {
+        use std::ops::Bound::{Excluded, Included};
+        if lo >= hi {
+            return;
+        }
+        let mut to_remove = Vec::new();
+        if let Some((&k, &v)) = map.range(..=lo).next_back()
+            && v >= lo
+        {
+            lo = k;
+            hi = hi.max(v);
+            to_remove.push(k);
+        }
+        for (&k, &v) in map.range((Excluded(lo), Included(hi))) {
+            hi = hi.max(v);
+            to_remove.push(k);
+        }
+        for k in to_remove {
+            map.remove(&k);
+        }
+        map.insert(lo, hi);
+    }
+
+    fn clear(map: &mut BTreeMap<usize, usize>, from: usize, to: usize) {
+        if from >= to || map.is_empty() {
+            return;
+        }
+        let mut to_remove = Vec::new();
+        let mut to_insert = Vec::new();
+        if let Some((&k, &v)) = map.range(..from).next_back()
+            && v > from
+        {
+            to_remove.push(k);
+            to_insert.push((k, from));
+            if v > to {
+                to_insert.push((to, v));
+            }
+        }
+        for (&k, &v) in map.range(from..to) {
+            to_remove.push(k);
+            if v > to {
+                to_insert.push((to, v));
+            }
+        }
+        for k in to_remove {
+            map.remove(&k);
+        }
+        for (k, v) in to_insert {
+            map.insert(k, v);
+        }
+    }
+
+    fn lookup(map: &BTreeMap<usize, usize>, at: usize) -> Option<usize> {
+        map.range(..=at)
+            .next_back()
+            .and_then(|(_, &hi)| (at < hi).then_some(hi))
+    }
+
+    fn overlaps(map: &BTreeMap<usize, usize>, start: usize, end: usize) -> bool {
+        if start >= end || map.is_empty() {
+            return false;
+        }
+        if map.range(..start).next_back().is_some_and(|(_, &hi)| hi > start) {
+            return true;
+        }
+        map.range(start..end).next().is_some()
+    }
+}
+
+pub(crate) fn cached_unmapped_end(at: usize) -> Option<usize> {
+    if !holes_once() {
+        return None;
+    }
+    let hit = HoleCache::lookup(&HOLE_CACHE.read().unwrap_or_else(|e| e.into_inner()).unmapped, at);
+    if hit.is_some() {
+        HOLE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    hit
+}
+
+pub(crate) fn record_unmapped_hole(lo: usize, hi: usize) {
+    if !holes_once() || lo >= hi {
+        return;
+    }
+    let mut c = HOLE_CACHE.write().unwrap_or_else(|e| e.into_inner());
+    HoleCache::insert(&mut c.unmapped, lo, hi);
+}
+
+pub(crate) fn has_cached_unmapped_hole(start: usize, end: usize) -> bool {
+    if !holes_once() || start >= end {
+        return false;
+    }
+    HoleCache::overlaps(
+        &HOLE_CACHE.read().unwrap_or_else(|e| e.into_inner()).unmapped,
+        start,
+        end,
+    )
+}
+
+fn clear_cached_unmapped(start: usize, end: usize) {
+    if start >= end {
+        return;
+    }
+    let mut c = HOLE_CACHE.write().unwrap_or_else(|e| e.into_inner());
+    HoleCache::clear(&mut c.unmapped, start, end);
+}
+
+fn clear_cached_guardable(first_block: usize, last_block: usize) {
+    if first_block >= last_block {
+        return;
+    }
+    let mut c = HOLE_CACHE.write().unwrap_or_else(|e| e.into_inner());
+    HoleCache::clear(&mut c.guardable, first_block, last_block);
+}
+
 struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
@@ -1141,20 +1308,48 @@ fn hole_run_end(block: usize, last: usize) -> usize {
 /// but committed private memory, images, and free memory).
 fn view_run(block: usize, to: usize) -> (usize, bool) {
     use windows_sys::Win32::System::Memory::{
-        MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, VirtualQuery,
+        MEM_COMMIT, MEM_FREE, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS,
+        VirtualQuery,
     };
+    if holes_once() {
+        let c = HOLE_CACHE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(end_block) = HoleCache::lookup(&c.guardable, block) {
+            GUARDABLE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return (end_block.clamp(block + 1, to), true);
+        }
+        if let Some(end_byte) = HoleCache::lookup(&c.unmapped, block * BLOCK) {
+            let hole_end = end_byte / BLOCK;
+            if hole_end > block {
+                HOLE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                return (hole_end.clamp(block + 1, to), false);
+            }
+        }
+    }
     let mut info = MEMORY_BASIC_INFORMATION::default();
     // SAFETY: queries our own address space without dereferencing `block`.
     let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
     if n == 0 || info.RegionSize == 0 {
         return (block + 1, false);
     }
-    let end = (info.BaseAddress as usize)
-        .saturating_add(info.RegionSize)
-        .div_ceil(BLOCK)
-        .clamp(block + 1, to);
+    let base = info.BaseAddress as usize;
+    let region_end = base.saturating_add(info.RegionSize);
+    let end = region_end.div_ceil(BLOCK).clamp(block + 1, to);
     let non_view = info.State == MEM_FREE
         || (info.State == MEM_COMMIT && (info.Type == MEM_PRIVATE || info.Type == MEM_IMAGE));
+    if holes_once() {
+        if !non_view {
+            let g_lo = base.div_ceil(BLOCK);
+            let g_hi = region_end / BLOCK;
+            if g_lo < g_hi {
+                let mut c = HOLE_CACHE.write().unwrap_or_else(|e| e.into_inner());
+                HoleCache::insert(&mut c.guardable, g_lo, g_hi);
+            }
+        } else if info.Type == windows_sys::Win32::System::Memory::MEM_MAPPED
+            && (info.State != MEM_COMMIT || info.Protect == PAGE_NOACCESS)
+        {
+            record_unmapped_hole(base, region_end);
+        }
+    }
     (end, !non_view)
 }
 
@@ -1760,12 +1955,15 @@ pub fn title_memory_remapped(at: usize, len: usize) {
         let mut g = guards_mut();
         remapped_locked(&mut g, at, end, true);
     }
+    clear_cached_unmapped(at, end);
+    clear_cached_guardable(at / BLOCK, end.div_ceil(BLOCK));
     remapped_notify(at, end);
 }
 
 /// The title committed memory `[at, at + len)` it had reserved.
 pub fn title_memory_committed(at: usize, len: usize) {
     if len != 0 {
+        clear_cached_unmapped(at, at.saturating_add(len));
         crate::shadow::filled(at as u64, (at + len) as u64);
     }
 }
@@ -1775,6 +1973,7 @@ pub fn title_memory_committed(at: usize, len: usize) {
 /// next use, not when their turn to be looked at comes.
 pub fn title_memory_written(at: usize, len: usize) {
     if len != 0 {
+        clear_cached_unmapped(at, at.saturating_add(len));
         bump_region_epochs(at, at.saturating_add(len));
         // The runtime writes through a view of its own, which neither the
         // kernel's write watch nor our guards see: the pages are noted
@@ -2724,5 +2923,34 @@ mod tests {
             assert_ne!(UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }), 0);
             assert_ne!(CloseHandle(section), 0);
         }
+    }
+
+    #[test]
+    fn holes_once_caches_unmapped_and_clears_on_commit_and_remap() {
+        struct Reset(Option<bool>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                super::HOLES_ONCE_HERE.set(self.0);
+            }
+        }
+        let _r = Reset(super::HOLES_ONCE_HERE.replace(Some(true)));
+        assert!(super::holes_once());
+
+        let base = 0x7000_0000_0000usize;
+        let len = 4 * PAGE;
+        super::record_unmapped_hole(base, base + len);
+        assert_eq!(super::cached_unmapped_end(base + 128), Some(base + len));
+        assert!(super::has_cached_unmapped_hole(base + PAGE, base + 2 * PAGE));
+
+        // Committing the middle 2 pages splits the unmapped hole into left + right.
+        title_memory_committed(base + PAGE, 2 * PAGE);
+        assert_eq!(super::cached_unmapped_end(base + 16), Some(base + PAGE));
+        assert_eq!(super::cached_unmapped_end(base + PAGE + 16), None);
+        assert_eq!(super::cached_unmapped_end(base + 3 * PAGE + 16), Some(base + len));
+        assert!(!super::has_cached_unmapped_hole(base + PAGE, base + 3 * PAGE));
+
+        // Remap clears the remaining ends cleanly.
+        title_memory_remapped(base, len);
+        assert!(!super::has_cached_unmapped_hole(base, base + len));
     }
 }
