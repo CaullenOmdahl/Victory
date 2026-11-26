@@ -633,7 +633,9 @@ fn with_tiled_copy<T>(memory: *const u8, size: usize, use_copy: impl FnOnce(&[u8
 pub(crate) fn committed(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;
-    let end = p + len;
+    let Some(end) = p.checked_add(len) else {
+        return false;
+    };
     if crate::shadow::in_place(p as u64, end as u64) {
         return true;
     }
