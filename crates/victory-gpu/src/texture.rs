@@ -343,6 +343,9 @@ pub(crate) fn upload_first(resource: This, texture: &ID3D12Resource) {
     if let Some(copy) = crate::resource::host_copy(resource)
         && let Some(staging) = staging(resource, texture)
     {
+        if crate::heap_worker::enqueue(staging.clone(), copy.clone()) {
+            return;
+        }
         FIRST.lock().unwrap_or_else(|e| e.into_inner()).push((staging, copy));
     }
 }
@@ -1109,7 +1112,7 @@ fn copyable_footprints_cached(
     (footprints, rows, total)
 }
 
-fn create_staging(
+pub(crate) fn create_staging(
     host: &crate::host::Host,
     map: Option<&mut HashMap<usize, Arc<Staging>>>,
     now: u64,
@@ -1171,7 +1174,7 @@ fn create_staging(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::host::Host;
     use crate::resource::HostTexture;
@@ -1376,7 +1379,21 @@ mod tests {
         unsafe { VirtualFree(address as *mut _, 0, MEM_RELEASE) };
     }
 
-    fn make_rgba_texture(host: &Host, width: u32, height: u32) -> (Arc<HostTexture>, Texture) {
+    use test_helpers::*;
+
+    pub(crate) mod test_helpers {
+    use super::*;
+    use crate::host::Host;
+    use crate::resource::HostTexture;
+    use std::sync::atomic::AtomicU32;
+    use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+    pub(crate) fn make_rgba_texture(
+        host: &Host,
+        width: u32,
+        height: u32,
+    ) -> (Arc<HostTexture>, Texture) {
         let layout_tex = Texture::new(&TextureDesc {
             dimension: Dimension::Tex2d,
             format: DXGI_FORMAT_R8G8B8A8_UNORM.0 as u32,
@@ -1433,7 +1450,12 @@ mod tests {
     }
 
     /// Reads a 2D RGBA8 texture back from `host` into a tightly packed row buffer.
-    fn read_back_rgba(host: &Host, copy: &Arc<HostTexture>, width: u32, height: u32) -> Vec<u8> {
+    pub(crate) fn read_back_rgba(
+        host: &Host,
+        copy: &Arc<HostTexture>,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
         let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
         let mut rows = 0u32;
         let mut total = 0u64;
@@ -1540,7 +1562,7 @@ mod tests {
         }
     }
 
-    fn fill_linear_rgba(layout: &victory_formats::texture::Layout, mem: &mut [u8], pixel: [u8; 4]) {
+    pub(crate) fn fill_linear_rgba(layout: &victory_formats::texture::Layout, mem: &mut [u8], pixel: [u8; 4]) {
         let mut linear = vec![0u8; layout.desc.width as usize * layout.desc.height as usize * 4];
         for chunk in linear.as_chunks_mut::<4>().0 {
             *chunk = pixel;
@@ -1551,10 +1573,11 @@ mod tests {
             .expect("tile pixels");
     }
 
-    fn all_pixels_eq(bytes: &[u8], expected: [u8; 4]) -> bool {
+    pub(crate) fn all_pixels_eq(bytes: &[u8], expected: [u8; 4]) -> bool {
         let (chunks, rem) = bytes.as_chunks::<4>();
         rem.is_empty() && !chunks.is_empty() && chunks.iter().all(|&px| px == expected)
     }
+}
 
     /// Exercises the real D3D12 WARP prelude upload path end to end:
     /// (a) initial use uploads title memory to GPU,

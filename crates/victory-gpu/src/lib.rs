@@ -34,6 +34,8 @@ pub mod frame;
 #[cfg(windows)]
 mod fx;
 #[cfg(windows)]
+mod heap_worker;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;

@@ -1643,26 +1643,68 @@ impl Host {
         target != 0 && Self::fence_completed(&self.fence).is_some_and(|c| c < target)
     }
 
-    /// Waits until the host GPU fence reaches at least `target`.
+    /// Waits until the host GPU fence reaches at least `target` without
+    /// holding `self.submitted` across the kernel wait, then reaps completed
+    /// submissions.
     pub(crate) fn wait_fence(&self, target: u64) {
         if target == 0 || FINISHED_FENCE.load(Ordering::Acquire) >= target {
             return;
         }
-        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let Some(completed) = Self::fence_completed(&self.fence) else {
             return;
         };
         if completed < target {
-            // SAFETY: the fence and event are ours; guarded by `submitted`.
-            unsafe {
-                if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
-                    tracing::warn!(error = %e, "host fence wait failed");
-                } else {
-                    WaitForSingleObject(self.event, INFINITE);
+            struct EventDrop(HANDLE);
+            impl Drop for EventDrop {
+                fn drop(&mut self) {
+                    if !self.0.0.is_null() {
+                        // SAFETY: `self.0` was created by `CreateEventW` for this thread.
+                        unsafe {
+                            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+                        }
+                    }
+                }
+            }
+            thread_local! {
+                static WAIT_EVENT: EventDrop = EventDrop(
+                    // SAFETY: plain unnamed auto-reset event creation.
+                    unsafe { CreateEventW(None, false, false, None) }.unwrap_or_default()
+                );
+            }
+            let raw = WAIT_EVENT.with(|e| e.0.0 as usize);
+            if raw != 0 {
+                // SAFETY: `self.fence` is free-threaded; `raw` is this thread's event.
+                unsafe {
+                    if let Err(e) = self.fence.SetEventOnCompletion(target, HANDLE(raw as *mut _)) {
+                        tracing::warn!(error = %e, "host fence wait failed");
+                    } else {
+                        WaitForSingleObject(HANDLE(raw as *mut _), INFINITE);
+                    }
+                }
+            } else {
+                let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
+                // SAFETY: fallback under `self.submitted` using `self.event`.
+                unsafe {
+                    if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
+                        tracing::warn!(error = %e, "host fence wait failed");
+                    } else {
+                        WaitForSingleObject(self.event, INFINITE);
+                    }
                 }
             }
         }
+        let _guard = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         self.reap_completed();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_on_queue(&self, fence: &ID3D12Fence, value: u64) {
+        // SAFETY: `self.queue` and `fence` are live on the same device.
+        unsafe {
+            self.queue
+                .Wait(fence, value)
+                .expect("queue Wait on copy fence");
+        }
     }
 
     /// Waits for all in-flight asynchronous submissions to complete.
@@ -1980,6 +2022,20 @@ impl Host {
             && !each
             && async_submit()
             && card_writes.is_empty();
+        #[cfg(feature = "diagnostics")]
+        let skip_copy_wait = no_work();
+        #[cfg(not(feature = "diagnostics"))]
+        let skip_copy_wait = false;
+        if !skip_copy_wait
+            && let Some((copy_fence, val)) = early.copy_wait.take()
+        {
+            // SAFETY: `self.queue` and `copy_fence` are live on the same device.
+            unsafe {
+                if let Err(e) = self.queue.Wait(&copy_fence, val) {
+                    tracing::warn!(error = %e, "host copy-queue wait failed");
+                }
+            }
+        }
         if let Some(first) = first {
             // SAFETY: a closed list.
             unsafe { self.queue.ExecuteCommandLists(&[Some(first)]) };
@@ -2078,7 +2134,11 @@ impl Host {
                 .push_back(InFlight {
                     fence: *submitted,
                     submission: this_submission,
-                    _early_copies: early.copies,
+                    _early_copies: {
+                        let mut copies = early.copies;
+                        copies.extend(early.copied);
+                        copies
+                    },
                     _plans: batch.plans,
                     finish: Some(Finish {
                         lists: keep.map(<[_]>::to_vec).unwrap_or_default(),
@@ -4543,6 +4603,11 @@ struct Early {
         std::sync::Arc<crate::texture::Staging>,
         std::sync::Arc<crate::resource::HostTexture>,
     )>,
+    copied: Vec<(
+        std::sync::Arc<crate::texture::Staging>,
+        std::sync::Arc<crate::resource::HostTexture>,
+    )>,
+    copy_wait: Option<(ID3D12Fence, u64)>,
     before: Vec<D3D12_RESOURCE_BARRIER>,
     after: Vec<D3D12_RESOURCE_BARRIER>,
 }
@@ -4551,57 +4616,101 @@ impl Early {
     /// Takes the textures waiting; `late`: after the lists' preludes took
     /// the textures' states, so not those the lists use (they upload them).
     fn take(&mut self, batch: &mut Batch, runs: &[&HostList], late: bool) {
-        let first = crate::texture::take_first();
-        if first.is_empty() {
-            return;
-        }
-        let mut used = crate::fx::Set::default();
-        if late {
-            for list in runs {
-                let states = list.states.lock().unwrap_or_else(|e| e.into_inner());
-                used.extend(states.values().map(|s| std::sync::Arc::as_ptr(&s.2) as usize));
-            }
-        }
-        let due: Vec<(
-            std::sync::Arc<crate::texture::Staging>,
-            std::sync::Arc<crate::resource::HostTexture>,
-            std::sync::atomic::AtomicBool,
-        )> = first
-            .into_iter()
-            .filter(|(staging, copy)| {
-                !used.contains(&(std::sync::Arc::as_ptr(copy) as usize))
-                    && batch.texture_due(staging)
-            })
-            .map(|(staging, copy)| (staging, copy, std::sync::atomic::AtomicBool::new(false)))
-            .collect();
-        in_parallel(&due, 2, |chunk| {
-            for (staging, _, dirty) in chunk {
-                if staging.refresh() {
-                    dirty.store(true, Ordering::Relaxed);
-                }
-            }
-        });
         const COPY_DEST: i32 = D3D12_RESOURCE_STATE_COPY_DEST.0;
         const SHADER_RESOURCE: u32 = 0x40 | 0x80;
-        for (staging, copy, dirty) in due {
-            if !dirty.into_inner() {
-                continue;
+        let mut first = crate::texture::take_first();
+        let mut ready_direct = Vec::new();
+        if let Some(drain) = crate::heap_worker::flush_before_submit() {
+            if let Some((fence, val)) = drain.wait {
+                match &mut self.copy_wait {
+                    Some((f, cur)) if val > *cur => {
+                        *f = fence;
+                        *cur = val;
+                    }
+                    None => self.copy_wait = Some((fence, val)),
+                    _ => {}
+                }
             }
-            let real = copy.state.swap(SHADER_RESOURCE, Ordering::Relaxed) as i32;
-            let (to, from) = (D3D12_RESOURCE_STATES(COPY_DEST), D3D12_RESOURCE_STATES(real));
-            if real != COPY_DEST {
-                self.before.push(transition(&copy.texture, from, to));
+            for (staging, copy) in drain.copied {
+                let _ = batch.texture_due(&staging);
+                self.copied.push((staging, copy));
             }
-            self.after
-                .push(transition(&copy.texture, to, D3D12_RESOURCE_STATES(SHADER_RESOURCE as i32)));
-            self.copies.push((staging, copy));
+            ready_direct = drain.ready_direct;
+            first.extend(drain.unprocessed);
+        }
+        if !first.is_empty() || !ready_direct.is_empty() {
+            let mut used = crate::fx::Set::default();
+            if late {
+                for list in runs {
+                    let states = list.states.lock().unwrap_or_else(|e| e.into_inner());
+                    used.extend(states.values().map(|s| std::sync::Arc::as_ptr(&s.2) as usize));
+                }
+            }
+            let due: Vec<(
+                std::sync::Arc<crate::texture::Staging>,
+                std::sync::Arc<crate::resource::HostTexture>,
+                std::sync::atomic::AtomicBool,
+            )> = first
+                .into_iter()
+                .filter(|(staging, copy)| {
+                    !used.contains(&(std::sync::Arc::as_ptr(copy) as usize))
+                        && batch.texture_due(staging)
+                })
+                .map(|(staging, copy)| (staging, copy, std::sync::atomic::AtomicBool::new(false)))
+                .collect();
+            if !due.is_empty() {
+                in_parallel(&due, 2, |chunk| {
+                    for (staging, _, dirty) in chunk {
+                        if staging.refresh() {
+                            dirty.store(true, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+            let mut push_direct = |staging, copy: std::sync::Arc<crate::resource::HostTexture>| {
+                let real = copy.state.swap(SHADER_RESOURCE, Ordering::Relaxed) as i32;
+                let (to, from) = (D3D12_RESOURCE_STATES(COPY_DEST), D3D12_RESOURCE_STATES(real));
+                if real != COPY_DEST {
+                    self.before.push(transition(&copy.texture, from, to));
+                }
+                self.after
+                    .push(transition(&copy.texture, to, D3D12_RESOURCE_STATES(SHADER_RESOURCE as i32)));
+                self.copies.push((staging, copy));
+            };
+            for (staging, copy, dirty) in due {
+                if dirty.into_inner() {
+                    push_direct(staging, copy);
+                }
+            }
+            for (staging, copy) in ready_direct {
+                if !used.contains(&(std::sync::Arc::as_ptr(&copy) as usize))
+                    && batch.texture_due(&staging)
+                {
+                    push_direct(staging, copy);
+                }
+            }
+        }
+        if late && !self.copied.is_empty() {
+            for (_, copy) in &self.copied {
+                if copy
+                    .state
+                    .compare_exchange(0, SHADER_RESOURCE, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    self.after.push(transition(
+                        &copy.texture,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATES(SHADER_RESOURCE as i32),
+                    ));
+                }
+            }
         }
     }
 
     /// The list with the uploads, if there are any. One submission runs at a
     /// time and is waited for, so there is one list.
     fn record(&self, host: &Host) -> Option<ID3D12CommandList> {
-        if self.copies.is_empty() {
+        if self.copies.is_empty() && self.before.is_empty() && self.after.is_empty() {
             return None;
         }
         struct List(ID3D12CommandAllocator, ID3D12GraphicsCommandList);
@@ -4635,7 +4744,9 @@ impl Early {
                 for (staging, copy) in &self.copies {
                     staging.record_copies(list, &copy.texture);
                 }
-                list.ResourceBarrier(&self.after);
+                if !self.after.is_empty() {
+                    list.ResourceBarrier(&self.after);
+                }
                 list.Close()
             });
             if let Err(e) = recorded {
@@ -5449,6 +5560,7 @@ impl Meter {
                 );
                 crate::texture::flips::log();
                 crate::port_cbv::log(frames);
+                crate::heap_worker::log(frames);
                 crate::copystat::log(frames);
                 let beside_frames = f64::from(self.log_frames.max(1));
                 self.log_frames = 0;

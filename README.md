@@ -107,6 +107,9 @@ Speed:
 - Constant buffer views can be lowered to raw byte-address SRVs (`t<slot>`
   root SRVs and `R32_TYPELESS` `RAW` heap views, `VICTORY_PORT_CBV=1`, off
   by default) to bind constant buffers directly without `fill_scratch` copies.
+- Newly visible bindless textures can be pre-detiled and uploaded to VRAM
+  ahead of submission on a dedicated `COPY` command queue
+  (`VICTORY_HEAP_WORKER=1`, off by default).
 
 Memory the title shows at several addresses:
 - Every view of a guarded physical page is guarded with it, so a write of
