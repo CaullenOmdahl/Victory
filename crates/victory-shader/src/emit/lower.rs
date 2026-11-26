@@ -3953,18 +3953,42 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, exact, zero, r)
     }
 
-    /// The high dword of a 32 × 32-bit product.
+    /// The high dword of a 32 × 32-bit product, computed in 32-bit DXIL (no `INT64`).
     fn mul_hi(&mut self, a: V, b: V, signed: bool) -> V {
         let c = self.cur;
-        let i64t = self.s.m.int(64);
-        let ext = if signed { Cast::SExt } else { Cast::ZExt };
-        let a = self.s.m.cast(c, ext, a, i64t);
-        let b = self.s.m.cast(c, ext, b, i64t);
-        let m = self.s.m.bin(c, Bin::Mul, a, b);
-        let k32 = self.s.m.int_const(i64t, 32);
-        let hi = self.s.m.bin(c, Bin::LShr, m, k32);
-        self.s.flags |= flags::INT64;
-        self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let (mask16, k16) = (k(self, 0xFFFF), k(self, 16));
+        let a0 = self.s.m.bin(c, Bin::And, a, mask16);
+        let a1 = self.s.m.bin(c, Bin::LShr, a, k16);
+        let b0 = self.s.m.bin(c, Bin::And, b, mask16);
+        let b1 = self.s.m.bin(c, Bin::LShr, b, k16);
+
+        let p00 = self.s.m.bin(c, Bin::Mul, a0, b0);
+        let p01 = self.s.m.bin(c, Bin::Mul, a0, b1);
+        let p10 = self.s.m.bin(c, Bin::Mul, a1, b0);
+        let p11 = self.s.m.bin(c, Bin::Mul, a1, b1);
+
+        // Hacker's Delight 8-2: every intermediate stays <= 0xFFFF_0000 (no u32 overflow).
+        let p00_hi = self.s.m.bin(c, Bin::LShr, p00, k16);
+        let t = self.s.m.bin(c, Bin::Add, p10, p00_hi);
+        let w1 = self.s.m.bin(c, Bin::And, t, mask16);
+        let w2 = self.s.m.bin(c, Bin::LShr, t, k16);
+        let u = self.s.m.bin(c, Bin::Add, p01, w1);
+        let u_hi = self.s.m.bin(c, Bin::LShr, u, k16);
+
+        let hi = self.s.m.bin(c, Bin::Add, p11, w2);
+        let hi = self.s.m.bin(c, Bin::Add, hi, u_hi);
+        if !signed {
+            return hi;
+        }
+        // Signed high word = unsigned high word - ((a < 0) ? b : 0) - ((b < 0) ? a : 0).
+        let k31 = k(self, 31);
+        let a_sign = self.s.m.bin(c, Bin::AShr, a, k31);
+        let b_sign = self.s.m.bin(c, Bin::AShr, b, k31);
+        let corr_a = self.s.m.bin(c, Bin::And, a_sign, b);
+        let corr_b = self.s.m.bin(c, Bin::And, b_sign, a);
+        let hi = self.s.m.bin(c, Bin::Sub, hi, corr_a);
+        self.s.m.bin(c, Bin::Sub, hi, corr_b)
     }
 
     /// `0 × anything = 0`, as in D3D9.
@@ -8378,6 +8402,64 @@ impl<'a> Lower<'a> {
                 }
                 Ok(())
             }
+            "v_swaprel_b32" => {
+                // RDNA2 ISA VOP1 V_SWAPREL_B32 splits M0 into 10-bit offsets:
+                // M0[9:0] offsets SRC0 and M0[25:16] offsets VDST (bits [15:10]
+                // and [31:26] are ignored). Both ranges can overlap (`ir.rs` marks
+                // sreg..vgprs and dreg..vgprs both read and written), so capture
+                // both source values first and walk `inst.writes`.
+                let m0 = self.i32_of(inst.read(Reg::S(crate::ir::M0)).ok_or("M0")?)?;
+                let (
+                    Some(&Operand::Vector { reg: sreg, .. }),
+                    Some(Operand::Vector { reg: dreg, .. }),
+                ) = (v.src.first(), v.dst)
+                else {
+                    return Err("v_swaprel_b32");
+                };
+                let mask = self.s.m.i32(0x3FF);
+                let src_off = self.s.m.bin(c, Bin::And, m0, mask);
+                let k16 = self.s.m.i32(16);
+                let hi = self.s.m.bin(c, Bin::LShr, m0, k16);
+                let dst_off = self.s.m.bin(c, Bin::And, hi, mask);
+
+                let select_at = |l: &mut Self, base: u8, off: V| -> Result<V, Why> {
+                    let mut r = l.s.m.i32(0);
+                    for k in 0..=255u8.saturating_sub(base) {
+                        let Some(x) = inst.read(Reg::V(base + k)) else {
+                            break;
+                        };
+                        let x = l.i32_of(x)?;
+                        let kk = l.s.m.i32(u32::from(k));
+                        let is = l.s.m.cmp(c, pred::EQ, off, kk);
+                        r = l.s.m.select(c, is, x, r);
+                    }
+                    Ok(r)
+                };
+                let a = select_at(self, dreg, dst_off)?;
+                let b = select_at(self, sreg, src_off)?;
+                for &(reg, _) in &inst.writes {
+                    let Reg::V(r) = reg else {
+                        continue;
+                    };
+                    let old = match inst.read(reg) {
+                        Some(o) => self.i32_of(o)?,
+                        None => self.s.m.i32(0),
+                    };
+                    let mut x = old;
+                    if r >= sreg {
+                        let kk = self.s.m.i32(u32::from(r - sreg));
+                        let is_s = self.s.m.cmp(c, pred::EQ, src_off, kk);
+                        x = self.s.m.select(c, is_s, a, x);
+                    }
+                    if r >= dreg {
+                        let kk = self.s.m.i32(u32::from(r - dreg));
+                        let is_d = self.s.m.cmp(c, pred::EQ, dst_off, kk);
+                        x = self.s.m.select(c, is_d, b, x);
+                    }
+                    self.write_placed(inst, reg, x, guard);
+                }
+                Ok(())
+            }
             "v_ffbh_u32" | "v_ffbh_i32" => {
                 // Counted from the top bit, -1 when none (DXIL's too).
                 let a = s(self, 0)?;
@@ -9491,10 +9573,10 @@ impl<'a> Lower<'a> {
             let f = self.half_fsrc(inst, 0)?;
             return self.write_f(inst, f, guard);
         }
+        // Clamp on the result in f32, then one rounding to a half. The output
+        // modifier is ignored: f16 output denormals are kept, and with them
+        // RDNA2 ignores it (RDNA2 ISA 6.2.2).
         let float_result = |l: &mut Self, mut f: V| -> Result<(), Why> {
-            if v.omod != 0 {
-                return Err("an output modifier on a 16-bit operation");
-            }
             if v.clamp {
                 f = l.unary(7, f);
             }
@@ -11327,23 +11409,18 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, old, x)
     }
 
-    /// VOP3 f16 output modifiers: omod, then clamp, applied to the f32
-    /// value before its one conversion to f16 (the order `write_f` uses).
+    /// VOP3 f16 output modifiers: the clamp, applied to the f32 value before
+    /// its one conversion to f16. The output modifier is ignored, as for other
+    /// f16 results (RDNA2 ISA 6.2.2).
     fn half_modifiers(&mut self, inst: &Inst, f: V) -> V {
         let Fields::Valu(v) = &inst.fields else {
             return f;
         };
-        let c = self.cur;
-        let mut f = f;
-        if v.omod != 0 {
-            let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
-            let k = self.s.m.f32(factor.to_bits());
-            f = self.s.m.bin(c, Bin::Mul, f, k);
-        }
         if v.clamp {
-            f = self.unary(7, f);
+            self.unary(7, f)
+        } else {
+            f
         }
-        f
     }
 
     fn image(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
@@ -15543,6 +15620,44 @@ mod tests {
             0x3C << 26 | (op as u32 & 0x7F) << 18 | (dmask as u32) << 8 | 1 << 3,
             ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
         ]
+    }
+
+    #[test]
+    fn mul_hi_needs_no_int64() {
+        let sfi0 = |words: &[u32]| -> u64 {
+            let constants = crate::native::RootParam {
+                sgprs: 4,
+                ..root(RootType::Constants, 0, 0)
+            };
+            let emitted = lower_with(words, vec![constants], vec![]).unwrap();
+            let container = crate::Container::parse(&emitted.dxil).unwrap();
+            let features = container.part(crate::FourCC::SFI0).unwrap();
+            u64::from_le_bytes(features.data.try_into().unwrap())
+        };
+        for (name, op) in [("s_mul_hi_u32", 0x35u32), ("s_mul_hi_i32", 0x36)] {
+            let words = [
+                0x8000_0000 | (op << 23) | (4 << 16) | (1 << 8),
+                0x7E00_0280,
+                0x7E02_0204,
+                0xD834_0000,
+                0x0000_0100,
+                S_ENDPGM,
+            ];
+            assert_eq!(sfi0(&words) & 0x8000, 0, "{name} must not require INT64");
+        }
+        for (name, op) in [("v_mul_hi_u32", 0x16Au32), ("v_mul_hi_i32", 0x16C)] {
+            let words = [
+                0x7E00_0280,
+                0x7E02_0200,
+                0x7E04_0201,
+                0xD400_0003 | (op << 16),
+                257 | (258 << 9),
+                0xD834_0000,
+                0x0000_0300,
+                S_ENDPGM,
+            ];
+            assert_eq!(sfi0(&words) & 0x8000, 0, "{name} must not require INT64");
+        }
     }
 
     #[test]

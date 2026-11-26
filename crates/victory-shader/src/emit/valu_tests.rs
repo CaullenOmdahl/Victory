@@ -2469,3 +2469,158 @@ fn s_buffer_load_truncates_terms_independently() {
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
 }
+
+#[test]
+fn mul_hi_matches_rdna2_without_int64() {
+    const VALUES: [u32; 12] = [
+        0,
+        1,
+        2,
+        0xFFFF,
+        0x1_0000,
+        0x007F_FFFF,
+        0x0080_0000,
+        0x00FF_FFFF,
+        0x7FFF_FFFF,
+        0x8000_0000,
+        0xFFFF_0001,
+        0xFFFF_FFFF,
+    ];
+    let mut inputs = Vec::with_capacity(VALUES.len() * VALUES.len());
+    for a in VALUES {
+        for b in VALUES {
+            inputs.push([a, b, 0, 0]);
+        }
+    }
+    let check_sfi0 = |shader: &HostShader, label: &str| {
+        let container = crate::dxbc::Container::parse(&shader.dxil).expect("DXBC container");
+        let features = container.part(crate::FourCC::SFI0).expect("SFI0 part");
+        let flags = u64::from_le_bytes(features.data.try_into().expect("u64 SFI0"));
+        assert_eq!(flags & 0x8000, 0, "{label} must not set SFI0 INT64");
+    };
+    type Eval = fn(u32, u32) -> u32;
+    let cases: [(&str, Vec<u32>, Eval); 4] = [
+        (
+            "v_mul_hi_u32",
+            vop3(0x16A, 0, vgpr(1), vgpr(2), 0).to_vec(),
+            |a, b| ((u64::from(a) * u64::from(b)) >> 32) as u32,
+        ),
+        (
+            "v_mul_hi_i32",
+            vop3(0x16C, 0, vgpr(1), vgpr(2), 0).to_vec(),
+            |a, b| ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32,
+        ),
+        (
+            "s_mul_hi_u32",
+            vec![sop2(0x35, 16, 0, 1), vop1(0x001, 0, sgpr(16))],
+            |a, b| ((u64::from(a) * u64::from(b)) >> 32) as u32,
+        ),
+        (
+            "s_mul_hi_i32",
+            vec![sop2(0x36, 16, 0, 1), vop1(0x001, 0, sgpr(16))],
+            |a, b| ((i64::from(a as i32) * i64::from(b as i32)) >> 32) as u32,
+        ),
+    ];
+    for (name, body, eval) in cases {
+        let shader = build_valu_cs(&body);
+        check_sfi0(&shader, name);
+        run_cases(&shader, &inputs, |backend, _, inp, got| {
+            let want = eval(inp[0], inp[1]);
+            assert_eq!(
+                got, want,
+                "{backend}: {name}({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+                inp[0], inp[1]
+            );
+        });
+    }
+}
+
+/// An f16 result ignores its output modifier (times 2, 4 or 0.5) and takes
+/// its clamp.
+#[test]
+fn f16_results_ignore_their_output_modifier() {
+    const V_ADD_F16: u16 = 0x132;
+    const V_MUL_F16: u16 = 0x135;
+    const V_FMA_F16: u16 = 0x34B;
+    let op = |op: u16, omod: u32, clamp: bool| {
+        let [w0, w1] = vop3(op, 0, vgpr(1), vgpr(2), vgpr(3));
+        build_valu_cs(&[w0 | u32::from(clamp) << 15, w1 | omod << 27])
+    };
+    let cases = [[0x3E00, 0x3400, 0, 0]]; // 1.5, 0.25, 0
+    for (shader, want) in [
+        (op(V_ADD_F16, 1, false), 0x3F00), // 1.75
+        (op(V_ADD_F16, 2, false), 0x3F00),
+        (op(V_ADD_F16, 3, false), 0x3F00),
+        (op(V_ADD_F16, 3, true), 0x3C00),  // 1.75 clamped: 1.0
+        (op(V_MUL_F16, 1, false), 0x3600), // 0.375
+        (op(V_FMA_F16, 1, false), 0x3600),
+    ] {
+        run_cases(&shader, &cases, |backend, _, _, got| {
+            assert_eq!(got & 0xFFFF, want, "{backend}");
+        });
+    }
+}
+
+#[test]
+fn v_swaprel_b32_swaps_indexed_vgprs_and_respects_exec() {
+    let swap = 0x7E00_0000 | (1u32 << 17) | (0x68u32 << 9) | 257;
+    let shader = build_valu_cs(&[
+        0xBE86_037E, // s_mov_b32 s6, exec_lo
+        0xBF06_C103, // s_cmp_eq_i32 s3, -1
+        0xBF84_0001, // s_cbranch_scc0 +1 -> set m0
+        0xBEFE_0380, // s_mov_b32 exec_lo, 0
+        0xBEFC_0303, // s_mov_b32 m0, s3
+        swap,
+        0xBEFE_0306, // s_mov_b32 exec_lo, s6 (restore active lanes)
+        0x3404_0488, // v_lshlrev_b32 v2, 8, v2
+        0x3406_0690, // v_lshlrev_b32 v3, 16, v3
+        0x3800_0501, // v_or_b32 v0, v1, v2
+        0x3800_0700, // v_or_b32 v0, v0, v3
+    ]);
+
+    let cases: &[([u32; 4], u32)] = &[
+        ([0x11, 0x22, 0x33, 0x0000_0002], 0x00_11_22_33),
+        ([0x11, 0x22, 0x33, 0x0001_0002], 0x00_22_33_11),
+        ([0x11, 0x22, 0x33, 0xFC01_FC02], 0x00_22_33_11),
+        ([0x11, 0x22, 0x33, 0x0001_0001], 0x00_33_22_11),
+        ([0x11, 0x22, 0x33, 0xFFFF_FFFF], 0x00_33_22_11),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, inp, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_swaprel_b32(m0={:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[3],
+        );
+    });
+}
+
+#[test]
+fn v_swaprel_b32_constant_m0_swaps_distant_ranges() {
+    let shader = build_valu_cs(&[
+        vop1(0x001, 11, vgpr(3)),          // v11 = s2
+        vop1(0x001, 12, vgpr(4)),          // v12 = s3
+        0xBEFC_0382,                       // s_mov_b32 m0, 2 (src_off=2, dst_off=0)
+        vop1(0x068, 1, vgpr(10)),          // v_swaprel_b32 v1, v10
+        0x3404_0488,                       // v_lshlrev_b32 v2, 8, v2
+        0x3416_1690,                       // v_lshlrev_b32 v11, 16, v11
+        0x3418_1898,                       // v_lshlrev_b32 v12, 24, v12
+        0x3800_0501,                       // v_or_b32 v0, v1, v2
+        0x3800_1700,                       // v_or_b32 v0, v0, v11
+        0x3800_1900,                       // v_or_b32 v0, v0, v12
+    ]);
+
+    let cases: &[([u32; 4], u32)] = &[
+        ([0x11, 0x22, 0xAA, 0xBB], 0x11_AA_22_BB),
+        ([0x42, 0x10, 0x20, 0x99], 0x42_20_10_99),
+    ];
+    let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let want = cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: v_swaprel_b32 constant m0=2 = {got:#010x}, want {want:#010x}",
+        );
+    });
+}
