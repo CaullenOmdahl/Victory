@@ -28,6 +28,7 @@ mod reciprocal;
 mod rsqrt;
 mod scalar_vcc;
 mod tables;
+mod wave_prefix;
 #[cfg(test)]
 mod packed_mod_tests;
 #[cfg(test)]
@@ -131,6 +132,9 @@ pub(crate) struct Lowered {
     /// Whether the program uses wave operations.
     #[cfg(test)]
     pub wave_ops: bool,
+    /// `(waveActiveBallot, waveReadLaneAt.i32, wavePrefixOp.f32)` call counts.
+    #[cfg(test)]
+    pub wave_prefix_calls: (u32, u32, u32),
     /// Test builds: the property words of each handle annotation, in order.
     #[cfg(test)]
     pub annotations: Vec<(u32, u32)>,
@@ -2192,13 +2196,13 @@ impl<'a> Lower<'a> {
         let ty = if float { f32t } else { i32t };
         let sfx = if float { "f32" } else { "i32" };
         let r = match (op, prefix) {
-            (Op::AddU | Op::AddF | Op::AddF16, Some(inclusive)) => {
+            (Op::AddU, Some(inclusive)) => {
                 let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
                 let r = self.s.op(
                     c,
-                    &format!("wavePrefixOp.{sfx}"),
+                    "wavePrefixOp.i32",
                     Attr::NoUnwind,
-                    ty,
+                    i32t,
                     121,
                     &[arg, k0, k1],
                 );
@@ -2208,7 +2212,17 @@ impl<'a> Lower<'a> {
                     r
                 }
             }
-            (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
+            (op, Some(inclusive)) => {
+                let id_i32 = if f16 {
+                    let id_f32 = self
+                        .s
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[id]);
+                    self.as_int(id_f32)
+                } else {
+                    id
+                };
+                self.lower_wave_prefix(op, arg, id_i32, inclusive)
+            }
             (Op::Or | Op::And | Op::Xor, None) => {
                 let k = self.s.m.i8(match op {
                     Op::And => 0,
@@ -2269,6 +2283,12 @@ impl<'a> Lower<'a> {
             heap_handles: self.s.m.written_calls("dx.op.createHandleFromHeap") as u32,
             #[cfg(test)]
             wave_ops: self.s.flags & flags::WAVE_OPS != 0,
+            #[cfg(test)]
+            wave_prefix_calls: (
+                self.s.m.written_calls("dx.op.waveActiveBallot") as u32,
+                self.s.m.written_calls("dx.op.waveReadLaneAt.i32") as u32,
+                self.s.m.written_calls("dx.op.wavePrefixOp.f32") as u32,
+            ),
             #[cfg(test)]
             annotations: std::mem::take(&mut self.s.annotations),
             #[cfg(test)]
