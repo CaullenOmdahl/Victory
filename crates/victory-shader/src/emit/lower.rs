@@ -2521,7 +2521,24 @@ impl<'a> Lower<'a> {
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, g, first));
             }
             Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
-            Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
+            Input::GroupInfo => {
+                // `{first_wavefront, 14'b0, ordered_append_term[10:0], wave_count[5:0]}`
+                // (LLVM AMDGPUUsage, "Initial Kernel Execution State"): without GDS
+                // ordered append, bits 16:6 hold the wave's index in the group.
+                let e = self.s.entry;
+                let wave = self.wave();
+                let threads: u32 = self.s.threads.expect("compute").iter().product();
+                let count = self.s.m.i32(threads.div_ceil(wave) & 0x3F);
+                let w = self.wave_id();
+                let k6 = self.s.m.i32(6);
+                let placed = self.s.m.bin(e, Bin::Shl, w, k6);
+                let low = self.s.m.bin(e, Bin::Or, placed, count);
+                let zero = self.s.m.i32(0);
+                let is_first = self.s.m.cmp(e, pred::EQ, w, zero);
+                let first_bit = self.s.m.i32(1 << 31);
+                let high = self.s.m.select(e, is_first, first_bit, zero);
+                return Val::I32(self.s.m.bin(e, Bin::Or, high, low));
+            }
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
                     unreachable!()
@@ -2532,9 +2549,7 @@ impl<'a> Lower<'a> {
             Input::MergedWaveInfo => {
                 // shortcut: only the wave index (bits 24-27) is set; the
                 // console's other bits (lane counts) are read by no program.
-                let f = self.mesh_thread();
-                let shift = self.s.m.i32(self.wave().trailing_zeros());
-                let w = self.s.m.bin(self.s.entry, Bin::LShr, f, shift);
+                let w = self.wave_id();
                 let k24 = self.s.m.i32(24);
                 return Val::I32(self.s.m.bin(self.s.entry, Bin::Shl, w, k24));
             }
@@ -4815,6 +4830,23 @@ impl<'a> Lower<'a> {
         if self.x.native.wave64 { 64 } else { 32 }
     }
 
+    /// Compute or mesh: the wave's index in the thread group.
+    fn wave_id(&mut self) -> V {
+        let f = self.mesh_thread();
+        let shift = self.s.m.i32(self.wave().trailing_zeros());
+        self.s.m.bin(self.s.entry, Bin::LShr, f, shift)
+    }
+
+    /// Masks a console lane selector modulo the wavefront width (`31` or `63`).
+    fn mask_lane(&mut self, lane: V) -> V {
+        let mask = self.wave() - 1;
+        if let Some(k) = self.s.m.int_value(lane) {
+            return self.s.m.i32((k as u32) & mask);
+        }
+        let m = self.s.m.i32(mask);
+        self.s.m.bin(self.cur, Bin::And, lane, m)
+    }
+
     fn lane_index(&mut self) -> V {
         if self.s.mesh.is_some() {
             // The console's lane: mesh code reads no other lanes, so host
@@ -4835,10 +4867,40 @@ impl<'a> Lower<'a> {
     }
 
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
-    /// lane must be a constant.
-    fn quad_pick(&mut self, x: V, src: V) -> V {
+    /// lane must be a constant. `pattern`, a quad permutation every quad
+    /// uses (two bits per lane), lets a broadcast or an exchange take one
+    /// quad operation instead of a read of each lane.
+    fn quad_pick(&mut self, x: V, src: V, pattern: Option<u8>) -> V {
         self.s.flags |= flags::WAVE_OPS;
         let c = self.cur;
+        match pattern {
+            Some(0xE4) => return x,
+            Some(p @ (0x00 | 0x55 | 0xAA | 0xFF)) => {
+                let lane = self.s.m.i32(u32::from(p & 3));
+                return self.s.op(
+                    c,
+                    "quadReadLaneAt.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    122,
+                    &[x, lane],
+                );
+            }
+            Some(p @ (0xB1 | 0x4E | 0x1B)) => {
+                // Lane 0 reads lane 1, 2 or 3: across x, across y or the
+                // diagonal (QuadOp 0, 1, 2), every lane its partner.
+                let direction = self.s.m.i8((p & 3) - 1);
+                return self.s.op(
+                    c,
+                    "quadOp.i32",
+                    Attr::NoUnwind,
+                    self.s.t.i32,
+                    123,
+                    &[x, direction],
+                );
+            }
+            _ => {}
+        }
         let three = self.s.m.i32(3);
         let q = self.s.m.bin(c, Bin::And, src, three);
         let mut r = x;
@@ -4949,7 +5011,11 @@ impl<'a> Lower<'a> {
             let pixel = self.s.pixel;
             let at = |l: &mut Self, lane: V| {
                 // A pixel's quad through quad reads (see `helpers_read`).
-                let r = if pixel { l.quad_pick(xi, lane) } else { l.read_lane(xi, lane) };
+                let r = if pixel {
+                    l.quad_pick(xi, lane, None)
+                } else {
+                    l.read_lane(xi, lane)
+                };
                 l.as_float(r)
             };
             let origin = at(self, base);
@@ -5141,7 +5207,8 @@ impl<'a> Lower<'a> {
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
             let r = if mesh_quad || self.helpers_read(quad) {
-                self.quad_pick(x, src)
+                let pattern = (offset & 0x8000 != 0).then_some(offset as u8);
+                self.quad_pick(x, src, pattern)
             } else {
                 self.read_lane(x, src)
             };
@@ -6295,6 +6362,19 @@ impl<'a> Lower<'a> {
             unreachable!()
         };
         let name = inst.name();
+        if name == "s_get_waveid_in_workgroup" {
+            if self.s.threads.is_none() {
+                return Err("s_get_waveid_in_workgroup outside compute");
+            }
+            let Some(Operand::Scalar { code, .. }) = *data else {
+                return Err(name);
+            };
+            if inst.write(Reg::S(code)).is_some() {
+                let w = self.wave_id();
+                self.write(inst, Reg::S(code), w, None);
+            }
+            return Ok(());
+        }
         if name.starts_with("s_scratch_") {
             return Err("scalar access to the console scratch aperture");
         }
@@ -8076,8 +8156,12 @@ impl<'a> Lower<'a> {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
-        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+        // Quad permutations, and DPP8 where every lane picks a lane of its
+        // own quad, stay in groups the pixel layout shares.
+        let quad = match dpp {
+            Dpp::Row { ctrl, .. } => ctrl <= 0xFF,
+            Dpp::Lanes { sel, .. } => (0..8).all(|i| ((sel >> (3 * i)) ^ i) & 4 == 0),
+        };
         let mesh_quad = self.s.mesh.is_some() && quad;
         if !mesh_quad {
             self.cross_lane(quad)?;
@@ -8158,7 +8242,11 @@ impl<'a> Lower<'a> {
             }
         };
         let mut r = if mesh_quad || self.helpers_read(quad) {
-            self.quad_pick(x, src)
+            let pattern = match dpp {
+                Dpp::Row { ctrl, .. } => Some(ctrl as u8),
+                Dpp::Lanes { .. } => None,
+            };
+            self.quad_pick(x, src, pattern)
         } else {
             self.read_lane(x, src)
         };
@@ -9071,11 +9159,13 @@ impl<'a> Lower<'a> {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                let lane = if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
                     self.s.flags |= flags::WAVE_OPS;
+                    lane
                 } else {
                     self.cross_lane(false)?;
-                }
+                    self.mask_lane(lane)
+                };
                 let r = if self.console_cf {
                     self.console_read_lane(a, lane)
                 } else {
@@ -9094,6 +9184,7 @@ impl<'a> Lower<'a> {
                     None => self.s.m.i32(0),
                 };
                 self.cross_lane(false)?;
+                let lane = self.mask_lane(lane);
                 let me = if self.console_cf {
                     self.console_lane().0
                 } else {
@@ -9101,7 +9192,7 @@ impl<'a> Lower<'a> {
                 };
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
-                int(self, r)
+                return self.write_i(inst, r, None);
             }
             "v_readfirstlane_b32"
                 if inst
@@ -16633,5 +16724,278 @@ mod loop85_tests {
         })
         .unwrap();
         assert_eq!(lowered.threads, Some([64, 1, 1]));
+    }
+}
+
+#[cfg(test)]
+mod loop86_tests {
+    use super::super::{container::SigElement, emit};
+    use crate::native::{ComputeIo, MeshIo, PsInput, RootParam, StageIo, Usage};
+    use crate::{Container, FourCC, HwStage, NativeProgram, RootType, ShaderError};
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+
+    fn elem(name: &str, kind: u8, row: u32) -> SigElement {
+        SigElement {
+            name: name.into(),
+            index: 0,
+            kind,
+            comp: 9,
+            interp: 0,
+            row: Some(row),
+            col: 0,
+            cols: 4,
+            usage: 0,
+            half: false,
+        }
+    }
+
+    #[test]
+    fn writelane_and_readlane_lower_in_wave32_and_wave64() {
+        for wave64 in [false, true] {
+            let wave = if wave64 { 64 } else { 32 };
+            let words: &[u32] = &[
+                0x7E02_0200, // v_mov_b32 v1, v0
+                0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+                0xD761_0001, // v_writelane_b32 v1, 42, 65
+                (128 + 42) | 0xFF << 9,
+                65,
+                0xD761_0001, // v_writelane_b32 v1, s0, s1
+                1 << 9,
+                0xD760_0004, // v_readlane_b32 s4, v1, -1
+                257 | 193 << 9,
+                0x4A02_0204, // v_add_nc_u32 v1, s4, v1
+                0xD834_0000, // ds_write_b32 v0, v1
+                0x0000_0100,
+                S_ENDPGM,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 8,
+                layout: vec![RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                }],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: (2 << 1) | (1 << 15),
+                    threads: [wave, 1, 1],
+                }),
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = crate::ir::build(&native.code, wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, HwStage::Cs).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let dxbc = crate::dxbc::build(&[]);
+            let c = Container::parse(&dxbc).unwrap();
+            let shader = emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).unwrap();
+            assert!(!shader.dxil.is_empty());
+        }
+    }
+
+    #[test]
+    fn group_info_and_waveid_in_workgroup_lower() {
+        let cs_words = [
+            0xF4A8_1F40u32,
+            0xFA00_0000, // s_get_waveid_in_workgroup null
+            0xF4A8_0080,
+            0xFA00_0000, // s_get_waveid_in_workgroup s2
+            0xBF06_8000, // s_cmp_eq_u32 s0, 0
+            0xBF85_0001, // s_cbranch_scc1 -> join
+            0xBE81_0380, // s_mov_b32 s1, 0
+            0xBF07_0201, // s_cmp_lg_u32 s1, s2
+            0xBF85_0001,
+            0xBE83_0380,
+            S_ENDPGM,
+        ];
+        let dxbc = crate::dxbc::build(&[]);
+        let c = Container::parse(&dxbc).unwrap();
+        for wave64 in [false, true] {
+            let native = NativeProgram {
+                stage: HwStage::Cs,
+                wave64,
+                vgprs: 4,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Cs(ComputeIo {
+                    rsrc2: 1 << 7 | 1 << 10,
+                    threads: [96, 1, 1],
+                }),
+                code: cs_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = crate::ir::build(&native.code, wave64, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, HwStage::Cs).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            let l = emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).unwrap();
+            let emitted = Container::parse(&l.dxil).unwrap();
+            let sfi0 = emitted.part(FourCC::SFI0).unwrap();
+            assert_eq!(u64::from_le_bytes(sfi0.data.try_into().unwrap()) & 0x8_0000, 0);
+        }
+
+        let ms_words = [
+            0xF4A8_0040u32,
+            0xFA00_0000, // s_get_waveid_in_workgroup s1
+            0x7E00_0C01, // v_cvt_f32_u32 v0, s1
+            0xBEFC_0380, // s_mov_b32 m0, 0
+            0xBF83_0009, // s_sendmsg sendmsg(GS_ALLOC_REQ)
+            0xF800_0941,
+            0x0000_0000,
+            0xF800_08CF,
+            0x0000_0000,
+            S_ENDPGM,
+        ];
+        let mut pos = elem("SV_Position", 3, 0);
+        pos.interp = 4;
+        pos.usage = 0xF;
+        let ms_native = NativeProgram {
+            stage: HwStage::Ms,
+            wave64: false,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ms(MeshIo {
+                outputs: vec![],
+                clip_cntl: 0,
+                threads: 64,
+                max_vertices: 64,
+                max_primitives: 64,
+                topology: 2,
+                lds_bytes: 0,
+            }),
+            code: ms_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let osg1 = super::super::container::signature(&[pos.clone()], false);
+        let mdxbc = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let _mc = Container::parse(&mdxbc).unwrap();
+        let p = crate::ir::build(&ms_native.code, false, ms_native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &ms_native.layout, HwStage::Ms).unwrap();
+        let io = crate::io::raise(&p, &ms_native).unwrap();
+        let _ = super::lower(&super::Parts {
+            native: &ms_native,
+            psv: None,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![pos.clone()],
+            prims: vec![],
+            mesh_stride: 64,
+            target: crate::emit::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
+        })
+        .unwrap();
+
+        // Outside compute and mesh (`Ps`), `s_get_waveid_in_workgroup` is refused.
+        let mut target = elem("SV_Target", 16, 0);
+        target.usage = 0xF;
+        let ps_words = [
+            0xF4A8_0000u32,
+            0xFA00_0000,
+            0x7E00_0200,
+            0xF800_180F,
+            0x0000_0000,
+            S_ENDPGM,
+        ];
+        let ps_native = NativeProgram {
+            stage: HwStage::Ps,
+            wave64: false,
+            vgprs: 4,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Ps {
+                inputs: vec![],
+                input_addr: 0,
+                db_shader_control: 0,
+                patches: vec![],
+            },
+            code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&ps_native.code, false, ps_native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let res = crate::resource::track(&p, &ps_native.layout, HwStage::Ps).unwrap();
+        let io = crate::io::raise(&p, &ps_native).unwrap();
+        let osg1 = super::super::container::signature(&[target], false);
+        let pdxbc = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
+        let pc = Container::parse(&pdxbc).unwrap();
+        let err = emit(&pc, &ps_native, &p, &st, &io, &res, crate::emit::Target::ANY)
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            ShaderError::Unsupported {
+                what: "s_get_waveid_in_workgroup outside compute",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pixel_quad_swizzles_and_dpp8_in_quad() {
+        let attr = PsInput {
+            usage: Usage::Generic,
+            row: 0,
+            mask: 0b1111,
+            attr: 0,
+            flat: false,
+            fp16: false,
+            pack2: false,
+            row2: 0,
+        };
+        let mut target = elem("SV_Target", 16, 0);
+        target.usage = 15;
+        let isg1 = super::super::container::signature(&[elem("TEXCOORD", 0, 0)], true);
+        let osg1 = super::super::container::signature(&[target], false);
+        let dxbc = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
+        let c = Container::parse(&dxbc).unwrap();
+        let run = |inst: [u32; 2]| {
+            let words = [
+                0xC808_0000u32, // v_interp_p1_f32 v2, v0, attr0.x
+                0xC809_0001,    // v_interp_p2_f32 v2, v1, attr0.x
+                inst[0],
+                inst[1],
+                0xF800_180F,
+                0x0303_0303,
+                S_ENDPGM,
+            ];
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![attr.clone()],
+                    input_addr: 1 << 1,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = crate::ir::build(&native.patched_code(), false, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, HwStage::Ps).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY)
+        };
+        for pat in [0x00, 0x55, 0xAA, 0xFF, 0xB1, 0x4E, 0x1B, 0xE4, 0x27] {
+            let swz = [0xD800_0000 | (0x35 << 18) | 0x8000 | pat, (3 << 24) | 2];
+            let dpp = [0x7E00_02FA | (3 << 17), 0xFF00_0000 | (pat << 8) | 2];
+            assert!(run(swz).is_ok());
+            assert!(run(dpp).is_ok());
+        }
+        let in_quad = [3u32, 0, 2, 1, 4, 6, 5, 7];
+        let sel = (0..8).fold(0, |s, i| s | (in_quad[i] << (3 * i)));
+        assert!(run([0x7E00_02E9 | (3 << 17), (sel << 8) | 2]).is_ok());
+        assert!(run([0x7E00_02E9 | (3 << 17), ((sel ^ 4) << 8) | 2]).is_err());
     }
 }

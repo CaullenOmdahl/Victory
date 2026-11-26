@@ -103,6 +103,17 @@ impl Source {
             s => vec![s],
         }
     }
+
+    /// Whether lanes may hold different descriptors.
+    fn per_lane(&self) -> bool {
+        match self {
+            Source::Fetched { .. } | Source::Lanes { .. } | Source::Paths { .. } => true,
+            Source::Phi { args, .. } | Source::Select { args, .. } => {
+                args.iter().any(Source::per_lane)
+            }
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1149,6 +1160,11 @@ impl<'a> Tracer<'a> {
             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
             .collect::<Option<Vec<_>>>()
             .ok_or("a descriptor not in SGPRs")?;
+        // Read from the first active lane at the access, as a waterfall loop
+        // does (`track` proves the loop): the dwords each lane holds.
+        if let Some(lanes) = self.first_lanes(&words) {
+            return self.per_lane(&lanes, &mut Vec::new());
+        }
         self.classify(&words, &mut Vec::new())
     }
 
@@ -1161,20 +1177,20 @@ impl<'a> Tracer<'a> {
         if let Some(source) = self.select(words, joins)? {
             return Ok(source);
         }
-        let read = |w: &Term| match *w {
-            Term::Value(v) => self.first_lane_source(v),
-            Term::Const(_) => None,
-        };
-        if let Some(sources) = words.iter().map(read).collect::<Option<Vec<_>>>() {
-            // Read from the first active lane, as a waterfall loop does: the
-            // dwords each lane holds.
-            let lanes: Vec<Term> = sources
-                .into_iter()
-                .map(|v| self.lane_term(Term::Value(v)))
-                .collect();
-            return self.per_lane(&lanes, joins);
+        if let Some(lanes) = self.first_lanes(words) {
+            // Read from the first active lane where no waterfall loop at the
+            // access proves them each lane's own (picked or joined after the
+            // reads): reject per-lane sources outside a waterfall loop.
+            let source = self.per_lane(&lanes, joins)?;
+            if source.per_lane() {
+                return Err("a descriptor read from the first lane outside a waterfall loop");
+            }
+            return Ok(source);
         }
-        if words.iter().any(|w| read(w).is_some()) {
+        if words.iter().any(|w| match *w {
+            Term::Value(v) => self.first_lane_source(v).is_some(),
+            Term::Const(_) => false,
+        }) {
             return Err("a descriptor partly read from the first lane");
         }
         if let Some(consts) = words
@@ -1410,6 +1426,20 @@ impl<'a> Tracer<'a> {
             return None;
         };
         inst.read(Reg::V(reg))
+    }
+
+    /// The VGPR values `words` read from the first active lane, when every
+    /// dword is a `v_readfirstlane_b32` result.
+    fn first_lanes(&self, words: &[Term]) -> Option<Vec<Term>> {
+        words
+            .iter()
+            .map(|w| match *w {
+                Term::Value(v) => self
+                    .first_lane_source(v)
+                    .map(|s| self.lane_term(Term::Value(s))),
+                Term::Const(_) => None,
+            })
+            .collect()
     }
 
     /// The `v_readfirstlane_b32` results the descriptor operand `op` of
@@ -1890,9 +1920,14 @@ impl Tracer<'_> {
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
-            .ok()
-            .flatten()
+        let mask = if self.p.wave64 { 63 } else { 31 };
+        self.spilled(
+            inst.read(Reg::V(reg))?,
+            lane_of(lane)? & mask,
+            &mut Vec::new(),
+        )
+        .ok()
+        .flatten()
     }
 
     /// What lane `lane` of VGPR value `v` holds: `Ok(None)` for a phi in
@@ -1924,7 +1959,8 @@ impl Tracer<'_> {
         if inst.name() != "v_writelane_b32" {
             return Err(());
         }
-        if lane_of(*at).ok_or(())? != lane {
+        let mask = if self.p.wave64 { 63 } else { 31 };
+        if (lane_of(*at).ok_or(())? & mask) != lane {
             return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
         }
         match *value {
@@ -3000,6 +3036,45 @@ pub(crate) mod tests {
                 err,
                 ShaderError::Unsupported {
                     what: "a descriptor read from the first lane of an LDS read",
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn first_lane_reads_outside_waterfall_loop_are_refused() {
+        // Per-lane `global_load_dwordx4` dwords read via `v_readfirstlane_b32` and
+        // picked by `s_cselect` (outside the waterfall loop's own reads): refused.
+        let words: &[u32] = &[
+            0xBE84_0300, // s_mov_b32 s4, s0
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0702,
+            0xFA00_0020, // s_load_dwordx4 s[28:31], s[4:5], 0x20
+            0xDC38_8400,
+            0x0404_0001, // global_load_dwordx4 v[4:7], v1, s[4:5] offset:0
+            0xBF8C_0070, // s_waitcnt vmcnt(0) lgkmcnt(0)
+            0x7E18_0504, // v_readfirstlane_b32 s12, v4
+            0x7E1A_0505, // v_readfirstlane_b32 s13, v5
+            0x7E1C_0506, // v_readfirstlane_b32 s14, v6
+            0x7E1E_0507, // v_readfirstlane_b32 s15, v7
+            0xBF06_8001, // s_cmp_eq_u32 s1, 0
+            0x858C_1C0C, // s_cselect_b64 s[12:13], s[12:13], s[28:29]
+            0x858E_1E0E, // s_cselect_b64 s[14:15], s[14:15], s[30:31]
+            0xE030_2000,
+            0x8003_0100, // buffer_load_dword v1, v0, s[12:15], 0 idxen
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, false, 256).unwrap();
+        let layout = [param(Table, 0, 1), param(Constants, 1, 1)];
+        let err = track(&p, &layout, HwStage::Cs).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ShaderError::Unsupported {
+                    what: "a descriptor read from the first lane outside a waterfall loop",
                     ..
                 }
             ),

@@ -289,7 +289,6 @@ s_dcache_discard
 s_dcache_discard_x2
 s_dcache_inv
 s_dcache_wb
-s_get_waveid_in_workgroup
 s_getpc_b64
 s_getreg_b32
 s_gl1_inv
