@@ -73,6 +73,10 @@ pub(crate) struct Hoist {
     pub(crate) writes: u64,
 }
 
+/// What a render target or depth view of the host is made from: the host
+/// texture, and [`crate::descriptor::RtvRecord::key`].
+type TargetKey = (usize, (usize, [u32; 7]));
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
@@ -96,11 +100,12 @@ pub(crate) struct State {
     /// What was set on the host list at once, for the one a cut list goes on
     /// in.
     fixed: Fixed,
-    /// What the host list has: pipeline, root signature, heaps.
+    /// What the host list has: pipeline, root signature, heaps, targets.
     host_pipeline: usize,
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
+    host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
     /// Tables made afresh in this list, by a hash of the table and what it
     /// holds ([`table_hash`]).
     fresh_tables: std::collections::HashMap<u64, Fresh, std::hash::BuildHasherDefault<Plain>>,
@@ -488,6 +493,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
+        self.host_targets = None;
         // Making one refreshes what it names, which is each list's own work.
         self.fresh_tables.clear();
         self.fresh_records.clear();
@@ -532,7 +538,8 @@ impl State {
         stencil_ref(list, reference);
     }
 
-    /// Render targets and depth, set on the host list at once.
+    /// Render targets and depth, set on the host list at once, unless it has
+    /// the same ones already (`VICTORY_BIND_CACHE=0` sets them every time).
     pub(crate) fn set_targets(&mut self, list: &HostList, handles: &[u64], depth: u64) {
         let mut targets = Vec::new();
         for &h in handles {
@@ -557,7 +564,8 @@ impl State {
             return;
         };
         self.targets.clear();
-        let mut rtvs = Vec::new();
+        let mut rtv_sources = Vec::with_capacity(targets.len());
+        let mut keys = Vec::with_capacity(targets.len());
         for record in &targets {
             let Some(texture) = crate::resource::host_resource(record.resource) else {
                 continue;
@@ -565,16 +573,36 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(texture, record.desc().as_ref()));
+            keys.push((windows::core::Interface::as_raw(texture) as usize, record.key()));
+            rtv_sources.push((texture, *record));
         }
         self.depth = 0;
-        let dsv = depth.and_then(|record| {
+        let dsv_source = depth.and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            Some(host.dsv(texture, record.depth_desc().as_ref()))
+            Some((texture, record))
         });
+        let now = (
+            keys,
+            dsv_source.map(|(texture, record)| {
+                (windows::core::Interface::as_raw(texture) as usize, record.key())
+            }),
+        );
+        self.fixed.views = Some((targets, depth));
+        static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
+            && self.host_targets.as_ref() == Some(&now)
+        {
+            return;
+        }
+        self.host_targets = Some(now);
+        let rtvs: Vec<_> = rtv_sources
+            .iter()
+            .map(|(texture, record)| host.rtv(texture, record.desc().as_ref()))
+            .collect();
+        let dsv = dsv_source.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -584,7 +612,6 @@ impl State {
                 dsv.as_ref().map(std::ptr::from_ref),
             )
         };
-        self.fixed.views = Some((targets, depth));
     }
 
     /// The user-data value of a root argument, as translated shaders read
