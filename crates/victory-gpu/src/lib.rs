@@ -58,7 +58,6 @@ pub mod resource;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
-#[cfg(windows)]
 pub mod shader_cache;
 #[cfg(windows)]
 mod shadow;
@@ -85,6 +84,9 @@ pub fn frames_begun() -> u64 {
     frame::current()
 }
 pub use memstat::report as memory_report;
+#[cfg(windows)]
+pub use pipeline::warm_used;
+pub use pipeline::{WarmStats, needed_shader_hashes};
 #[cfg(windows)]
 pub use texture::{PageGenOracle, set_page_gen_oracle};
 #[cfg(windows)]

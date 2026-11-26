@@ -15,11 +15,12 @@
 //! All library calls are serialised: the interface does not promise that
 //! stores, loads and serialising may overlap.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+pub(crate) use super::recipes::{RECIPES_FILE, UsedRecipe, decode_recipes, encode_recipes};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::core::{HSTRING, Interface, PCWSTR};
 
@@ -483,20 +484,31 @@ pub(crate) fn save(now: bool) {
     // creates it, and finds it in those caches.
     let Some(library) = library() else {
         if USED_CHANGED.swap(false, Ordering::Relaxed) {
-            let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+            let used: Vec<String> = USED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .flatten()
+                .cloned()
+                .collect();
             match write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()) {
-                Ok(()) => tracing::info!(early = used.len(), "early pipeline list saved (no host pipeline library)"),
+                Ok(()) => {
+                    tracing::info!(early = used.len(), "early pipeline list saved (no host pipeline library)");
+                }
                 Err(e) => {
                     USED_CHANGED.store(true, Ordering::Relaxed);
                     tracing::warn!(error = %e, "early pipeline list not saved");
                 }
             }
         }
+        save_recipes(dir);
         return;
     };
     let (blob, saved_additions) = {
         let l = library.lock().unwrap_or_else(|e| e.into_inner());
         if l.added == 0 && !USED_CHANGED.load(Ordering::Relaxed) {
+            drop(l);
+            save_recipes(dir);
             return;
         }
         // SAFETY: a buffer of the size the library asks for.
@@ -513,10 +525,17 @@ pub(crate) fn save(now: bool) {
         }
     };
     let used_changed = USED_CHANGED.swap(false, Ordering::Relaxed);
-    let used: Vec<String> = USED.lock().unwrap_or_else(|e| e.into_inner()).iter().flatten().cloned().collect();
+    let used: Vec<String> = USED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
     let written = std::fs::create_dir_all(dir)
         .and_then(|()| write_atomically(&dir.join(LIBRARY_FILE), &blob))
         .and_then(|()| write_atomically(&dir.join(EARLY_FILE), used.join("\n").as_bytes()));
+    save_recipes(dir);
     match written {
         Ok(()) => {
             let mut l = library.lock().unwrap_or_else(|e| e.into_inner());
@@ -589,6 +608,64 @@ pub(crate) fn note_used(key: &str) {
     let set = used.get_or_insert_with(HashSet::new);
     if set.len() < EARLY_MAX && set.insert(key.to_owned()) {
         USED_CHANGED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Deduplicated pipeline recipes drawn or dispatched with (for offline `victory warm`).
+static RECIPES: Mutex<Option<HashMap<String, UsedRecipe>>> = Mutex::new(None);
+static RECIPES_CHANGED: AtomicBool = AtomicBool::new(false);
+
+fn recipes() -> std::sync::MutexGuard<'static, Option<HashMap<String, UsedRecipe>>> {
+    let mut guard = RECIPES.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_none() {
+        let map = DIR
+            .get()
+            .and_then(|d| std::fs::read(d.join(RECIPES_FILE)).ok())
+            .and_then(|b| decode_recipes(&b))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| (r.key.clone(), r))
+            .collect();
+        *guard = Some(map);
+    }
+    guard
+}
+
+pub(crate) fn note_used_recipe(
+    key: &str,
+    stages: &[(&str, &str)],
+    graphics: Option<&super::host::GraphicsState>,
+) {
+    let mut guard = recipes();
+    let map = guard.get_or_insert_with(HashMap::new);
+    if map.len() < EARLY_MAX && !map.contains_key(key) {
+        map.insert(
+            key.to_owned(),
+            UsedRecipe {
+                key: key.to_owned(),
+                stages: stages
+                    .iter()
+                    .map(|&(s, h)| (s.to_owned(), h.to_owned()))
+                    .collect(),
+                graphics: graphics.map(super::host::GraphicsState::encode),
+            },
+        );
+        RECIPES_CHANGED.store(true, Ordering::Relaxed);
+    }
+}
+
+fn save_recipes(dir: &Path) {
+    if !RECIPES_CHANGED.swap(false, Ordering::Relaxed) {
+        return;
+    }
+    let list: Vec<UsedRecipe> = recipes()
+        .as_ref()
+        .map(|m| m.values().cloned().collect())
+        .unwrap_or_default();
+    let bytes = encode_recipes(&list);
+    if let Err(e) = write_atomically(&dir.join(RECIPES_FILE), &bytes) {
+        RECIPES_CHANGED.store(true, Ordering::Relaxed);
+        tracing::warn!(error = %e, "used pipeline recipes not saved");
     }
 }
 

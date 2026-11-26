@@ -32,13 +32,13 @@ pub fn use_shader_cache(dir: PathBuf) {
 }
 
 /// Shaders found in the cache and translated since the start.
-pub(crate) fn counts() -> (u64, u64) {
+pub fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
 /// Short hex key identifying this build's shader translation (respecting
 /// `VICTORY_SHADER_BUILD_OF` in diagnostic builds).
-pub(crate) fn build_key() -> String {
+pub fn build_key() -> String {
     blake3::Hash::from(*build()).to_hex()[..16].to_owned()
 }
 
@@ -85,7 +85,7 @@ fn build() -> &'static [u8; 32] {
 
 /// The translation of a console shader container for a host that runs
 /// `target`'s wave sizes, from the cache when there is one.
-pub(crate) fn host_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
+pub fn host_shader(container: &[u8], target: Target) -> Result<HostShader, String> {
     let translate =
         |c: &[u8]| victory_shader::emit::translate_for(c, target).map_err(|e| e.to_string());
     match CACHE.get() {
@@ -402,8 +402,12 @@ mod tests {
             lanes_max: 64,
             ..Target::ANY
         };
+        #[cfg(windows)]
+        let portable_views = crate::descriptor::host::PORTABLE_VIEWS;
+        #[cfg(not(windows))]
+        let portable_views = 1_000_000;
         let capped_views = Target {
-            view_slots: crate::descriptor::host::PORTABLE_VIEWS,
+            view_slots: portable_views,
             ..rdna
         };
         let full_views = Target {

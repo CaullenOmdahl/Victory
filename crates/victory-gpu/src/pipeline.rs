@@ -868,6 +868,120 @@ pub(crate) mod host;
 mod library;
 #[cfg(windows)]
 mod make;
+mod recipes;
+
+pub use recipes::needed_shader_hashes;
+
+/// Summary of an offline `victory warm` run.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WarmStats {
+    pub recipes: usize,
+    pub matched: usize,
+    pub built: usize,
+    pub loaded: usize,
+    pub missing_shaders: usize,
+    pub shader_hits: u64,
+    pub shader_misses: u64,
+}
+
+#[cfg(windows)]
+fn stage_str(stage: &str) -> Option<&'static str> {
+    match stage {
+        "vertex" => Some("vertex"),
+        "pixel" => Some("pixel"),
+        "compute" => Some("compute"),
+        "mesh" => Some("mesh"),
+        "domain" => Some("domain"),
+        "hull" => Some("hull"),
+        "geometry" => Some("geometry"),
+        _ => None,
+    }
+}
+
+/// Offline pipeline pre-compilation (`victory warm --used`): warms DXIL from
+/// `shader_cache_dir`, compiles each recorded recipe into `ID3D12PipelineLibrary1`
+/// using up to 8 64 MiB-stack worker threads, and flushes `host-pipelines.bin`.
+#[cfg(windows)]
+pub fn warm_used(
+    containers: &HashMap<String, Vec<u8>>,
+    shader_cache_dir: std::path::PathBuf,
+    pipeline_cache_dir: std::path::PathBuf,
+) -> Result<WarmStats, String> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    crate::shader_cache::use_shader_cache(shader_cache_dir);
+    library::use_pipeline_cache(pipeline_cache_dir.clone());
+    if crate::host::host().is_none() {
+        return Err("no host D3D12 device".into());
+    }
+
+    let recipes = recipes::load_used_recipes(&pipeline_cache_dir);
+    let total_recipes = recipes.len();
+    let mut work: Vec<(Vec<Arc<Shader>>, Option<Vec<u8>>)> = Vec::new();
+    let mut missing_shaders = 0usize;
+
+    for recipe in recipes {
+        let mut shaders = Vec::with_capacity(recipe.stages.len());
+        let mut complete = true;
+        for (stage_name, hash) in &recipe.stages {
+            let Some(stage) = stage_str(stage_name) else {
+                complete = false;
+                break;
+            };
+            let Some(bytes) = containers.get(hash) else {
+                complete = false;
+                break;
+            };
+            shaders.push(shader(stage, bytes));
+        }
+        if !complete {
+            missing_shaders += 1;
+            continue;
+        }
+        work.push((shaders, recipe.graphics));
+    }
+
+    let matched = work.len();
+    let made_before = library::MADE.load(Ordering::Relaxed);
+    let loaded_before = library::LOADED.load(Ordering::Relaxed);
+    let threads = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .clamp(1, 8);
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for i in 0..threads.min(matched.max(1)) {
+            let work = &work;
+            let next = &next;
+            let _ = std::thread::Builder::new()
+                .name(format!("victory-warm-{i}"))
+                .stack_size(64 << 20)
+                .spawn_scoped(s, move || {
+                    while let Some((shaders, g_bytes)) =
+                        work.get(next.fetch_add(1, Ordering::Relaxed))
+                    {
+                        let graphics = g_bytes.as_deref().and_then(host::GraphicsState::decode);
+                        if g_bytes.is_some() && graphics.is_none() {
+                            continue;
+                        }
+                        let _ = host::HostPipeline::new(shaders, graphics.as_ref());
+                    }
+                });
+        }
+    });
+    library::save(true);
+    let built = (library::MADE.load(Ordering::Relaxed) - made_before) as usize;
+    let loaded = (library::LOADED.load(Ordering::Relaxed) - loaded_before) as usize;
+    let (shader_hits, shader_misses) = crate::shader_cache::counts();
+    Ok(WarmStats {
+        recipes: total_recipes,
+        matched,
+        built,
+        loaded,
+        missing_shaders,
+        shader_hits,
+        shader_misses,
+    })
+}
 
 /// Keeps compiled host pipelines, and the list of title pipelines to start
 /// early, in `dir` (a folder of the cache) across runs.

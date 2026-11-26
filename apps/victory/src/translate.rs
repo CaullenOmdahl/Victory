@@ -7,8 +7,11 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::Result;
+use victory_shader::emit;
+#[cfg(windows)]
 use victory_shader::emit::host::{self, Host};
-use victory_shader::emit::{self, validator::Validator};
+#[cfg(windows)]
+use victory_shader::emit::validator::Validator;
 use victory_shader::structure::{self, Atom, LaneExit};
 use victory_shader::{
     Container, FourCC, HwStage, NativeProgram, RootType, ShaderError, ir,
@@ -147,13 +150,18 @@ type Kept = std::sync::Arc<Mutex<Vec<(String, emit::HostShader)>>>;
 struct Checks {
     /// The wave sizes to translate for.
     target: emit::Target,
+    /// Populate the on-disk DXIL shader cache (`--cache`).
+    cache: bool,
     /// Shaders named in `VICTORY_PAIRS` (`vs+ps,...`, label substrings),
     /// kept to build those pipelines after the walk.
     keep: Option<Kept>,
+    #[cfg(windows)]
     validator: Option<Validator>,
+    #[cfg(windows)]
     host: Option<(Host, emit::HostShader)>,
 }
 
+#[expect(clippy::too_many_arguments, reason = "CLI options map directly here")]
 pub fn run(
     paths: Vec<PathBuf>,
     validate: bool,
@@ -161,9 +169,15 @@ pub fn run(
     list: bool,
     jobs: Option<usize>,
     host_lanes: Option<(u32, u32)>,
+    cache: bool,
+    cache_dir: Option<PathBuf>,
+    no_native16: bool,
+    portable_views: bool,
 ) -> Result<()> {
     let paths = crate::default_paths(paths)?;
+    #[cfg(windows)]
     let dll = validate.then(Validator::default_path).flatten();
+    #[cfg(windows)]
     if validate {
         Validator::load(dll.as_deref()).map_err(anyhow::Error::msg)?;
         println!(
@@ -173,8 +187,38 @@ pub fn run(
         );
     }
     let mut target = emit::Target::ANY;
+    #[cfg(windows)]
     if pipelines {
         target = Host::new(false).map_err(anyhow::Error::msg)?.target();
+    } else if cache {
+        target = emit::Target {
+            view_slots: if portable_views {
+                1_000_000
+            } else {
+                emit::VIEW_SLOTS
+            },
+            sampler_slots: emit::SAMPLER_SLOTS,
+            native16: !no_native16,
+            ..emit::Target::ANY
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        if validate || pipelines {
+            anyhow::bail!("--validate and --pipelines require Windows/Proton");
+        }
+        if cache {
+            target = emit::Target {
+                view_slots: if portable_views {
+                    1_000_000
+                } else {
+                    emit::VIEW_SLOTS
+                },
+                sampler_slots: emit::SAMPLER_SLOTS,
+                native16: !no_native16,
+                ..emit::Target::ANY
+            };
+        }
     }
     if let Some((lanes_min, lanes_max)) = host_lanes {
         target = emit::Target {
@@ -182,6 +226,23 @@ pub fn run(
             lanes_max,
             ..target
         };
+    }
+    if cache {
+        let dir = match cache_dir {
+            Some(d) => d,
+            None => victory_core::Config::load()?.cache_subdir("shaders")?,
+        };
+        let display_dir = dir.display().to_string();
+        victory_gpu::shader_cache::use_shader_cache(dir);
+        println!(
+            "shader cache {display_dir} (key {}, lanes {}-{}, views {}, samplers {}, native16={})",
+            victory_gpu::shader_cache::build_key(),
+            target.lanes_min,
+            target.lanes_max,
+            target.view_slots,
+            target.sampler_slots,
+            target.native16
+        );
     }
     if target != emit::Target::ANY {
         println!(
@@ -195,6 +256,7 @@ pub fn run(
         .filter_map(|p| p.split_once('+'))
         .map(|(v, p)| (v.trim().to_owned(), p.trim().to_owned()))
         .collect();
+    let fast_cache = cache && !validate && !pipelines && !list && pairs.is_empty();
     let kept = std::sync::Arc::new(Mutex::new(Vec::new()));
     let threads =
         jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()));
@@ -222,16 +284,23 @@ pub fn run(
                         };
                         let mut checks = Checks {
                             target,
+                            cache,
                             keep: (!pairs.is_empty()).then(|| kept.clone()),
+                            #[cfg(windows)]
                             validator: validate
                                 .then(|| Validator::load(dll.as_deref()).ok())
                                 .flatten(),
+                            #[cfg(windows)]
                             host: pipelines
                                 .then(|| Host::new(false).ok().map(|h| (h, host::stub_ps())))
                                 .flatten(),
                         };
                         while let Some(job) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) {
-                            translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            if fast_cache {
+                                translate_cached(job, entry.path(), &seen, &mut t, checks.target);
+                            } else {
+                                translate(job, entry.path(), &seen, &mut t, &mut checks);
+                            }
                         }
                         lock(&total).merge(t);
                     });
@@ -288,6 +357,7 @@ pub fn run(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
     );
+    #[cfg(windows)]
     if !pairs.is_empty() {
         let host = Host::new(false).map_err(anyhow::Error::msg)?;
         let kept = lock(&kept);
@@ -316,7 +386,45 @@ pub fn run(
     for (reason, (n, example)) in failed {
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
+    if cache {
+        let (hits, misses) = victory_gpu::shader_cache::counts();
+        println!("shader cache {hits} hits, {misses} misses");
+    }
     Ok(())
+}
+
+/// Fast path for `translate --cache`: translates and caches each unique
+/// container once through `victory_gpu::shader_cache::host_shader`.
+fn translate_cached(
+    source: &Source,
+    path: &Path,
+    seen: &Mutex<HashSet<blake3::Hash>>,
+    t: &mut Tally,
+    target: emit::Target,
+) {
+    let example = || format!("{}{}", path.display(), source.label());
+    let Some(bytes) = source.bytes() else {
+        return t.fail("corrupt record".into(), example);
+    };
+    t.containers += 1;
+    let Ok(container) = Container::parse(&bytes) else {
+        return t.fail("no DXIL part (SM5 or older)".into(), example);
+    };
+    let Some(dxil) = container
+        .part(FourCC::DXIL)
+        .or_else(|| container.part(FourCC::ACCC))
+        .map(|p| p.data)
+    else {
+        return t.fail("no DXIL part (SM5 or older)".into(), example);
+    };
+    if !lock(seen).insert(blake3::hash(dxil)) {
+        t.duplicates += 1;
+        return;
+    }
+    match victory_gpu::shader_cache::host_shader(&bytes, target) {
+        Ok(_) => t.translated += 1,
+        Err(e) => t.fail(e, example),
+    }
 }
 
 /// The instructions around `offset` (`VICTORY_AROUND=<count>`, before and
@@ -365,6 +473,9 @@ fn translate(
     if !lock(seen).insert(blake3::hash(dxil)) {
         t.duplicates += 1;
         return;
+    }
+    if checks.cache {
+        let _ = victory_gpu::shader_cache::host_shader(&bytes, checks.target);
     }
     let programs = match victory_shader::container_programs(&container) {
         Ok(p) => p,
@@ -499,6 +610,7 @@ fn translate(
 }
 
 /// Validates an emitted shader if asked to.
+#[allow(unused_variables, unused_mut)]
 fn check(
     mut shader: emit::HostShader,
     t: &mut Tally,
@@ -521,6 +633,7 @@ fn check(
             &shader.dxil,
         );
     }
+    #[cfg(windows)]
     if let Some((h, stub_ps)) = &checks.host {
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
@@ -538,41 +651,44 @@ fn check(
             Err(e) => t.fail(format!("pipeline: {e}"), &label),
         }
     }
-    let Some(v) = checks.validator.as_mut() else {
-        return;
-    };
-    match v.validate(&mut shader.dxil) {
-        Ok(()) => {
-            *counter(t, shader.stage, 2) += 1;
-            if t.list {
-                t.lines.push(format!("{}  validated", label()));
-            }
-        }
-        Err(text) => {
-            let first = text
-                .lines()
-                .find(|l| l.contains("error"))
-                .unwrap_or(text.lines().next().unwrap_or(""))
-                .to_owned();
-            if let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP") {
-                let n = t
-                    .failed
-                    .get(&format!("validator: {first}"))
-                    .map_or(0, |f| f.0);
-                if n < 3 {
-                    let name = format!(
-                        "{dir}/{}_{n}",
-                        first
-                            .chars()
-                            .filter(char::is_ascii_alphanumeric)
-                            .take(40)
-                            .collect::<String>()
-                    );
-                    let _ = std::fs::write(format!("{name}.dxil"), &shader.dxil);
-                    let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
+    #[cfg(windows)]
+    {
+        let Some(v) = checks.validator.as_mut() else {
+            return;
+        };
+        match v.validate(&mut shader.dxil) {
+            Ok(()) => {
+                *counter(t, shader.stage, 2) += 1;
+                if t.list {
+                    t.lines.push(format!("{}  validated", label()));
                 }
             }
-            t.fail(format!("validator: {first}"), label);
+            Err(text) => {
+                let first = text
+                    .lines()
+                    .find(|l| l.contains("error"))
+                    .unwrap_or(text.lines().next().unwrap_or(""))
+                    .to_owned();
+                if let Ok(dir) = std::env::var("VICTORY_EMIT_DUMP") {
+                    let n = t
+                        .failed
+                        .get(&format!("validator: {first}"))
+                        .map_or(0, |f| f.0);
+                    if n < 3 {
+                        let name = format!(
+                            "{dir}/{}_{n}",
+                            first
+                                .chars()
+                                .filter(char::is_ascii_alphanumeric)
+                                .take(40)
+                                .collect::<String>()
+                        );
+                        let _ = std::fs::write(format!("{name}.dxil"), &shader.dxil);
+                        let _ = std::fs::write(format!("{name}.txt"), format!("{}\n{text}", label()));
+                    }
+                }
+                t.fail(format!("validator: {first}"), label);
+            }
         }
     }
 }

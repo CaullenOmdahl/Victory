@@ -342,6 +342,100 @@ impl GraphicsState {
         }
     }
 
+    /// Serialises this state (versioned binary) so another process (`victory warm`)
+    /// can recreate the exact same host pipeline and library key.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(512);
+        out.push(1);
+        push_pod(&mut out, &self.blend);
+        out.extend_from_slice(&self.sample_mask.to_le_bytes());
+        push_pod(&mut out, &self.rasterizer);
+        push_pod(&mut out, &self.depth);
+        out.push(u8::from(self.depth_bounds));
+        let count = self.inputs.len().min(self.names.len());
+        out.extend_from_slice(&(count as u32).to_le_bytes());
+        for (elem, name) in self.inputs.iter().zip(&self.names).take(count) {
+            let name_bytes = name.as_bytes();
+            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(name_bytes);
+            let mut plain = *elem;
+            plain.SemanticName = PCSTR::null();
+            push_pod(&mut out, &plain);
+        }
+        out.extend_from_slice(&self.strip_cut.0.to_le_bytes());
+        out.extend_from_slice(&self.topology.0.to_le_bytes());
+        push_pod(&mut out, &self.targets);
+        out.extend_from_slice(&self.depth_format.0.to_le_bytes());
+        push_pod(&mut out, &self.samples);
+        out
+    }
+
+    /// Reconstructs a `GraphicsState` written by [`Self::encode`].
+    pub(crate) fn decode(mut bytes: &[u8]) -> Option<GraphicsState> {
+        if *bytes.first()? != 1 {
+            return None;
+        }
+        bytes = &bytes[1..];
+        let blend = take_pod::<D3D12_BLEND_DESC>(&mut bytes)?;
+        let sample_mask = u32::from_le_bytes(take_slice(&mut bytes, 4)?.try_into().ok()?);
+        let rasterizer = take_pod::<D3D12_RASTERIZER_DESC>(&mut bytes)?;
+        let depth = take_pod::<D3D12_DEPTH_STENCIL_DESC>(&mut bytes)?;
+        let depth_bounds = match *bytes.first()? {
+            0 => false,
+            1 => true,
+            _ => return None,
+        };
+        bytes = &bytes[1..];
+        let count = u32::from_le_bytes(take_slice(&mut bytes, 4)?.try_into().ok()?) as usize;
+        let mut names = Vec::with_capacity(count.min(64));
+        let mut raw_inputs = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            let name_len =
+                u32::from_le_bytes(take_slice(&mut bytes, 4)?.try_into().ok()?) as usize;
+            let name_slice = take_slice(&mut bytes, name_len)?;
+            let cstr = CString::new(name_slice).ok()?;
+            let elem = take_pod::<D3D12_INPUT_ELEMENT_DESC>(&mut bytes)?;
+            names.push(cstr);
+            raw_inputs.push(elem);
+        }
+        let inputs: Vec<D3D12_INPUT_ELEMENT_DESC> = raw_inputs
+            .into_iter()
+            .zip(&names)
+            .map(|(elem, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                ..elem
+            })
+            .collect();
+        let strip_cut = D3D12_INDEX_BUFFER_STRIP_CUT_VALUE(i32::from_le_bytes(
+            take_slice(&mut bytes, 4)?.try_into().ok()?,
+        ));
+        let topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(i32::from_le_bytes(
+            take_slice(&mut bytes, 4)?.try_into().ok()?,
+        ));
+        let targets = take_pod::<D3D12_RT_FORMAT_ARRAY>(&mut bytes)?;
+        let depth_format = DXGI_FORMAT(i32::from_le_bytes(
+            take_slice(&mut bytes, 4)?.try_into().ok()?,
+        ));
+        let samples = take_pod::<DXGI_SAMPLE_DESC>(&mut bytes)?;
+        if !bytes.is_empty() {
+            return None;
+        }
+        Some(GraphicsState {
+            blend,
+            sample_mask,
+            rasterizer,
+            depth,
+            depth_bounds,
+            inputs,
+            names,
+            strip_cut,
+            topology,
+            targets,
+            depth_format,
+            samples,
+        })
+    }
+
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
     pub(crate) fn describe(&self) -> String {
@@ -1265,4 +1359,79 @@ mod tests {
         assert_eq!(cleared.RTFormats[..2], [DXGI_FORMAT(28); 2]);
         assert!(cleared.RTFormats[2..].iter().all(|&f| f == DXGI_FORMAT_UNKNOWN));
     }
+
+    #[test]
+    fn graphics_state_encode_decode_round_trips() {
+        let mut g = GraphicsState::default();
+        g.targets.NumRenderTargets = 2;
+        g.targets.RTFormats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
+        g.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        g.depth_format = DXGI_FORMAT_D32_FLOAT;
+        g.depth_bounds = true;
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        g.sample_mask = 0xa5a5_5a5a;
+        g.rasterizer.CullMode = D3D12_CULL_MODE_FRONT;
+        g.blend.RenderTarget[0].BlendEnable = true.into();
+        g.names = vec![c"POSITION".to_owned(), c"TEXCOORD".to_owned()];
+        g.inputs = vec![
+            D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(g.names[0].as_ptr().cast()),
+                SemanticIndex: 0,
+                Format: DXGI_FORMAT_R32G32B32_FLOAT,
+                InputSlot: 0,
+                AlignedByteOffset: 0,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                InstanceDataStepRate: 0,
+            },
+            D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(g.names[1].as_ptr().cast()),
+                SemanticIndex: 1,
+                Format: DXGI_FORMAT_R32G32_FLOAT,
+                InputSlot: 1,
+                AlignedByteOffset: 12,
+                InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
+                InstanceDataStepRate: 1,
+            },
+        ];
+
+        let encoded = g.encode();
+        let decoded = GraphicsState::decode(&encoded).expect("decode GraphicsState");
+        assert_eq!(decoded.describe(), g.describe());
+        assert_eq!(decoded.formats(), g.formats());
+        assert_eq!(decoded.topology, g.topology);
+        assert_eq!(decoded.depth_bounds, g.depth_bounds);
+        assert_eq!(decoded.inputs.len(), 2);
+        assert_eq!(
+            decoded.inputs[0].SemanticName.0,
+            decoded.names[0].as_ptr().cast::<u8>()
+        );
+        assert_eq!(
+            decoded.inputs[1].SemanticName.0,
+            decoded.names[1].as_ptr().cast::<u8>()
+        );
+        assert!(GraphicsState::decode(&encoded[..encoded.len() - 1]).is_none());
+    }
+}
+
+fn push_pod<T: Copy>(out: &mut Vec<u8>, value: &T) {
+    // SAFETY: `T` is a plain C representation struct (`Copy`) valid for reading `size_of::<T>()` bytes.
+    let bytes = unsafe {
+        std::slice::from_raw_parts((value as *const T).cast::<u8>(), size_of::<T>())
+    };
+    out.extend_from_slice(bytes);
+}
+
+fn take_slice<'a>(bytes: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
+    if bytes.len() < len {
+        return None;
+    }
+    let (head, rest) = bytes.split_at(len);
+    *bytes = rest;
+    Some(head)
+}
+
+fn take_pod<T: Copy>(bytes: &mut &[u8]) -> Option<T> {
+    let slice = take_slice(bytes, size_of::<T>())?;
+    // SAFETY: `slice` is exactly `size_of::<T>()` bytes for `T: Copy`.
+    Some(unsafe { slice.as_ptr().cast::<T>().read_unaligned() })
 }

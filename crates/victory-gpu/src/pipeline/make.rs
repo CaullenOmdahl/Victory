@@ -226,6 +226,12 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        let stages: Vec<(&str, &str)> = p
+            .shaders
+            .iter()
+            .map(|s| (s.stage, s.hash.as_str()))
+            .collect();
+        super::library::note_used_recipe(&p.key, &stages, p.graphics.as_deref());
     }
     if p.made.get().is_none() {
         start(p, true);

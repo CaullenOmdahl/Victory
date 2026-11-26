@@ -10,6 +10,7 @@ mod shader;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod title_patch;
 mod translate;
+mod warm;
 
 use std::path::PathBuf;
 
@@ -92,6 +93,31 @@ enum Command {
         /// Worker threads (default: every logical core).
         #[arg(long)]
         jobs: Option<usize>,
+        /// Write translated shaders to the on-disk shader cache.
+        #[arg(long)]
+        cache: bool,
+        /// Override shader cache directory (defaults to configured shaders cache dir).
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+        /// Disable native 16-bit shader ops when populating the offline cache.
+        #[arg(long)]
+        no_native16: bool,
+        /// Use 1,000,000 view slots (PORTABLE_VIEWS) instead of VIEW_SLOTS when caching offline.
+        #[arg(long)]
+        portable_views: bool,
+    },
+    /// Compile host D3D12 pipelines ahead of time from saved usage recipes.
+    Warm {
+        paths: Vec<PathBuf>,
+        /// Warm only pipelines recorded in used-pipelines.bin by an earlier run.
+        #[arg(long)]
+        used: bool,
+        /// Override shader cache directory (defaults to configured shaders cache dir).
+        #[arg(long)]
+        shader_cache_dir: Option<PathBuf>,
+        /// Override pipeline cache directory (defaults to configured pipelines cache dir).
+        #[arg(long)]
+        pipeline_cache_dir: Option<PathBuf>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -161,7 +187,28 @@ fn main() -> Result<()> {
             list,
             jobs,
             host_lanes,
-        } => translate::run(paths, validate, pipelines, list, jobs, host_lanes),
+            cache,
+            cache_dir,
+            no_native16,
+            portable_views,
+        } => translate::run(
+            paths,
+            validate,
+            pipelines,
+            list,
+            jobs,
+            host_lanes,
+            cache,
+            cache_dir,
+            no_native16,
+            portable_views,
+        ),
+        Command::Warm {
+            paths,
+            used,
+            shader_cache_dir,
+            pipeline_cache_dir,
+        } => warm::run(paths, used, shader_cache_dir, pipeline_cache_dir),
         Command::Run {
             exe,
             unimplemented,
