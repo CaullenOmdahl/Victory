@@ -79,7 +79,7 @@ struct Direct {
 
 #[derive(Default)]
 struct Before {
-    snapshot: Option<(usize, Vec<u8>)>,
+    segments: Vec<(usize, Vec<u8>)>,
     unchanged: UnchangedPages,
 }
 
@@ -588,28 +588,23 @@ impl Shadow {
         let host =
             |a: usize, b: usize| unsafe { std::slice::from_raw_parts(self.data.add(a), b - a) };
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
-        let before = &mut before.snapshot;
-        let (start, end) = match &*before {
-            Some((at, bytes)) => ((*at).min(from), (at + bytes.len()).max(to)),
-            None => (from, to),
-        };
-        if let Some((at, bytes)) = &*before
-            && (*at, at + bytes.len()) == (start, end)
-        {
-            return;
-        }
-        // Parts newly covered from the copy, the rest as it was taken.
-        let mut grown = pooled(end - start);
-        match before.take() {
-            Some((at, bytes)) => {
-                grown.extend_from_slice(host(start, at));
-                grown.extend_from_slice(&bytes);
-                grown.extend_from_slice(host(at + bytes.len(), end));
-                give_back(bytes);
+        let segments = &mut before.segments;
+        let mut i = segments.partition_point(|(at, bytes)| at + bytes.len() <= from);
+        let mut cur = from;
+        while cur < to {
+            let next_start = segments.get(i).map_or(to, |(at, _)| (*at).min(to));
+            if cur < next_start {
+                let mut gap = pooled(next_start - cur);
+                gap.extend_from_slice(host(cur, next_start));
+                segments.insert(i, (cur, gap));
+                i += 1;
+                cur = next_start;
+            } else {
+                let seg_end = segments[i].0 + segments[i].1.len();
+                cur = cur.max(seg_end);
+                i += 1;
             }
-            None => grown.extend_from_slice(host(start, end)),
         }
-        *before = Some((start, grown));
     }
 
     /// After the submission ran: copies the bytes its shaders wrote back
@@ -631,7 +626,7 @@ impl Shadow {
         }
         let mut before = self.before.lock().unwrap_or_else(|e| e.into_inner());
         let Before {
-            snapshot,
+            segments,
             unchanged,
         } = &mut *before;
         let mut written = 0;
@@ -641,36 +636,42 @@ impl Shadow {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             pending.retain(|&r| r != (address, address + len));
             self.pending_len.store(pending.len(), Ordering::Relaxed);
-            if pending.is_empty()
-                && let Some((_, bytes)) = snapshot.take()
-            {
+            if pending.is_empty() && !segments.is_empty() {
                 unchanged.clear();
-                give_back(bytes);
+                for (_, bytes) in segments.drain(..) {
+                    give_back(bytes);
+                }
             }
             return 0;
         }
-        if let Some((taken, before)) = &mut *snapshot
-            && *taken <= from
-            && to <= *taken + before.len()
-            && from < to
-        {
-            unchanged.begin(start + *taken, start + *taken + before.len());
-            let before = &mut before[from - *taken..to - *taken];
-            // By 64 KiB piece: the copy compared with its bytes before the
-            // submission, title memory read only where the GPU wrote.
-            // An unchanged page is never modified by copy-back, so later
-            // overlapping ranges can skip it for the rest of the submission.
+        if from < to && !segments.is_empty() {
+            let first_at = segments[0].0;
+            let last_end = segments.last().map_or(first_at, |(at, b)| at + b.len());
+            unchanged.begin(start + first_at, start + last_end);
+            // By 64 KiB piece bounded to each snapshot segment: the copy
+            // compared with its bytes before the submission, title memory
+            // read only where the GPU wrote.
             let mode = self.watched.load(Ordering::Relaxed);
             let filter_marks = crate::marks::filter_copy_back();
             let mut dirty_words = Vec::new();
             let mut title: Option<Vec<u8>> = None;
             let mut synced = Vec::new();
+            let mut seg_idx = segments.partition_point(|(at, bytes)| at + bytes.len() <= from);
             let mut at = from;
-            while at < to {
-                let n = (PAGE - (start + at) % PAGE).min(to - at);
+            while at < to && seg_idx < segments.len() {
+                let (taken, seg) = &mut segments[seg_idx];
+                let seg_end = *taken + seg.len();
+                if at < *taken {
+                    at = (*taken).min(to);
+                    continue;
+                }
+                let n = (PAGE - (start + at) % PAGE).min(to - at).min(seg_end - at);
                 if filter_marks {
                     if !crate::marks::is_page_marked(start + at) {
                         at += n;
+                        if at >= seg_end {
+                            seg_idx += 1;
+                        }
                         continue;
                     }
                     let w = crate::marks::word_index(start + at);
@@ -681,7 +682,7 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &mut before[at - from..at - from + n];
+                let old = &mut seg[at - *taken..at - *taken + n];
                 if unchanged.differs(start + at, host, old) {
                     let buf = title.get_or_insert_with(|| {
                         let mut v = pooled(PAGE);
@@ -717,6 +718,9 @@ impl Shadow {
                     }
                 }
                 at += n;
+                if at >= seg_end {
+                    seg_idx += 1;
+                }
             }
             crate::marks::note_dirty_words(&dirty_words);
             if let Some(buf) = title {
@@ -770,11 +774,11 @@ impl Shadow {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|&r| r != (address, address + len));
         self.pending_len.store(pending.len(), Ordering::Relaxed);
-        if pending.is_empty()
-            && let Some((_, bytes)) = snapshot.take()
-        {
+        if pending.is_empty() && !segments.is_empty() {
             unchanged.clear();
-            give_back(bytes);
+            for (_, bytes) in segments.drain(..) {
+                give_back(bytes);
+            }
         }
         written
     }
@@ -4400,6 +4404,50 @@ mod find_cache_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn writing_non_adjacent_ranges_keeps_separate_segments_without_gap_copy() {
+        let mut memory = vec![0xAAu8; 3 * PAGE];
+        let base = memory.as_mut_ptr() as u64;
+        let resource = (base as usize) | 0x3;
+        register(resource, base, (3 * PAGE) as u64);
+        let s = find(base, 1).expect("shadow");
+        s.update(base as usize, 3 * PAGE);
+        s.writing(base as usize + 128, 64);
+        s.writing(base as usize + 2 * PAGE + 256, 64);
+        {
+            let before = s.before.lock().unwrap();
+            assert_eq!(before.segments.len(), 2, "two disjoint segments without gap");
+            assert_eq!(before.segments[0].0, 128);
+            assert_eq!(before.segments[0].1.len(), 64);
+            assert_eq!(before.segments[1].0, 2 * PAGE + 256);
+            assert_eq!(before.segments[1].1.len(), 64);
+        }
+        // Mutate the covered shadow byte before extending so we verify the
+        // existing segment keeps its original snapshot while only the gap is copied.
+        // SAFETY: `s.data` maps `s.len` host bytes.
+        unsafe { s.data.add(130).write(0x55) };
+        s.writing(base as usize + 160, 128);
+        {
+            let before = s.before.lock().unwrap();
+            assert_eq!(before.segments.len(), 3);
+            assert_eq!(before.segments[0].1[2], 0xAA, "original segment preserved");
+            assert_eq!(before.segments[1].0, 192);
+            assert_eq!(before.segments[1].1.len(), 96);
+            assert_eq!(before.segments[2].0, 2 * PAGE + 256);
+        }
+        // Simulate a GPU write in segment 2 as well, then drain all pending ranges.
+        // SAFETY: `s.data` maps `s.len` host bytes.
+        unsafe { s.data.add(2 * PAGE + 260).write(0x77) };
+        let w1 = s.copy_back(base as usize + 128, 64);
+        let w2 = s.copy_back(base as usize + 160, 128);
+        let w3 = s.copy_back(base as usize + 2 * PAGE + 256, 64);
+        assert!(w1 >= 1 && w2 == 0 && w3 >= 1);
+        assert_eq!(memory[130], 0x55);
+        assert_eq!(memory[2 * PAGE + 260], 0x77);
+        assert!(s.before.lock().unwrap().segments.is_empty());
+        unregister(resource, base);
     }
 }
 
