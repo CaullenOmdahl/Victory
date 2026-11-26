@@ -564,7 +564,7 @@ struct Views {
     pages: std::collections::HashMap<(usize, u64), Vec<usize>>,
 }
 
-static VIEWS: Mutex<Option<Views>> = Mutex::new(None);
+static VIEWS: RwLock<Option<Views>> = RwLock::new(None);
 
 /// Whether all the views of a guarded page are guarded together.
 fn view_guard() -> bool {
@@ -619,7 +619,7 @@ impl Views {
 /// Every address the page of the block at `at` is shown at (see
 /// [`Views::shown`]).
 fn aliases(at: usize) -> Vec<usize> {
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     views.as_ref().map_or(Vec::new(), |v| v.shown(at - at % BLOCK).to_vec())
 }
 
@@ -633,7 +633,7 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
     }
     let mut others = Vec::new();
     {
-        let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let mut views = VIEWS.write().unwrap_or_else(|e| e.into_inner());
         let views = views.get_or_insert_with(Views::default);
         views.forget(at, len);
         views.by_addr.insert(at, (len, section, offset));
@@ -655,7 +655,7 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 
 /// The runtime unmapped the views in `[at, at + len)`.
 pub fn title_memory_view_gone(at: usize, len: usize) {
-    if let Some(views) = VIEWS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+    if let Some(views) = VIEWS.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
         views.forget(at, len);
     }
 }
@@ -973,7 +973,7 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
     // with one view (most of them): this runs under the guards' lock, which
     // every copy's check waits for (6 % of the submitting thread's time when
     // it asked block by block, run p1).
-    let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
     let Some(views) = views.as_ref() else { return };
     for block in from..to {
         let shown = views.shown(block * BLOCK);
@@ -1163,7 +1163,7 @@ fn note_beside_write(at: usize, len: usize) {
     let (first, last) = (at / BLOCK, (at + len).div_ceil(BLOCK));
     let mut alias_blocks = Vec::new();
     if view_guard() {
-        let views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
         if let Some(views) = views.as_ref() {
             for block in first..last {
                 let shown = views.shown(block * BLOCK);

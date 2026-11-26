@@ -11,7 +11,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
@@ -687,16 +687,20 @@ fn drop_overlapping_placeholders(
     placeholders.retain(|&(p, n)| p.saturating_add(n) <= base || p >= end);
 }
 
-static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
-    Mutex::new(Physical {
+static PHYSICAL: LazyLock<RwLock<Physical>> = LazyLock::new(|| {
+    RwLock::new(Physical {
         // Page numbers are opaque to titles; 0 stays unused.
         next_page: 0x10_0000,
         ..Default::default()
     })
 });
 
-fn physical() -> MutexGuard<'static, Physical> {
-    PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
+fn physical() -> RwLockWriteGuard<'static, Physical> {
+    PHYSICAL.write().unwrap_or_else(|e| e.into_inner())
+}
+
+fn physical_read() -> RwLockReadGuard<'static, Physical> {
+    PHYSICAL.read().unwrap_or_else(|e| e.into_inner())
 }
 
 fn section_cap_pages() -> Option<usize> {
@@ -959,7 +963,7 @@ impl Drop for View {
 fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
     let end = offset.checked_add(len)?;
     let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
-    let physical = physical();
+    let physical = physical_read();
     let mut runs: Vec<(Slice, usize)> = Vec::new();
     for page in pages {
         let slice = physical.pages.get(page)?;
@@ -979,9 +983,11 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
 /// Writes title memory `[at, at + len)` where one title view of physical
 /// pages shows all of it: `write` gets the address of those bytes in our
 /// persistent view of the section (`Section::persistent_ptr`), which no guard
-/// covers. Releases the mapping lock before committing/copying so parallel
-/// copy-back workers do not serialize on `physical`; `View::persistent` keeps
-/// the `Arc<Section>` alive and guards against concurrent persistent writes.
+/// covers. Takes a non-blocking read lock (`PHYSICAL.try_read`) and releases it
+/// before committing/copying so parallel copy-back workers do not serialize on
+/// `physical` and immediately fall back when `XMemMapPhysicalPages` holds the
+/// write lock; `View::persistent` keeps the `Arc<Section>` alive and guards
+/// against concurrent persistent writes.
 /// False, with `write` not called, where no physical-page view shows `[at, at + len)`.
 pub fn write_beside(at: usize, len: usize, write: &mut dyn FnMut(*mut u8)) -> bool {
     if len == 0 {
@@ -991,7 +997,11 @@ pub fn write_beside(at: usize, len: usize, write: &mut dyn FnMut(*mut u8)) -> bo
         return false;
     };
     let (view_slice, offset) = {
-        let physical = physical();
+        let physical = match PHYSICAL.try_read() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return false,
+        };
         let Some((&base, &(size, ref slice))) = physical.views.range(..=at).next_back() else {
             return false;
         };
@@ -1027,7 +1037,7 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
 }
 
 fn shown_runs(runs: &[(Slice, usize)]) -> Vec<(usize, usize)> {
-    let physical = physical();
+    let physical = physical_read();
     let mut shown = Vec::new();
     for (slice, n) in runs {
         let (from, to) = (slice.index, slice.index + n);
@@ -1078,7 +1088,7 @@ pub fn va_generation_digest(addr: usize, len: usize) -> Option<u64> {
         return None;
     }
     let end = addr.checked_add(len)?;
-    let phys = physical();
+    let phys = physical_read();
     let mut cursor = addr;
     let mut digest = 0x517c_c1b7_2722_0a95u64;
     while cursor < end {
@@ -1170,7 +1180,7 @@ fn page_window_with(
 
 /// Count of `pages` not known to this allocator.
 pub(crate) fn unknown_pages(pages: &[usize]) -> usize {
-    let physical = physical();
+    let physical = physical_read();
     pages.iter().filter(|p| !physical.pages.contains_key(p)).count()
 }
 
@@ -2432,6 +2442,7 @@ mod tests {
 
     #[test]
     fn writes_beside_land_through_guarded_views() {
+        let _gate = write_beside_test_gate().lock().unwrap_or_else(|e| e.into_inner());
         use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
         let pages = allocate(2);
         let reserve = || {
@@ -2526,6 +2537,48 @@ mod tests {
         // SAFETY: `va` is our whole reservation.
         assert_ne!(unsafe { VirtualFree(va, 0, MEM_RELEASE) }, 0);
         assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
+    }
+
+    fn write_beside_test_gate() -> &'static Mutex<()> {
+        static GATE: OnceLock<Mutex<()>> = OnceLock::new();
+        GATE.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn write_beside_falls_back_immediately_when_physical_is_write_locked() {
+        let _gate = write_beside_test_gate().lock().unwrap_or_else(|e| e.into_inner());
+        let pages = allocate(1);
+        let va = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!va.is_null());
+        assert_eq!(XMemMapPhysicalPages(va, 1, pages.as_ptr()), va);
+
+        {
+            let _write_lock = physical();
+            let mut called = false;
+            assert!(!write_beside(va as usize, 4, &mut |_| called = true));
+            assert!(!called);
+        }
+
+        let mut called = false;
+        assert!(write_beside(va as usize, 4, &mut |to| {
+            called = true;
+            // SAFETY: 4 bytes inside the mapped page.
+            unsafe { std::ptr::write_bytes(to, 0xAB, 4) };
+        }));
+        assert!(called);
+        // SAFETY: mapped page, readable.
+        assert_eq!(unsafe { std::slice::from_raw_parts(va as *const u8, 4) }, [0xAB; 4]);
+
+        assert_eq!(XMemMapPhysicalPages(va, 1, std::ptr::null()), va);
+        // SAFETY: `va` is our whole reservation.
+        assert_ne!(unsafe { VirtualFree(va, 0, MEM_RELEASE) }, 0);
+        assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
 }
 
@@ -2624,7 +2677,7 @@ fn log_memory(peak: &mut usize) {
         .take(8)
         .map(|(base, n)| format!("{base:#x} {} MiB", n / MIB))
         .collect();
-    let pages = physical().pages.len() * PAGE;
+    let pages = physical_read().pages.len() * PAGE;
     tracing::info!(
         target: "victory::memory",
         "commit {} MiB (peak {} MiB): private {} MiB (title range {} MiB; by allocation: {}), \
