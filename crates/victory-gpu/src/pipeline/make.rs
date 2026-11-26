@@ -91,6 +91,11 @@ impl Pending {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn key(&self) -> &str {
+        &self.key
+    }
+
     fn make(&self) {
         self.make_with(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
     }

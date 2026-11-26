@@ -1,7 +1,10 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 use crate::Converter;
 
@@ -59,10 +62,22 @@ impl Cache {
         std::fs::create_dir_all(dir)?;
         // Write-then-rename so readers never see partial output.
         let tmp = tempfile_in(dir);
-        let mut file = std::fs::OpenOptions::new()
+        let mut file = match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&tmp)?;
+            .open(&tmp)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Reusing an abandoned staging file (e.g. reused PID after a crash)
+                // is safe once truncated.
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&tmp)?
+            }
+            Err(err) => return Err(err.into()),
+        };
         let written = file.write_all(&output);
         drop(file);
         let published = written.and_then(|()| std::fs::rename(&tmp, &path));
@@ -75,16 +90,19 @@ impl Cache {
 }
 
 fn tempfile_in(dir: &Path) -> PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let n = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     dir.join(format!(".tmp-{}-{n}", std::process::id()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
+
+    fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     struct Upper {
         version: u32,
@@ -106,6 +124,7 @@ mod tests {
 
     #[test]
     fn converts_once_then_hits() {
+        let _guard = one_at_a_time();
         let tmp = tempfile::tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("cache")).unwrap();
         let conv = Upper {
@@ -121,6 +140,7 @@ mod tests {
 
     #[test]
     fn failed_publication_removes_the_staging_file() {
+        let _guard = one_at_a_time();
         let tmp = tempfile::tempdir().unwrap();
         let cache = Cache::open(tmp.path().join("cache")).unwrap();
         let conv = Upper {
@@ -139,7 +159,30 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_staging_file_does_not_fail_a_conversion() {
+        let _guard = one_at_a_time();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = Cache::open(tmp.path().join("cache")).unwrap();
+        let conv = Upper {
+            version: 1,
+            runs: AtomicUsize::new(0),
+        };
+        let path = cache.path_for(&CacheKey::new(&conv, b"abc"));
+        let dir = path.parent().unwrap();
+        std::fs::create_dir_all(dir).unwrap();
+        let next = TEMP_COUNTER.load(Ordering::Relaxed);
+        let stale = dir.join(format!(".tmp-{}-{next}", std::process::id()));
+        std::fs::write(&stale, b"stale leftover bytes").unwrap();
+
+        let published = cache.get_or_convert(&conv, b"abc").unwrap();
+        assert_eq!(published, path);
+        assert_eq!(std::fs::read(&published).unwrap(), b"ABC");
+        assert!(!stale.exists());
+    }
+
+    #[test]
     fn version_bump_invalidates() {
+        let _guard = one_at_a_time();
         let v1 = Upper {
             version: 1,
             runs: AtomicUsize::new(0),
@@ -153,6 +196,7 @@ mod tests {
 
     #[test]
     fn refuses_cache_inside_repo() {
+        let _guard = one_at_a_time();
         let inside = Path::new(env!("CARGO_MANIFEST_DIR")).join("cache");
         assert!(Cache::open(inside).is_err());
     }

@@ -836,6 +836,12 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
+    if shaders.len() == 2
+        && shaders[0].stage == "pixel"
+        && matches!(shaders[1].stage, "vertex" | "mesh")
+    {
+        shaders.swap(0, 1);
+    }
     hand_out(
         shaders,
         #[cfg(windows)]
@@ -1122,6 +1128,61 @@ mod tests {
         let b = shader("pixel", bytes);
         assert!(Arc::ptr_eq(&a, &b));
         assert_eq!(a.hash, blake3::hash(bytes).to_hex()[..16]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn reversed_graphics_stream_stages_produce_same_pipeline_key() {
+        let make_stream = |first_kind: u64, first: &[u8], second_kind: u64, second: &[u8]| {
+            let mut stream = vec![0u8; 0x2b0];
+            let mut put = |at: usize, v: u64| stream[at..at + 8].copy_from_slice(&v.to_le_bytes());
+            for (at, kind) in [
+                (0x10, first_kind),
+                (0x28, second_kind),
+                (0x40, 3),
+                (0x58, 4),
+                (0x70, 5),
+                (0x88, 8),
+                (0x1d8, 9),
+                (0x1e0, 10),
+                (0x210, 21),
+                (0x250, 17),
+                (0x260, 12),
+                (0x278, 14 | 3 << 32),
+                (0x280, 15 | 28 << 32),
+                (0x2a0, 1 << 32),
+                (0x2a8, 16),
+            ] {
+                put(at, kind);
+            }
+            put(0x18, first.as_ptr() as u64);
+            put(0x20, first.len() as u64);
+            put(0x30, second.as_ptr() as u64);
+            put(0x38, second.len() as u64);
+            let desc = StreamDesc {
+                size: stream.len(),
+                stream: stream.as_ptr(),
+            };
+            let mut p = std::ptr::null();
+            assert_eq!(
+                create_stream(std::ptr::null(), &desc, &PIPELINE_IIDS[0], &mut p),
+                S_OK
+            );
+            p
+        };
+
+        let (vs, ms, ps) = (
+            b"reversed-stream-vs",
+            b"reversed-stream-ms",
+            b"reversed-stream-ps",
+        );
+        for (kind, name, producer) in [(1, "vertex", vs.as_slice()), (24, "mesh", ms.as_slice())] {
+            let forward = make_stream(kind, producer, 2, ps);
+            let reversed = make_stream(2, ps, kind, producer);
+            assert_eq!(shaders(forward), [(name, producer.to_vec()), ("pixel", ps.to_vec())]);
+            assert_eq!(shaders(reversed), shaders(forward));
+            assert_eq!(pipeline(reversed).host.key(), pipeline(forward).host.key());
+        }
     }
 }
 
