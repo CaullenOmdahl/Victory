@@ -6684,8 +6684,9 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        // A raw or structured buffer view (an SRV, or a UAV the code also
-        // reads through scalar memory), else a constant buffer view.
+        // A raw or structured buffer view (an SRV, a UAV the code also
+        // reads through scalar memory, or a CBV when `constants_raw()` is
+        // enabled), else a constant buffer view.
         let raw = kind
             .filter(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav))
             .map(|u| {
@@ -6697,16 +6698,10 @@ impl<'a> Lower<'a> {
                 };
                 (u_bit, stride)
             });
-        // A descriptor loaded from the resource heap by index has no
-        // used-resource entry, and what the title keeps in those slots are
-        // buffer views (shader resource views on the host), not constant
-        // buffer views: a raw buffer. Read as a constant buffer, the access
-        // is outside what D3D12 defines (GPU-based validation: "Descriptor
-        // type doesn't match shader register type", SRV in the heap, CBV
-        // register) and hosts differ in what it gives: the meshlet culling
-        // programs read the scene's buffer this way (heap index 17), and on
-        // a Radeon 8060S they culled nearly everything.
-        let raw = raw.or_else(|| (kind.is_none() && self.heap_indexed(src)).then_some((0, 0)));
+        let raw = raw.or_else(|| {
+            (super::shader::constants_raw() || (kind.is_none() && self.heap_indexed(src)))
+                .then_some((0, 0))
+        });
         let props = match raw {
             Some((u_bit, 0)) => (11 | u_bit, 0),
             Some((u_bit, stride)) => (12 | u_bit, stride),
@@ -6830,9 +6825,10 @@ impl<'a> Lower<'a> {
             bits: 0,
             words: [0, 0],
         };
-        let srv = self
-            .used_kind(&src)
-            .is_some_and(|u| u.kind == ResourceType::Srv);
+        let srv = super::shader::constants_raw()
+            || self
+                .used_kind(&src)
+                .is_some_and(|u| u.kind == ResourceType::Srv);
         let props = if srv { (11, 0) } else { (13, 0x1_0000) };
         let h = self.handle(site, &src, false, props)?;
         let c = self.cur;
@@ -7877,6 +7873,11 @@ impl<'a> Lower<'a> {
                     .find(|u| u.user_data == rp.user_data)
                     .map(|u| u.kind);
                 match (rp.root, kind, props.0) {
+                    (RootType::Descriptor, Some(ResourceType::Cbv) | None, 11)
+                        if super::shader::constants_raw() =>
+                    {
+                        Ok(self.s.root_srv_handle(rp.slot))
+                    }
                     (RootType::Descriptor, Some(ResourceType::Cbv) | None, 13) => {
                         Ok(self.s.root_cbv_handle(rp.slot))
                     }
@@ -13030,10 +13031,11 @@ impl<'a> Lower<'a> {
             if store || atomic.is_some() {
                 return Err("a write or atomic operation on a constant buffer");
             }
+            let raw_cbv = super::shader::constants_raw();
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
+            let h = self.handle(site, src, false, if raw_cbv { (11, 0) } else { (13, 0x1_0000) })?;
             let byte = match index {
                 Some(i) => {
                     let sixteen = self.s.m.i32(16);
@@ -13045,15 +13047,22 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
+            let read_dword = |l: &mut Self, at: V| -> V {
+                if raw_cbv {
+                    l.view_dwords(h, Some(0), at, None, 1)[0]
+                } else {
+                    l.cbuffer_dword(h, at)
+                }
+            };
             if let Some((width, signed, half)) = sub_load {
-                let x = self.read_subword(byte, width, signed, |l, at| Ok(l.cbuffer_dword(h, at)))?;
+                let x = self.read_subword(byte, width, signed, |l, at| Ok(read_dword(l, at)))?;
                 self.write_subword_result(inst, reg, x, half, guard)?;
                 return Ok(());
             }
             for k in 0..count {
                 let four = self.s.m.i32(4 * k);
                 let a = self.s.m.bin(c, Bin::Add, byte, four);
-                let x = self.cbuffer_dword(h, a);
+                let x = read_dword(self, a);
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());

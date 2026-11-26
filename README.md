@@ -104,6 +104,9 @@ Speed:
   granularity via `VICTORY_CARD_PIECE_KB=4|16|64`).
 - Stale write-watched 64 KiB pages can copy only the 4 KiB kernel subpages
   reported by `GetWriteWatch` (`VICTORY_DIRTY_4K=1`, off by default).
+- Constant buffer views can be lowered to raw byte-address SRVs (`t<slot>`
+  root SRVs and `R32_TYPELESS` `RAW` heap views, `VICTORY_PORT_CBV=1`, off
+  by default) to bind constant buffers directly without `fill_scratch` copies.
 
 Memory the title shows at several addresses:
 - Every view of a guarded physical page is guarded with it, so a write of

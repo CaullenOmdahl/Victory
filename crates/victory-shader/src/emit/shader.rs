@@ -19,6 +19,25 @@ pub const STRIDE_SPACE: u32 = 2;
 /// (`RWByteAddressBuffer`, 2 MiB covering the 40-bit title address space).
 pub const WRITE_MARKS_SPACE: u32 = 3;
 
+#[cfg(test)]
+thread_local! {
+    /// Per-thread override for [`constants_raw`] in unit tests.
+    pub(crate) static CONSTANTS_RAW_HERE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether shaders read constant buffers as raw byte buffers (`t<slot>` root
+/// SRVs and `R32_TYPELESS` raw descriptor-heap views) instead of CBVs
+/// (`VICTORY_PORT_CBV=1`, off by default). Keyed in [`victory_gpu::shader_cache`].
+pub fn constants_raw() -> bool {
+    #[cfg(test)]
+    if let Some(on) = CONSTANTS_RAW_HERE.get() {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_CBV").is_ok_and(|v| v.trim() == "1"))
+}
+
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;

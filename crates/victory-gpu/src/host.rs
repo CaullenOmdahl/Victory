@@ -3531,6 +3531,12 @@ impl HostList {
         self.scratch_in(len, 256, |_, _, gpu, data| (gpu, data))
     }
 
+    /// `len` bytes of upload memory (256-byte aligned) until the list is
+    /// reset: the backing buffer, its host GPU address, and its CPU pointer.
+    pub(crate) fn scratch_held(&self, len: u64) -> Option<(ID3D12Resource, u64, *mut u8)> {
+        self.scratch_in(len, 256, |buffer, _, gpu, data| (buffer.clone(), gpu, data))
+    }
+
     fn scratch_one_off<R>(
         &self,
         host: &Host,
@@ -5442,6 +5448,7 @@ impl Meter {
                     "textures changed in place"
                 );
                 crate::texture::flips::log();
+                crate::port_cbv::log(frames);
                 crate::copystat::log(frames);
                 let beside_frames = f64::from(self.log_frames.max(1));
                 self.log_frames = 0;

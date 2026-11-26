@@ -60,6 +60,9 @@ fn build() -> &'static [u8; 32] {
             bytes.push(victory_shader::emit::rays().into());
             bytes.push(victory_shader::emit::force_wave64().into());
             bytes.push(victory_shader::emit::write_marks().into());
+            if victory_shader::emit::constants_raw() {
+                bytes.extend_from_slice(b"VICTORY_PORT_CBV=1");
+            }
         };
         // Diagnostics (`VICTORY_SHADER_BUILD_OF=<executable>`): match entries
         // keyed by that binary's hash when bisecting older builds.

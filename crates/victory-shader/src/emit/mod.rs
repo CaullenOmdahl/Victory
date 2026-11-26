@@ -120,7 +120,9 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use container::MESH_OUTPUT_LIMIT;
 pub use rectangle::rectangle_geometry;
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE, WRITE_MARKS_SPACE};
+pub use shader::{
+    ROOT_CBV_SPACE, SAMPLER_SPACE, STRIDE_SPACE, USER_DATA_SPACE, WRITE_MARKS_SPACE, constants_raw,
+};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -4140,5 +4142,111 @@ mod pr306_tests {
             #[cfg(windows)]
             validate_if_available(&out.dxil);
         }
+    }
+
+    #[test]
+    fn constants_raw_reads_cbv_as_raw_buffer_and_root_srv() {
+        // Descriptor:
+        // - root CBV at s[0:1] (slot 0, user_data 0) read via s_load_dword s20, s[0:1], 0x10
+        // - root table at s2 (slot 1, user_data 2): entry 0 UAV (s[4:7]), entry 1 CBV (s[8:11])
+        // Reads root CBV word + table CBV word via s_buffer_load_dword, stores to UAV at 0..8.
+        let words: &[u32] = &[
+            0xF400_0500u32,
+            0xFA00_0010, // s_load_dword s20, s[0:1], 0x10 (root CBV)
+            0xBE83_0380, // s_mov_b32 s3, 0
+            0xF408_0101,
+            0xFA00_0000, // s_load_dwordx4 s[4:7], s[2:3], 0x0 (table UAV)
+            0xF408_0201,
+            0xFA00_0020, // s_load_dwordx4 s[8:11], s[2:3], 0x20 (table CBV)
+            0xBF8C_0070, // s_waitcnt lgkmcnt(0)
+            0xF420_0544,
+            0xFA00_0004, // s_buffer_load_dword s21, s[8:11], 0x4
+            0xBF8C_0070, // s_waitcnt lgkmcnt(0)
+            0x7E00_0214, // v_mov_b32 v0, s20
+            0x7E02_0215, // v_mov_b32 v1, s21
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0xE074_1000,
+            0x8001_0002, // buffer_store_dwordx2 v[0:1], v2, s[4:7], 0 offen
+            0xBF81_0000, // s_endpgm
+        ];
+        let native = super::NativeProgram {
+            stage: super::HwStage::Cs,
+            wave64: false,
+            vgprs: 3,
+            layout: vec![
+                crate::RootParam {
+                    root: crate::RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    sgprs: 2,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::RootParam {
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 2,
+                    slot: 1,
+                },
+            ],
+            used: vec![
+                crate::UsedResource {
+                    kind: crate::ResourceType::Cbv,
+                    root: crate::RootType::Descriptor,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 0,
+                    dwords: 2,
+                    user_data: 0,
+                    slot: 0,
+                },
+                crate::UsedResource {
+                    kind: crate::ResourceType::Uav,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 0,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 2,
+                    slot: 1,
+                },
+                crate::UsedResource {
+                    kind: crate::ResourceType::Cbv,
+                    root: crate::RootType::Table,
+                    table_offset_dwords: 8,
+                    lower_bound: 0,
+                    stride: 4,
+                    dwords: 4,
+                    user_data: 2,
+                    slot: 1,
+                },
+            ],
+            io: crate::native::StageIo::Cs(crate::native::ComputeIo {
+                rsrc2: 3 << 1,
+                threads: [1, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let translate_with = |raw: bool| {
+            struct Reset(Option<bool>);
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    super::shader::CONSTANTS_RAW_HERE.set(self.0);
+                }
+            }
+            let _r = Reset(super::shader::CONSTANTS_RAW_HERE.replace(Some(raw)));
+            emit_synthetic(&[], &native).unwrap()
+        };
+        let off = translate_with(false);
+        let on = translate_with(true);
+        assert_eq!(off.root_cbvs, vec![0]);
+        assert!(off.root_srvs.is_empty());
+        assert!(on.root_cbvs.is_empty(), "root CBV becomes root SRV");
+        assert_eq!(on.root_srvs, vec![0]);
+        assert_ne!(off.dxil, on.dxil);
+        #[cfg(windows)]
+        validate_if_available(&on.dxil);
     }
 }

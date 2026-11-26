@@ -1580,6 +1580,33 @@ impl State {
                 };
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if crate::port_cbv::on() {
+                            if size > 0
+                                && let Some(shadow) = crate::shadow::find(address, u64::from(size))
+                                && host.constant_raw_at(
+                                    index,
+                                    &shadow.buffer,
+                                    shadow.gpu(address),
+                                    size,
+                                )
+                            {
+                                let len = u64::from(size.min(65_536)).min(shadow.left(address));
+                                if len > 0 {
+                                    shadow.refresh(list, address, len);
+                                }
+                                crate::port_cbv::in_copy(size);
+                                continue;
+                            }
+                            crate::port_cbv::copied();
+                            if let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size))
+                                && host.constant_raw_at(index, &buffer, gpu, size)
+                            {
+                                list.defer_fill(to, address as *const u8, size as usize);
+                            } else {
+                                host.make_null_kind(index, ResourceType::Srv, 4);
+                            }
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null_kind(index, ResourceType::Cbv, 4);
                             continue;
