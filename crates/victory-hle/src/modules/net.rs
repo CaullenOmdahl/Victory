@@ -21,7 +21,7 @@
 
 use std::ffi::{CStr, c_char, c_void};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use windows_sys::Win32::Foundation::SetLastError;
 
@@ -296,6 +296,27 @@ struct SocketAddress {
     len: i32,
 }
 
+type ConnectByList = extern "system" fn(
+    Socket,
+    *const u8,
+    *mut u32,
+    *mut c_void,
+    *mut u32,
+    *mut c_void,
+    *const c_void,
+    *mut c_void,
+) -> i32;
+
+/// Wine's ws2_32 does not export `WSAConnectByList`. Without the host API
+/// there is no connection to make through it, so refuse the call instead of
+/// panicking in the title.
+static CONNECT_BY_LIST: LazyLock<Option<ConnectByList>> = LazyLock::new(|| {
+    crate::host::function("ws2_32.dll", "WSAConnectByList").map(|address| {
+        // SAFETY: the host exports this function with this signature.
+        unsafe { std::mem::transmute::<usize, ConnectByList>(address) }
+    })
+});
+
 /// Every candidate must be loopback.
 pub extern "system" fn WSAConnectByList(
     s: Socket,
@@ -320,9 +341,18 @@ pub extern "system" fn WSAConnectByList(
             return 0;
         }
     }
-    host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
-        s, list, local_len, local, remote_len, remote, timeout, reserved,
-    )
+    if let Some(connect) = *CONNECT_BY_LIST {
+        connect(
+            s, list, local_len, local, remote_len, remote, timeout, reserved,
+        )
+    } else {
+        once(
+            "network connect blocked",
+            "WSAConnectByList (host has no such export)".into(),
+        );
+        wsa_error(WSAENETUNREACH);
+        0
+    }
 }
 
 pub extern "system" fn WSAJoinLeaf(
@@ -565,6 +595,27 @@ pub extern "system" fn GetAddrInfoW(
     )
 }
 
+type GetAddrInfoExA = extern "system" fn(
+    *const c_char,
+    *const c_char,
+    u32,
+    *const c_void,
+    *const c_void,
+    *mut *mut c_void,
+    *const c_void,
+    *mut c_void,
+    *const c_void,
+    *mut Handle,
+) -> i32;
+
+/// Wine's ws2_32 exports `GetAddrInfoExW`, but not the ANSI `GetAddrInfoExA`.
+static GET_ADDR_INFO_EX_A: LazyLock<Option<GetAddrInfoExA>> = LazyLock::new(|| {
+    crate::host::function("ws2_32.dll", "GetAddrInfoExA").map(|address| {
+        // SAFETY: the host exports this function with this signature.
+        unsafe { std::mem::transmute::<usize, GetAddrInfoExA>(address) }
+    })
+});
+
 pub extern "system" fn GetAddrInfoExA(
     name: *const c_char,
     service: *const c_char,
@@ -580,9 +631,19 @@ pub extern "system" fn GetAddrInfoExA(
     if !resolvable(narrow(name)) {
         return WSAHOST_NOT_FOUND;
     }
-    host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
-        name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
-    )
+    if let Some(lookup) = *GET_ADDR_INFO_EX_A {
+        lookup(
+            name, service, namespace, provider, hints, result, timeout, overlapped, completion,
+            handle,
+        )
+    } else {
+        once(
+            "network name lookup blocked",
+            "GetAddrInfoExA (host has no such export)".into(),
+        );
+        wsa_error(WSAHOST_NOT_FOUND);
+        WSAHOST_NOT_FOUND
+    }
 }
 
 pub extern "system" fn GetAddrInfoExW(
@@ -1048,22 +1109,26 @@ mod tests {
                 named.name
             );
         }
-        // Every override names a real export of its DLL. Some exports only
-        // exist on newer Windows (WinHttpGetProxySettingsEx is absent from
-        // Windows 10's winhttp.dll); the HLE supplies those itself, so skip
-        // them only when the host really lacks them.
-        const NEWER_WINDOWS_ONLY: &[&str] = &["WinHttpGetProxySettingsEx"];
+        // Every override names a real export of its DLL, except where the
+        // host itself lacks one: `WinHttpGetProxySettingsEx` is newer than
+        // Windows 10; Wine's ws2_32 has no `WSAConnectByList`, and only the
+        // wide `GetAddrInfoExW`.
+        const HOST_MAY_LACK: &[&str] = &[
+            "WinHttpGetProxySettingsEx",
+            "WSAConnectByList",
+            "GetAddrInfoExA",
+        ];
+        let mut missing = Vec::new();
         for e in m.exports.iter().filter(|e| !e.name.starts_with('#')) {
             let dll = if e.name.starts_with("WinHttp") {
                 "winhttp.dll"
             } else {
                 "ws2_32.dll"
             };
-            let present = crate::host::function(dll, e.name).is_some();
-            if !present && NEWER_WINDOWS_ONLY.contains(&e.name) {
-                continue;
+            if crate::host::function(dll, e.name).is_none() && !HOST_MAY_LACK.contains(&e.name) {
+                missing.push(format!("{dll}!{}", e.name));
             }
-            assert!(present, "{dll} lacks {}", e.name);
         }
+        assert!(missing.is_empty(), "host lacks: {missing:?}");
     }
 }

@@ -292,13 +292,17 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
+        let at = XMemVirtualAlloc(
             std::ptr::null_mut(),
             size,
             MEM_RESERVE | MEM_COMMIT,
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
         );
+        if !at.is_null() {
+            victory_gpu::title_memory_remapped(at as usize, size);
+        }
+        return at;
     }
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
@@ -332,13 +336,7 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-            if VirtualQuery(address, &mut info, size_of_val(&info)) == size_of_val(&info)
-                && info.RegionSize != 0
-            {
-                victory_gpu::title_memory_remapped(info.AllocationBase as usize, info.RegionSize);
-            }
-            VirtualFree(address, 0, MEM_RELEASE);
+            victory_gpu::release_title_allocation(address);
             return;
         }
         let user = address.cast::<u8>();

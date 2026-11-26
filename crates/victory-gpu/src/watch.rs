@@ -960,36 +960,70 @@ pub(crate) fn open_for_sync_write(at: usize, len: usize) {
     }
 }
 
-/// The runtime mapped or unmapped title memory `[at, at + len)`: what it
-/// shows is new and read-write, so it is no longer guarded, and any placed
-/// textures backed by that range are evicted.
-pub fn title_memory_remapped(at: usize, len: usize) {
-    if len == 0 {
-        return;
+/// Releases a complete private title allocation and invalidates its tracked
+/// pages. Query every protection region: a guarded allocation is not
+/// necessarily described by a single `VirtualQuery` result (`Marvisak #2824`).
+///
+/// # Safety
+/// `address` must point into a live private allocation owned by the caller,
+/// with the same lifetime requirements as `VirtualFree(MEM_RELEASE)`. Only
+/// its base address is accepted for release; interior addresses are rejected.
+pub unsafe fn release_title_allocation(address: *mut std::ffi::c_void) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_PRIVATE, MEM_RELEASE, MEMORY_BASIC_INFORMATION, VirtualFree, VirtualQuery,
+    };
+    if address.is_null() {
+        return false;
     }
-    let end = at.saturating_add(len);
+    let base = address as usize;
+    let mut end = base;
+    // SAFETY: zero-filled POD output struct filled by `VirtualQuery`.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: valid output buffer for `VirtualQuery`.
+        if unsafe { VirtualQuery(end as *const _, &mut info, size_of_val(&info)) } == 0
+            || info.AllocationBase != address
+            || info.Type != MEM_PRIVATE
+        {
+            break;
+        }
+        let Some(next) = (info.BaseAddress as usize).checked_add(info.RegionSize) else {
+            return false;
+        };
+        if next <= end {
+            return false;
+        }
+        end = next;
+    }
+    if end == base {
+        return false;
+    }
     {
         let mut g = guards_mut();
-        let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
-        let blocks: Vec<usize> = g
-            .protected
-            .range(first..last)
-            .copied()
-            .collect();
-        let holes: Vec<usize> = g
-            .holes
-            .range(first..last)
-            .copied()
-            .collect();
-        let uncovered = g.uncover(first, last);
-        let dropped_pins = g.drop_pins(first, last);
-        let changed = uncovered || !holes.is_empty() || !blocks.is_empty() || dropped_pins;
-        for block in holes {
-            g.holes.remove(&block);
+        // SAFETY: the caller owns the reservation; a release requires size zero.
+        if unsafe { VirtualFree(address, 0, MEM_RELEASE) } == 0 {
+            return false;
         }
-        for block in blocks {
-            g.protected.remove(&block);
-            g.clean.remove(&block);
+        remapped_locked(&mut g, base, end, false);
+    }
+    remapped_notify(base, end);
+    true
+}
+
+fn remapped_locked(g: &mut Guards, at: usize, end: usize, protect_blocks: bool) {
+    let (first, last) = (at / BLOCK, end.div_ceil(BLOCK));
+    let blocks: Vec<usize> = g.protected.range(first..last).copied().collect();
+    let holes: Vec<usize> = g.holes.range(first..last).copied().collect();
+    let uncovered = g.uncover(first, last);
+    let dropped_pins = g.drop_pins(first, last);
+    let changed = uncovered || !holes.is_empty() || !blocks.is_empty() || dropped_pins;
+    for block in holes {
+        g.holes.remove(&block);
+    }
+    for block in blocks {
+        g.protected.remove(&block);
+        g.clean.remove(&block);
+        if protect_blocks {
             // A view mapped a moment ago may already have been made
             // read-only as another view of a guarded page (between the
             // runtime's `title_memory_view` and this call): it is given
@@ -1007,17 +1041,35 @@ pub fn title_memory_remapped(at: usize, len: usize) {
                 )
             };
         }
-        let aliased: Vec<usize> = g.aliased.range(first..last).copied().collect();
-        for block in aliased {
-            g.aliased.remove(&block);
-        }
-        if changed {
-            bump_region_epochs(at, end);
-        }
     }
+    let aliased: Vec<usize> = g.aliased.range(first..last).copied().collect();
+    for block in aliased {
+        g.aliased.remove(&block);
+    }
+    if changed {
+        bump_region_epochs(at, end);
+    }
+}
+
+fn remapped_notify(at: usize, end: usize) {
     crate::shadow::remapped(at as u64, end as u64);
     crate::resource::evict_placed_textures(at as u64, end as u64);
     crate::descriptor::host::bindless_memory_changed(at as u64, end as u64);
+}
+
+/// The runtime mapped or unmapped title memory `[at, at + len)`: what it
+/// shows is new and read-write, so it is no longer guarded, and any placed
+/// textures backed by that range are evicted.
+pub fn title_memory_remapped(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let end = at.saturating_add(len);
+    {
+        let mut g = guards_mut();
+        remapped_locked(&mut g, at, end, true);
+    }
+    remapped_notify(at, end);
 }
 
 /// The title committed memory `[at, at + len)` it had reserved.
@@ -1605,5 +1657,37 @@ mod tests {
             VirtualFree((p + BLOCK) as *mut _, 0, MEM_RELEASE);
             windows_sys::Win32::Foundation::CloseHandle(section);
         }
+    }
+
+    #[test]
+    fn release_title_allocation_rejects_interior_and_frees_split_regions() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_FREE, MEMORY_BASIC_INFORMATION, PAGE_NOACCESS, VirtualProtect, VirtualQuery,
+        };
+        // SAFETY: fresh private 2-block allocation owned exclusively by this test.
+        let p = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                2 * BLOCK,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(p, 0);
+        let mut old = 0;
+        // Split into two distinct protection regions so a single VirtualQuery would stop at block 0.
+        // SAFETY: second block of our allocation.
+        assert_ne!(
+            unsafe { VirtualProtect((p + BLOCK) as *const _, BLOCK, PAGE_NOACCESS, &mut old) },
+            0
+        );
+        // SAFETY: interior pointer inside our live allocation is rejected safely.
+        assert!(!unsafe { release_title_allocation((p + BLOCK) as *mut _) });
+        // SAFETY: base pointer releases all split protection regions of our allocation.
+        assert!(unsafe { release_title_allocation(p as *mut _) });
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: valid output pointer.
+        let queried = unsafe { VirtualQuery((p + BLOCK) as *const _, &mut info, size_of_val(&info)) };
+        assert!(queried != 0 && info.State == MEM_FREE);
     }
 }
