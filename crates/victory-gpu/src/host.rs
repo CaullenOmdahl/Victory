@@ -575,6 +575,23 @@ fn warp_adapter() -> windows::core::Result<IDXGIAdapter> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn chunks_trim_after_idle_window() {
+        let (mut peak, mut window) = (0, 0);
+        assert_eq!(super::trim_chunks(12, 1, &mut peak, &mut window), super::CHUNK_KEEP);
+        for _ in 1..super::CHUNK_IDLE_RESETS - 1 {
+            assert_eq!(super::trim_chunks(8, 1, &mut peak, &mut window), 8);
+        }
+        assert_eq!(super::trim_chunks(8, 1, &mut peak, &mut window), super::CHUNK_SPARE);
+        assert_eq!((peak, window), (0, 0));
+
+        for i in 0..super::CHUNK_IDLE_RESETS - 1 {
+            let used = if i == 5 { 4 } else { 1 };
+            assert_eq!(super::trim_chunks(8, used, &mut peak, &mut window), 8);
+        }
+        assert_eq!(super::trim_chunks(8, 1, &mut peak, &mut window), 4);
+    }
+
+    #[test]
     fn sparse_copies_preserve_islands_and_observe_remaps() {
         use windows_sys::Win32::System::Memory::*;
         const N: usize = 5 << 16;
@@ -1054,6 +1071,23 @@ unsafe impl Send for Scratch {}
 const SCRATCH_CHUNK: u64 = 512 << 10;
 const FIRST_READBACK_CHUNK: u64 = 64 << 10;
 const READBACK_CHUNK: u64 = 4 << 20;
+const CHUNK_KEEP: usize = 8;
+const CHUNK_SPARE: usize = 1;
+const CHUNK_IDLE_RESETS: u32 = 64;
+
+fn trim_chunks(len: usize, used_chunks: usize, peak_used: &mut usize, window: &mut u32) -> usize {
+    let len = len.min(CHUNK_KEEP);
+    *peak_used = (*peak_used).max(used_chunks);
+    *window += 1;
+    if *window >= CHUNK_IDLE_RESETS {
+        let keep = (*peak_used).clamp(CHUNK_SPARE, CHUNK_KEEP);
+        *peak_used = 0;
+        *window = 0;
+        len.min(keep)
+    } else {
+        len
+    }
+}
 
 /// Readback chunks for texture-to-buffer copies, front to back: the chunks,
 /// the one in use and the bytes used in it. A list's read backs share them,
@@ -1063,6 +1097,8 @@ struct Readbacks {
     chunks: Vec<ReadbackChunk>,
     current: usize,
     used: u64,
+    peak_used: usize,
+    window: u32,
 }
 
 // SAFETY: the chunk pointers are persistent mappings of readback buffers.
@@ -2644,7 +2680,13 @@ impl HostList {
             chunks.barrier = false;
             chunks.bound = false;
         }
-        self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+            states.clear();
+            if states.capacity() > 256 {
+                states.shrink_to(64);
+            }
+        }
         {
             let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
             let Gather {
@@ -2670,14 +2712,29 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.queries.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
-        self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        {
+            let mut notes = self.notes.lock().unwrap_or_else(|e| e.into_inner());
+            notes.clear();
+            if notes.capacity() > 256 {
+                notes.shrink_to(64);
+            }
+        }
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             scratch.give_back();
         }
         {
             let mut readbacks = self.readbacks.lock().unwrap_or_else(|e| e.into_inner());
+            let readbacks = &mut *readbacks;
+            let used_chunks = readbacks.current + usize::from(readbacks.used > 0);
             (readbacks.current, readbacks.used) = (0, 0);
+            let keep = trim_chunks(
+                readbacks.chunks.len(),
+                used_chunks,
+                &mut readbacks.peak_used,
+                &mut readbacks.window,
+            );
+            readbacks.chunks.truncate(keep);
         }
         // SAFETY: the list is not executing.
         let reset = unsafe {

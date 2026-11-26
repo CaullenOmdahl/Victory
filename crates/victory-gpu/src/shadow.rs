@@ -2679,9 +2679,28 @@ impl Shadow {
 /// Merges bytes the GPU changed (`host != staging_old` / `old`) into `title`
 /// and updates both `host` and `old` to match `title`, returning the tight
 /// `[first, last)` byte span where `title` was modified (or `None` if nothing
-/// changed). Scans 8 bytes at a time so unchanged 64-bit words skip per-byte
-/// branching.
+/// changed). Uses 32-byte AVX2 comparisons when available, else 8-byte `u64`
+/// scans, so unchanged blocks skip per-byte branching.
 fn merge_gpu_writes_mut(
+    title: &mut [u8],
+    host: &mut [u8],
+    old: &mut [u8],
+) -> Option<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if use_avx2_merge() {
+        // SAFETY: `use_avx2_merge()` verified runtime AVX2 support.
+        return unsafe { merge_gpu_writes_mut_avx2(title, host, old) };
+    }
+    merge_gpu_writes_mut_scalar(title, host, old)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn use_avx2_merge() -> bool {
+    static AVX2: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVX2.get_or_init(|| std::is_x86_feature_detected!("avx2"))
+}
+
+fn merge_gpu_writes_mut_scalar(
     title: &mut [u8],
     host: &mut [u8],
     old: &mut [u8],
@@ -2726,11 +2745,82 @@ fn merge_gpu_writes_mut(
     (first < last).then_some((first, last))
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_gpu_writes_mut_avx2(
+    title: &mut [u8],
+    host: &mut [u8],
+    old: &mut [u8],
+) -> Option<(usize, usize)> {
+    use core::arch::x86_64::{
+        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+        _mm256_storeu_si256,
+    };
+    let n = title.len().min(host.len()).min(old.len());
+    let mut first = usize::MAX;
+    let mut last = 0usize;
+    let mut i = 0;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` bounds every slice and unaligned AVX2 loads/stores are valid here.
+        let unchanged = unsafe {
+            let h = _mm256_loadu_si256(host.as_ptr().add(i).cast::<__m256i>());
+            let o = _mm256_loadu_si256(old.as_ptr().add(i).cast::<__m256i>());
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(h, o)) == -1i32
+        };
+        if unchanged {
+            // SAFETY: `i + 32 <= n` and `title` does not alias `host` or `old`.
+            unsafe {
+                let t = _mm256_loadu_si256(title.as_ptr().add(i).cast::<__m256i>());
+                _mm256_storeu_si256(host.as_mut_ptr().add(i).cast::<__m256i>(), t);
+                _mm256_storeu_si256(old.as_mut_ptr().add(i).cast::<__m256i>(), t);
+            }
+        } else {
+            for k in i..i + 32 {
+                let h = host[k];
+                if h != old[k] && title[k] != h {
+                    title[k] = h;
+                    first = first.min(k);
+                    last = k + 1;
+                }
+                let t = title[k];
+                host[k] = t;
+                old[k] = t;
+            }
+        }
+        i += 32;
+    }
+    for k in i..n {
+        let h = host[k];
+        if h != old[k] && title[k] != h {
+            title[k] = h;
+            first = first.min(k);
+            last = k + 1;
+        }
+        let t = title[k];
+        host[k] = t;
+        old[k] = t;
+    }
+    (first < last).then_some((first, last))
+}
+
 /// Merges GPU-modified bytes (`gpu_new != staging_old`) into `title` and syncs
 /// `staging_old` to the merged bytes. Returns `(dirty_span_for_title, cpu_modified)`
 /// where `cpu_modified` is true if any byte unchanged by the GPU differed in `title`
 /// (a concurrent title CPU write that must be uploaded back to VRAM).
 fn merge_gpu_writes_card(
+    title: &mut [u8],
+    staging_old: &mut [u8],
+    gpu_new: &[u8],
+) -> (Option<(usize, usize)>, bool) {
+    #[cfg(target_arch = "x86_64")]
+    if use_avx2_merge() {
+        // SAFETY: `use_avx2_merge()` verified runtime AVX2 support.
+        return unsafe { merge_gpu_writes_card_avx2(title, staging_old, gpu_new) };
+    }
+    merge_gpu_writes_card_scalar(title, staging_old, gpu_new)
+}
+
+fn merge_gpu_writes_card_scalar(
     title: &mut [u8],
     staging_old: &mut [u8],
     gpu_new: &[u8],
@@ -2767,6 +2857,76 @@ fn merge_gpu_writes_card(
             }
         }
         i += 8;
+    }
+    for k in i..n {
+        let g = gpu_new[k];
+        let o = staging_old[k];
+        if g != o {
+            if title[k] != g {
+                title[k] = g;
+                first = first.min(k);
+                last = k + 1;
+            }
+            staging_old[k] = g;
+        } else if title[k] != o {
+            staging_old[k] = title[k];
+            cpu_modified = true;
+        }
+    }
+    ((first < last).then_some((first, last)), cpu_modified)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn merge_gpu_writes_card_avx2(
+    title: &mut [u8],
+    staging_old: &mut [u8],
+    gpu_new: &[u8],
+) -> (Option<(usize, usize)>, bool) {
+    use core::arch::x86_64::{
+        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8,
+        _mm256_storeu_si256,
+    };
+    let n = title.len().min(staging_old.len()).min(gpu_new.len());
+    let mut first = usize::MAX;
+    let mut last = 0usize;
+    let mut cpu_modified = false;
+    let mut i = 0;
+    while i + 32 <= n {
+        // SAFETY: `i + 32 <= n` bounds every slice and unaligned AVX2 loads are valid here.
+        let (g, o) = unsafe {
+            (
+                _mm256_loadu_si256(gpu_new.as_ptr().add(i).cast::<__m256i>()),
+                _mm256_loadu_si256(staging_old.as_ptr().add(i).cast::<__m256i>()),
+            )
+        };
+        if _mm256_movemask_epi8(_mm256_cmpeq_epi8(g, o)) == -1i32 {
+            // SAFETY: `i + 32 <= n` bounds `title` and `staging_old`.
+            unsafe {
+                let t = _mm256_loadu_si256(title.as_ptr().add(i).cast::<__m256i>());
+                if _mm256_movemask_epi8(_mm256_cmpeq_epi8(t, o)) != -1i32 {
+                    _mm256_storeu_si256(staging_old.as_mut_ptr().add(i).cast::<__m256i>(), t);
+                    cpu_modified = true;
+                }
+            }
+        } else {
+            for k in i..i + 32 {
+                let g = gpu_new[k];
+                let o = staging_old[k];
+                if g != o {
+                    if title[k] != g {
+                        title[k] = g;
+                        first = first.min(k);
+                        last = k + 1;
+                    }
+                    staging_old[k] = g;
+                } else if title[k] != o {
+                    staging_old[k] = title[k];
+                    cpu_modified = true;
+                }
+            }
+        }
+        i += 32;
     }
     for k in i..n {
         let g = gpu_new[k];
@@ -3963,6 +4123,99 @@ mod find_cache_tests {
         unsafe {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: p as *mut _ });
             CloseHandle(section);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_merge_gpu_writes_matches_scalar_for_unaligned_and_short_inputs() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut seed = 0x51a7_992b_c3d4_e811u64;
+        let next = |s: &mut u64| -> u8 {
+            *s ^= *s << 13;
+            *s ^= *s >> 7;
+            *s ^= *s << 17;
+            (*s & 0xFF) as u8
+        };
+        for offset in 0..8usize {
+            for n in [0usize, 1, 7, 8, 31, 32, 33, 63, 64, 65, 127, 259] {
+                for gpu_stride in [0usize, 1, 7, 64] {
+                    for cpu_stride in [0usize, 3, 19] {
+                        let base = (0..n + offset).map(|_| next(&mut seed)).collect::<Vec<u8>>();
+                        let mut title_a = base.clone();
+                        let mut old_a = base.clone();
+                        let mut host_a = base.clone();
+                        let mut gpu_a = base.clone();
+                        if gpu_stride != 0 {
+                            for (idx, b) in host_a[offset..].iter_mut().enumerate() {
+                                if idx % gpu_stride == 0 {
+                                    *b ^= 0x5A;
+                                    gpu_a[offset + idx] ^= 0x5A;
+                                }
+                            }
+                        }
+                        if cpu_stride != 0 {
+                            for (idx, b) in title_a[offset..].iter_mut().enumerate() {
+                                if idx % cpu_stride == 0 {
+                                    *b ^= 0xA5;
+                                }
+                            }
+                        }
+                        let mut title_b = title_a.clone();
+                        let mut old_b = old_a.clone();
+                        let mut host_b = host_a.clone();
+
+                        let span_s = super::merge_gpu_writes_mut_scalar(
+                            &mut title_a[offset..],
+                            &mut host_a[offset..],
+                            &mut old_a[offset..],
+                        );
+                        // SAFETY: runtime AVX2 verified above.
+                        let span_a = unsafe {
+                            super::merge_gpu_writes_mut_avx2(
+                                &mut title_b[offset..],
+                                &mut host_b[offset..],
+                                &mut old_b[offset..],
+                            )
+                        };
+                        assert_eq!(span_a, span_s, "mut span mismatch offset={offset} n={n}");
+                        assert_eq!(title_b, title_a);
+                        assert_eq!(host_b, host_a);
+                        assert_eq!(old_b, old_a);
+
+                        let mut c_title_a = base.clone();
+                        let mut c_old_a = base.clone();
+                        if cpu_stride != 0 {
+                            for (idx, b) in c_title_a[offset..].iter_mut().enumerate() {
+                                if idx % cpu_stride == 0 {
+                                    *b ^= 0x33;
+                                }
+                            }
+                        }
+                        let mut c_title_b = c_title_a.clone();
+                        let mut c_old_b = c_old_a.clone();
+
+                        let res_s = super::merge_gpu_writes_card_scalar(
+                            &mut c_title_a[offset..],
+                            &mut c_old_a[offset..],
+                            &gpu_a[offset..],
+                        );
+                        // SAFETY: runtime AVX2 verified above.
+                        let res_a = unsafe {
+                            super::merge_gpu_writes_card_avx2(
+                                &mut c_title_b[offset..],
+                                &mut c_old_b[offset..],
+                                &gpu_a[offset..],
+                            )
+                        };
+                        assert_eq!(res_a, res_s, "card mismatch offset={offset} n={n}");
+                        assert_eq!(c_title_b, c_title_a);
+                        assert_eq!(c_old_b, c_old_a);
+                    }
+                }
+            }
         }
     }
 }
