@@ -73,6 +73,8 @@ mod texpool;
 #[cfg(windows)]
 mod texture;
 #[cfg(windows)]
+mod texback;
+#[cfg(windows)]
 mod watch;
 #[cfg(windows)]
 mod wc;

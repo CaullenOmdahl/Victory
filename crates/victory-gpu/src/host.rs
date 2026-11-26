@@ -1179,6 +1179,11 @@ struct Deferred {
     prefilled: usize,
     /// Post-submission readbacks from GPU textures into title buffers.
     readbacks: Vec<Readback>,
+    /// Title textures of kinds requested via `VICTORY_TEXTURE_BACK` written
+    /// by this list's shaders, copied to readback buffers when the list closes.
+    back_wanted: Vec<crate::texback::Target>,
+    /// Recorded texture readbacks landed back into title memory after execution.
+    texture_backs: Vec<crate::texback::Back>,
     uploads: Vec<ID3D12Resource>,
     /// Host objects the list's commands name (pipelines, root signatures,
     /// descriptor heaps): the title may release its objects before it
@@ -1223,6 +1228,8 @@ impl Deferred {
     fn clear(&mut self) {
         self.copies.clear();
         self.readbacks.clear();
+        self.back_wanted.clear();
+        self.texture_backs.clear();
         self.uploads.clear();
         self.kept.clear();
         self.bound.clear();
@@ -2141,6 +2148,10 @@ impl Host {
                 };
                 COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
             }
+            for back in &list.deferred().texture_backs {
+                let written = crate::texback::land(back);
+                COPY_BACK[1].fetch_add(written as u64, Ordering::Relaxed);
+            }
         }
         COPY_BACK[0].fetch_add(copying.elapsed().as_micros() as u64, Ordering::Relaxed);
         // Host timestamps the lists resolved, on the title's GPU clock.
@@ -2497,7 +2508,61 @@ impl HostList {
         }
     }
 
+    /// Records that a draw or dispatch writes title texture `resource` via UAV;
+    /// if its dimensions and format match `VICTORY_TEXTURE_BACK`, queues a
+    /// readback copy at list close.
+    pub(crate) fn texture_written(&self, resource: crate::object::This) {
+        if !crate::texback::wanted(resource) {
+            return;
+        }
+        let mut deferred = self.deferred();
+        if !deferred
+            .back_wanted
+            .iter()
+            .any(|target| target.owner() == resource as usize)
+            && let Some(target) = crate::texback::Target::new(resource)
+        {
+            deferred.back_wanted.push(target);
+        }
+    }
+
+    fn settle_copy(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
+        let wanted = legal_state(&copy.texture, wanted);
+        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
+            std::collections::hash_map::Entry::Vacant(v) => {
+                v.insert((wanted, wanted, copy.clone()));
+            }
+            std::collections::hash_map::Entry::Occupied(mut o) => {
+                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                drop(states);
+                if before != wanted {
+                    // SAFETY: an open list and a live host texture whose state changed.
+                    unsafe {
+                        self.list.ResourceBarrier(&[transition(
+                            &copy.texture,
+                            D3D12_RESOURCE_STATES(before as i32),
+                            D3D12_RESOURCE_STATES(wanted as i32),
+                        )]);
+                    }
+                }
+            }
+        }
+    }
+
+    fn textures_back(&self) {
+        const COPY_SOURCE: u32 = 0x800;
+        let wanted = std::mem::take(&mut self.deferred().back_wanted);
+        for target in wanted {
+            self.settle_copy(&target.copy, COPY_SOURCE);
+            if let Some(back) = crate::texback::record(&self.list, target) {
+                self.deferred().texture_backs.push(back);
+            }
+        }
+    }
+
     pub(crate) fn close(&self) {
+        self.textures_back();
         // Gathered indirect scratch buffers leave INDIRECT_ARGUMENT back to
         // COMMON at list end so the next recording starts from COMMON.
         let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());

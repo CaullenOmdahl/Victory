@@ -1337,6 +1337,7 @@ fn remapped_locked(g: &mut Guards, at: usize, end: usize, protect_blocks: bool) 
 }
 
 fn remapped_notify(at: usize, end: usize) {
+    crate::texback::remapped(at, end.saturating_sub(at));
     crate::shadow::remapped(at as u64, end as u64);
     crate::resource::evict_placed_textures(at as u64, end as u64);
     crate::descriptor::host::bindless_memory_changed(at as u64, end as u64);

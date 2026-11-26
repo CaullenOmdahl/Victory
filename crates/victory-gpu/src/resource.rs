@@ -1120,6 +1120,38 @@ pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
     resource(this).host.clone()
 }
 
+/// Width, height, and DXGI format of texture `this` (`None` for a buffer or MSAA).
+#[cfg(windows)]
+pub(crate) fn texture_kind(this: This) -> Option<(u64, u32, u32)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    const TEXTURE_2D: u32 = 3;
+    (r.desc.dimension == TEXTURE_2D && r.desc.sample_count <= 1)
+        .then_some((r.desc.width, r.desc.height, r.desc.format))
+}
+
+/// Texture `this`'s single-plane console layout, title memory address, and byte
+/// size for `crate::texback`; `None` for buffers or multi-plane textures.
+#[cfg(windows)]
+pub(crate) fn title_texture(
+    this: This,
+) -> Option<(victory_formats::texture::Layout, usize, usize)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let t = texture_layout(&r.desc)?;
+    let [plane] = &t.planes[..] else {
+        return None;
+    };
+    Some((plane.layout.clone(), r.data() as usize, t.size as usize))
+}
+
 #[cfg(windows)]
 thread_local! {
     /// The texture being made is one the title placed in memory it streams.
@@ -1446,10 +1478,13 @@ fn hand_out_resource(
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
         crate::shadow::register(at, resource.data() as u64, desc.width);
-    } else if desc.flags & 5 != 0 && resource.host.is_some() {
-        let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-        targets.entry(resource.data() as u64).or_default().push(at);
+    } else {
+        crate::texback::replaced(resource.data() as usize);
+        if desc.flags & 5 != 0 && resource.host.is_some() {
+            let at = std::ptr::from_ref::<Resource>(&resource) as usize;
+            let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+            targets.entry(resource.data() as u64).or_default().push(at);
+        }
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -1457,14 +1492,17 @@ fn hand_out_resource(
 #[cfg(windows)]
 impl Drop for Resource {
     fn drop(&mut self) {
-        if self.desc.flags & 5 != 0 && self.host.is_some() {
+        if self.desc.dimension != BUFFER {
             let at = std::ptr::from_ref::<Resource>(self) as usize;
-            let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-            let start = self.data() as u64;
-            if let Some(list) = targets.get_mut(&start) {
-                list.retain(|&r| r != at);
-                if list.is_empty() {
-                    targets.remove(&start);
+            crate::texback::released(at);
+            if self.desc.flags & 5 != 0 && self.host.is_some() {
+                let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
+                let start = self.data() as u64;
+                if let Some(list) = targets.get_mut(&start) {
+                    list.retain(|&r| r != at);
+                    if list.is_empty() {
+                        targets.remove(&start);
+                    }
                 }
             }
         }
