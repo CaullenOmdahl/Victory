@@ -93,6 +93,10 @@ pub(crate) struct State {
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
     depth: usize,
+    /// The formats of the views [`State::bind_targets`] bound on the host
+    /// list: a draw's pipeline is one for them
+    /// (`crate::pipeline::host_pipeline_for`).
+    target_formats: crate::pipeline::host::TargetFormats,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
     /// The title's primitive topology (the host's may differ).
@@ -564,6 +568,7 @@ impl State {
             return;
         };
         self.targets.clear();
+        let mut formats = [0u32; 9];
         let mut rtv_sources = Vec::with_capacity(targets.len());
         let mut keys = Vec::with_capacity(targets.len());
         for record in &targets {
@@ -584,6 +589,22 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
+        let rtv_descs: Vec<_> = rtv_sources
+            .iter()
+            .enumerate()
+            .map(|(i, (texture, record))| {
+                let desc = record.desc();
+                if i < 8 {
+                    formats[i] = bound_format(texture, desc.as_ref().map(|d| d.Format));
+                }
+                (texture, desc)
+            })
+            .collect();
+        let dsv_desc = dsv_source.map(|(texture, record)| {
+            let desc = record.depth_desc();
+            formats[8] = bound_format(texture, desc.as_ref().map(|d| d.Format));
+            (texture, desc)
+        });
         let now = (
             keys,
             dsv_source.map(|(texture, record)| {
@@ -591,6 +612,7 @@ impl State {
             }),
         );
         self.fixed.views = Some((targets, depth));
+        self.target_formats = formats;
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
             && self.host_targets.as_ref() == Some(&now)
@@ -598,11 +620,11 @@ impl State {
             return;
         }
         self.host_targets = Some(now);
-        let rtvs: Vec<_> = rtv_sources
+        let rtvs: Vec<_> = rtv_descs
             .iter()
-            .map(|(texture, record)| host.rtv(texture, record.desc().as_ref()))
+            .map(|(texture, desc)| host.rtv(texture, desc.as_ref()))
             .collect();
-        let dsv = dsv_source.map(|(texture, record)| host.dsv(texture, record.depth_desc().as_ref()));
+        let dsv = dsv_desc.map(|(texture, desc)| host.dsv(texture, desc.as_ref()));
         // SAFETY: an open list; the views were just made.
         unsafe {
             list.list.OMSetRenderTargets(
@@ -776,7 +798,8 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return no("skipped by name");
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats)
+        else {
             return no("no host pipeline");
         };
         if p.compute || p.mesh != mesh {
@@ -2372,6 +2395,20 @@ fn bind_null_root(
     if let Some(gpu) = null_root_view() {
         // SAFETY: an open list; the null buffer lives for the entire process.
         unsafe { set_root_view(l, compute, srv, param, gpu, false) };
+    }
+}
+
+/// The format of a host view of `texture` whose description names
+/// `described` (none without a description): that one, or the texture's
+/// own, which is what the host gives a view without a format.
+fn bound_format(
+    texture: &ID3D12Resource,
+    described: Option<windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT>,
+) -> u32 {
+    match described {
+        Some(format) if format.0 != 0 => format.0 as u32,
+        // SAFETY: a live texture.
+        _ => unsafe { texture.GetDesc() }.Format.0 as u32,
     }
 }
 
