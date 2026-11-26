@@ -85,9 +85,7 @@ fn idle_without_rays(container: &[u8]) -> bool {
 }
 
 /// Whether a container's program is one of those that animate and draw hair
-/// strands, by its name. `VICTORY_HAIR` has them run.
-/// shortcut: left out, as some of them do not translate (an address from a
-/// phi) and the others draw lines all over the screen without them.
+/// strands, by its name. Enabled by default; `VICTORY_HAIR=0` skips them.
 #[cfg(windows)]
 fn hair_strands(container: &[u8]) -> bool {
     static RUN: OnceLock<bool> = OnceLock::new();
@@ -111,7 +109,7 @@ fn hair_strands(container: &[u8]) -> bool {
         b"CS_CullMaskPass",
         b"CS_LodBlend",
     ];
-    if *RUN.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_some()) {
+    if *RUN.get_or_init(|| std::env::var_os("VICTORY_HAIR").is_none_or(|v| v != "0")) {
         return false;
     }
     const END: &[u8] = b"_Wrapped";

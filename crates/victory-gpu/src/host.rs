@@ -424,7 +424,7 @@ impl Host {
                 && options.DepthBoundsTestSupported.as_bool();
             let mut options16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
             let gpu_upload = !cfg!(test)
-                && std::env::var_os("VICTORY_GPU_UPLOAD").is_some_and(|v| v == "1")
+                && std::env::var_os("VICTORY_GPU_UPLOAD").is_none_or(|v| v != "0")
                 && device
                     .CheckFeatureSupport(
                         D3D12_FEATURE_D3D12_OPTIONS16,

@@ -142,8 +142,50 @@ static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
 });
 
 /// Serializes `GetWriteWatch(WRITE_WATCH_FLAG_RESET)` with recording its
-/// cleared pages into `JOURNAL` so concurrent askers cannot miss a reset.
-static WRITE_WATCH_LOCK: Mutex<()> = Mutex::new(());
+/// cleared pages into `JOURNAL` so concurrent askers cannot miss a reset,
+/// sharded by 64 MiB address stripe so disjoint private allocations run in parallel.
+const WW_STRIPE_SHIFT: usize = 26;
+const WW_SHARDS: usize = 64;
+static WRITE_WATCH_LOCKS: [Mutex<()>; WW_SHARDS] = [const { Mutex::new(()) }; WW_SHARDS];
+
+#[allow(dead_code)]
+enum WwGuard {
+    One(std::sync::MutexGuard<'static, ()>),
+    Many(Vec<std::sync::MutexGuard<'static, ()>>),
+}
+
+fn ww_shard_indices(start: usize, end: usize) -> Vec<usize> {
+    if start >= end {
+        return vec![(start >> WW_STRIPE_SHIFT) & (WW_SHARDS - 1)];
+    }
+    let first = start >> WW_STRIPE_SHIFT;
+    let last = (end - 1) >> WW_STRIPE_SHIFT;
+    if last - first + 1 >= WW_SHARDS {
+        return (0..WW_SHARDS).collect();
+    }
+    let mut shards: Vec<usize> = (first..=last).map(|s| s & (WW_SHARDS - 1)).collect();
+    shards.sort_unstable();
+    shards.dedup();
+    shards
+}
+
+fn lock_write_watch(start: usize, end: usize) -> WwGuard {
+    if start >= end {
+        let shard = (start >> WW_STRIPE_SHIFT) & (WW_SHARDS - 1);
+        return WwGuard::One(WRITE_WATCH_LOCKS[shard].lock().unwrap_or_else(|e| e.into_inner()));
+    }
+    let first = start >> WW_STRIPE_SHIFT;
+    let last = (end - 1) >> WW_STRIPE_SHIFT;
+    if first == last {
+        let shard = first & (WW_SHARDS - 1);
+        return WwGuard::One(WRITE_WATCH_LOCKS[shard].lock().unwrap_or_else(|e| e.into_inner()));
+    }
+    let guards = ww_shard_indices(start, end)
+        .into_iter()
+        .map(|shard| WRITE_WATCH_LOCKS[shard].lock().unwrap_or_else(|e| e.into_inner()))
+        .collect();
+    WwGuard::Many(guards)
+}
 
 /// The pages of `[start, end)` (whole pages) as last written, for pages
 /// written since tracking began: `(page number, asking)` in page order, and
@@ -188,7 +230,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     thread_local! {
         static FOUND: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
     }
-    let ww = WRITE_WATCH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let ww = lock_write_watch(first * PAGE, last * PAGE);
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let (failed, pages): (bool, Vec<usize>) = FOUND.with(|cell| {
@@ -1809,5 +1851,25 @@ mod tests {
             remapped_locked(&mut g, hole_addr, hole_addr + BLOCK, false);
         }
         assert!(!has_known_hole(hole_addr, hole_addr + BLOCK));
+    }
+
+    #[test]
+    fn write_watch_lock_shards_single_cross_and_wrap_around_cleanly() {
+        let stripe = 1usize << WW_STRIPE_SHIFT;
+        // Single stripe locks one shard.
+        assert_eq!(ww_shard_indices(stripe, stripe + 0x10000), vec![1]);
+        // Exact upper boundary still stays on the starting stripe.
+        assert_eq!(ww_shard_indices(stripe, 2 * stripe), vec![1]);
+        // Cross-stripe spans both ascending shards and locks cleanly.
+        assert_eq!(ww_shard_indices(2 * stripe - 0x1000, 2 * stripe + 0x1000), vec![1, 2]);
+        let _cross = lock_write_watch(2 * stripe - 0x1000, 2 * stripe + 0x1000);
+        drop(_cross);
+        // Wrap-around across WW_SHARDS sorts and dedups shards in ascending order.
+        let wrap = (WW_SHARDS - 1) * stripe;
+        assert_eq!(ww_shard_indices(wrap, wrap + 3 * stripe), vec![0, 1, WW_SHARDS - 1]);
+        let _wrapped = lock_write_watch(wrap, wrap + 3 * stripe);
+        drop(_wrapped);
+        // Huge range >= WW_SHARDS * stripe locks every shard once in ascending order.
+        assert_eq!(ww_shard_indices(0, (WW_SHARDS + 4) * stripe), (0..WW_SHARDS).collect::<Vec<_>>());
     }
 }
