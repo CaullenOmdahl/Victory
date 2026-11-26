@@ -130,23 +130,93 @@ pub(crate) const PAGE: usize = 64 << 10;
 /// The kernel's page, the unit of its answers.
 const KERNEL_PAGE: usize = 4096;
 
-struct Journal {
-    /// Page number → the asking that last found it written.
-    written: BTreeMap<usize, u64>,
-}
-
 static ASKED: AtomicU64 = AtomicU64::new(0);
 
-static JOURNAL: RwLock<Journal> = RwLock::new(Journal {
-    written: BTreeMap::new(),
-});
-
 /// Serializes `GetWriteWatch(WRITE_WATCH_FLAG_RESET)` with recording its
-/// cleared pages into `JOURNAL` so concurrent askers cannot miss a reset,
+/// cleared pages into [`JOURNALS`] so concurrent askers cannot miss a reset,
 /// sharded by 64 MiB address stripe so disjoint private allocations run in parallel.
 const WW_STRIPE_SHIFT: usize = 26;
 const WW_SHARDS: usize = 64;
+const JOURNAL_PAGE_STRIPE_SHIFT: usize = WW_STRIPE_SHIFT - 16; // 1024 * 64 KiB = 64 MiB
+const JOURNAL_SHARDS: usize = WW_SHARDS;
 static WRITE_WATCH_LOCKS: [Mutex<()>; WW_SHARDS] = [const { Mutex::new(()) }; WW_SHARDS];
+static JOURNALS: [RwLock<BTreeMap<usize, u64>>; JOURNAL_SHARDS] =
+    [const { RwLock::new(BTreeMap::new()) }; JOURNAL_SHARDS];
+
+#[inline]
+fn journal_shard(page: usize) -> usize {
+    (page >> JOURNAL_PAGE_STRIPE_SHIFT) & (JOURNAL_SHARDS - 1)
+}
+
+fn journal_read_range(first: usize, last: usize) -> Vec<(usize, u64)> {
+    if first >= last {
+        return Vec::new();
+    }
+    let s0 = first >> JOURNAL_PAGE_STRIPE_SHIFT;
+    let s1 = (last - 1) >> JOURNAL_PAGE_STRIPE_SHIFT;
+    if s0 == s1 {
+        let j = JOURNALS[journal_shard(first)]
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        return j.range(first..last).map(|(&p, &w)| (p, w)).collect();
+    }
+    let mut out = Vec::new();
+    for stripe in s0..=s1 {
+        let lo = first.max(stripe << JOURNAL_PAGE_STRIPE_SHIFT);
+        let hi = last.min((stripe + 1) << JOURNAL_PAGE_STRIPE_SHIFT);
+        let j = JOURNALS[stripe & (JOURNAL_SHARDS - 1)]
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        out.extend(j.range(lo..hi).map(|(&p, &w)| (p, w)));
+    }
+    out
+}
+
+fn journal_record_and_read(pages: &[usize], now: u64, first: usize, last: usize) -> Vec<(usize, u64)> {
+    if first < last {
+        let s0 = first >> JOURNAL_PAGE_STRIPE_SHIFT;
+        let s1 = (last - 1) >> JOURNAL_PAGE_STRIPE_SHIFT;
+        if s0 == s1 && pages.iter().all(|&p| (p >> JOURNAL_PAGE_STRIPE_SHIFT) == s0) {
+            let mut j = JOURNALS[s0 & (JOURNAL_SHARDS - 1)]
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for &page in pages {
+                j.insert(page, now);
+            }
+            return j.range(first..last).map(|(&p, &w)| (p, w)).collect();
+        }
+    }
+    let mut i = 0;
+    while i < pages.len() {
+        let stripe = pages[i] >> JOURNAL_PAGE_STRIPE_SHIFT;
+        let mut j = JOURNALS[stripe & (JOURNAL_SHARDS - 1)]
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        while i < pages.len() && (pages[i] >> JOURNAL_PAGE_STRIPE_SHIFT) == stripe {
+            j.insert(pages[i], now);
+            i += 1;
+        }
+    }
+    journal_read_range(first, last)
+}
+
+fn journal_record_range(first: usize, last: usize, now: u64) {
+    if first >= last {
+        return;
+    }
+    let s0 = first >> JOURNAL_PAGE_STRIPE_SHIFT;
+    let s1 = (last - 1) >> JOURNAL_PAGE_STRIPE_SHIFT;
+    for stripe in s0..=s1 {
+        let lo = first.max(stripe << JOURNAL_PAGE_STRIPE_SHIFT);
+        let hi = last.min((stripe + 1) << JOURNAL_PAGE_STRIPE_SHIFT);
+        let mut j = JOURNALS[stripe & (JOURNAL_SHARDS - 1)]
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        for page in lo..hi {
+            j.insert(page, now);
+        }
+    }
+}
 
 #[allow(dead_code)]
 enum WwGuard {
@@ -254,7 +324,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         if failed {
             (true, Vec::new())
         } else {
-            (false, found[..count].iter().map(|&at| at / PAGE).collect())
+            let mut dedup = Vec::with_capacity(count.min(last - first));
+            let mut prev = None;
+            for &at in &found[..count] {
+                let page = at / PAGE;
+                if prev != Some(page) {
+                    dedup.push(page);
+                    prev = Some(page);
+                }
+            }
+            (false, dedup)
         }
     });
     if failed {
@@ -273,25 +352,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let now = ASKED.fetch_add(1, Ordering::AcqRel) + 1;
     if pages.is_empty() {
         drop(ww);
-        let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
-        return Some((
-            now,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        return Some((now, journal_read_range(first, last)));
     }
-    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
-    for page in pages {
-        j.written.insert(page, now);
-    }
-    let out = j
-        .written
-        .range(first..last)
-        .map(|(&p, &w)| (p, w))
-        .collect();
-    drop(j);
+    let out = journal_record_and_read(&pages, now, first, last);
     drop(ww);
     Some((now, out))
 }
@@ -312,26 +375,9 @@ pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usiz
     }
     let now = ASKED.fetch_add(1, Ordering::AcqRel) + 1;
     if guarded.is_empty() {
-        let j = JOURNAL.read().unwrap_or_else(|e| e.into_inner());
-        return Some((
-            now,
-            j.written
-                .range(first..last)
-                .map(|(&p, &w)| (p, w))
-                .collect(),
-        ));
+        return Some((now, journal_read_range(first, last)));
     }
-    let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
-    for page in guarded {
-        j.written.insert(page, now);
-    }
-    Some((
-        now,
-        j.written
-            .range(first..last)
-            .map(|(&p, &w)| (p, w))
-            .collect(),
-    ))
+    Some((now, journal_record_and_read(&guarded, now, first, last)))
 }
 
 /// Guarded blocks of view memory.
@@ -1331,10 +1377,7 @@ pub fn title_memory_written(at: usize, len: usize) {
         // zeros: walls, floors and bodies missing, others each launch).
         {
             let now = ASKED.fetch_add(1, Ordering::AcqRel) + 1;
-            let mut j = JOURNAL.write().unwrap_or_else(|e| e.into_inner());
-            for page in at / PAGE..(at + len).div_ceil(PAGE) {
-                j.written.insert(page, now);
-            }
+            journal_record_range(at / PAGE, (at + len).div_ceil(PAGE), now);
         }
         crate::resource::textures_rewritten(at as u64, (at + len) as u64);
     }
@@ -2064,5 +2107,54 @@ mod tests {
             UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: w as *mut _ });
             CloseHandle(section);
         }
+    }
+
+    #[test]
+    fn journal_shards_single_cross_stripe_and_wrap_around_in_page_order() {
+        let stride = 1usize << JOURNAL_PAGE_STRIPE_SHIFT;
+        let base_stripe = 0x10_000usize; // disjoint test page band
+        let p0 = base_stripe * stride + 5;
+        let boundary_lo = (base_stripe + 1) * stride - 1;
+        let boundary_hi = (base_stripe + 1) * stride + 2;
+        let wrap = (base_stripe + JOURNAL_SHARDS) * stride + 5;
+
+        assert_eq!(journal_shard(p0), journal_shard(wrap));
+        assert_ne!(journal_shard(boundary_lo), journal_shard(boundary_hi));
+
+        // Single-stripe insert & read.
+        let got_single = journal_record_and_read(&[p0, p0 + 3], 101, p0, p0 + 4);
+        assert_eq!(got_single, vec![(p0, 101), (p0 + 3, 101)]);
+
+        // Cross-stripe boundary + non-leaking wrap-around stripe.
+        journal_record_range(boundary_lo, boundary_hi + 1, 202);
+        let _ = journal_record_and_read(&[wrap], 303, wrap, wrap + 1);
+        assert_eq!(
+            journal_read_range(boundary_lo, boundary_hi + 1),
+            vec![
+                (boundary_lo, 202),
+                (boundary_lo + 1, 202),
+                (boundary_lo + 2, 202),
+                (boundary_hi, 202),
+            ]
+        );
+        // Single-stripe query at p0 must NOT leak wrap even though they share a shard.
+        assert_eq!(journal_read_range(p0, p0 + 4), vec![(p0, 101), (p0 + 3, 101)]);
+        // Clean up test entries so other tests stay isolated.
+        for (stripe, pages) in [
+            (base_stripe, vec![p0, p0 + 3]),
+            (base_stripe + 1, vec![boundary_lo + 1, boundary_lo + 2, boundary_hi]),
+            (base_stripe + JOURNAL_SHARDS, vec![wrap]),
+        ] {
+            let mut j = JOURNALS[stripe & (JOURNAL_SHARDS - 1)]
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for p in pages {
+                j.remove(&p);
+            }
+        }
+        JOURNALS[base_stripe & (JOURNAL_SHARDS - 1)]
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&boundary_lo);
     }
 }
