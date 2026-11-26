@@ -59,6 +59,11 @@ pub(crate) struct HostHeap {
     /// slot viewing a pooled texture, so the backing heap cannot be freed while
     /// a shader-visible descriptor slot still points into it.
     kept_textures: Mutex<HashMap<u32, Arc<crate::resource::HostTexture>>>,
+    /// Staging heap (non-shader-visible) holding title slots planned ahead of
+    /// an active submission; flushed into the live heap once it finishes.
+    staging: std::sync::OnceLock<Option<(ID3D12DescriptorHeap, usize)>>,
+    staged: Vec<AtomicU64>,
+    staged_any: std::sync::atomic::AtomicBool,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     /// Where the next search starts, the slots taken, and the smallest run
@@ -1078,6 +1083,12 @@ fn plan_note(part: usize, started: std::time::Instant, walked: usize, found: usi
     }
 }
 
+thread_local! {
+    /// Whether this thread plans ahead: its writes of title slots go to
+    /// the non-shader-visible staging heap ([`HostHeap::cpu`]).
+    static STAGING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1210,6 +1221,11 @@ impl HostHeap {
                 .map(|_| Mutex::new(vec![None; KEPT_PIECE as usize]))
                 .collect(),
             kept_textures: Mutex::default(),
+            staging: std::sync::OnceLock::new(),
+            staged: (0..(count as usize).div_ceil(64))
+                .map(|_| AtomicU64::new(0))
+                .collect(),
+            staged_any: std::sync::atomic::AtomicBool::new(false),
             next: Mutex::new((0, vec![false; extra as usize], usize::MAX)),
             strides,
             bindless: Mutex::new(Bindless {
@@ -1607,9 +1623,113 @@ impl HostHeap {
     }
 
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
+        if index < self.count && !self.sampler {
+            let (word, bit) = (index as usize / 64, 1u64 << (index % 64));
+            if STAGING.get() {
+                if let Some(at) = self.staging_cpu() {
+                    self.staged[word].fetch_or(bit, Ordering::AcqRel);
+                    self.staged_any.store(true, Ordering::Release);
+                    return D3D12_CPU_DESCRIPTOR_HANDLE {
+                        ptr: at + index as usize * self.step as usize,
+                    };
+                }
+            } else if self.staged_any.load(Ordering::Acquire) {
+                self.staged[word].fetch_and(!bit, Ordering::AcqRel);
+            }
+        }
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
         }
+    }
+
+    fn staging_cpu(&self) -> Option<usize> {
+        self.staging
+            .get_or_init(|| {
+                let host = host()?;
+                // SAFETY: plain non-shader-visible descriptor heap creation.
+                unsafe {
+                    let heap: ID3D12DescriptorHeap = host
+                        .device
+                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                            NumDescriptors: self.count,
+                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+                            NodeMask: 0,
+                        })
+                        .inspect_err(|error| {
+                            tracing::warn!(%error, count = self.count, "no staging descriptor heap");
+                        })
+                        .ok()?;
+                    let at = heap.GetCPUDescriptorHandleForHeapStart().ptr;
+                    Some((heap, at))
+                }
+            })
+            .as_ref()
+            .map(|(_, at)| *at)
+    }
+
+    /// Makes the heap's plan while a submission that indexes the heap still
+    /// runs: every slot goes to the non-shader-visible staging heap.
+    pub(crate) fn plan_ahead(&self) -> Option<Arc<BindlessPlan>> {
+        struct Staging;
+        impl Drop for Staging {
+            fn drop(&mut self) {
+                STAGING.set(false);
+            }
+        }
+        STAGING.set(true);
+        let _staging = Staging;
+        self.bindless_plan()
+    }
+
+    /// Copies staged slots into the shader-visible heap in contiguous runs
+    /// once the active submission has finished.
+    pub(crate) fn flush_staged(&self) -> usize {
+        if !self.staged_any.swap(false, Ordering::AcqRel) {
+            return 0;
+        }
+        let (Some(host), Some(staging)) = (host(), self.staging_cpu()) else {
+            return 0;
+        };
+        let _made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let step = self.step as usize;
+        let mut copied = 0;
+        let mut run: Option<(u32, u32)> = None;
+        let copy = |first: u32, n: u32| {
+            // SAFETY: both ranges lie inside their heaps; `staging` is non-shader-visible.
+            unsafe {
+                host.device.CopyDescriptorsSimple(
+                    n,
+                    D3D12_CPU_DESCRIPTOR_HANDLE {
+                        ptr: self.cpu + first as usize * step,
+                    },
+                    D3D12_CPU_DESCRIPTOR_HANDLE {
+                        ptr: staging + first as usize * step,
+                    },
+                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                );
+            }
+        };
+        for (word, bits) in self.staged.iter().enumerate() {
+            let mut bits = bits.swap(0, Ordering::AcqRel);
+            while bits != 0 {
+                let index = (word * 64) as u32 + bits.trailing_zeros();
+                bits &= bits - 1;
+                copied += 1;
+                run = match run {
+                    Some((first, n)) if first + n == index => Some((first, n + 1)),
+                    Some((first, n)) => {
+                        copy(first, n);
+                        Some((index, 1))
+                    }
+                    None => Some((index, 1)),
+                };
+            }
+        }
+        if let Some((first, n)) = run {
+            copy(first, n);
+        }
+        copied
     }
 
     /// Makes host slot `index` from the record the title has at `handle`

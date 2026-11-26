@@ -79,6 +79,93 @@ fn finish() {
     crate::host::wait_in_flight_if_ready();
 }
 
+/// Whether a title fence signalled behind an unwaited host submission is
+/// signalled when finished (`VICTORY_LATE_SIGNALS=1`, off by default).
+fn late() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    cfg!(windows)
+        && !cfg!(test)
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_SIGNALS").is_some_and(|v| v == "1"))
+}
+
+static LATE: Mutex<VecDeque<(u64, Held, u64)>> = Mutex::new(VecDeque::new());
+
+fn signal_late(fence: Held, value: u64) {
+    #[cfg(windows)]
+    let target = crate::host::in_flight_fence();
+    #[cfg(not(windows))]
+    let target = 0;
+    {
+        let mut owed = LATE.lock().unwrap_or_else(|e| e.into_inner());
+        if target != 0 || !owed.is_empty() {
+            owed.push_back((target, fence, value));
+            drop(owed);
+            #[cfg(windows)]
+            if crate::host::finished_fence() >= target {
+                deliver(crate::host::finished_fence());
+            }
+            finisher::ask();
+            return;
+        }
+    }
+    fence.signal(value);
+}
+
+pub(crate) fn deliver(finished: u64) {
+    let mut due = Vec::new();
+    {
+        let mut owed = LATE.lock().unwrap_or_else(|e| e.into_inner());
+        while owed.front().is_some_and(|(target, ..)| *target <= finished) {
+            due.extend(owed.pop_front());
+        }
+    }
+    if due.is_empty() {
+        return;
+    }
+    for (_, fence, value) in due {
+        fence.signal(value);
+    }
+    crate::fence::wake();
+    finisher::ask();
+}
+
+mod finisher {
+    use std::sync::{Condvar, Mutex, Once};
+
+    static ASKED: Mutex<bool> = Mutex::new(false);
+    static MORE: Condvar = Condvar::new();
+
+    pub(super) fn ask() {
+        static START: Once = Once::new();
+        START.call_once(|| {
+            if let Err(error) = std::thread::Builder::new().name("victory-finish".into()).spawn(run) {
+                tracing::warn!(%error, "no thread to finish host submissions");
+            }
+        });
+        *ASKED.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        MORE.notify_one();
+    }
+
+    fn run() {
+        loop {
+            {
+                let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+                while !*asked {
+                    asked = MORE.wait(asked).unwrap_or_else(|e| e.into_inner());
+                }
+                *asked = false;
+            }
+            super::pump();
+            #[cfg(windows)]
+            {
+                crate::host::finish_in_flight_apart();
+                super::deliver(crate::host::finished_fence());
+            }
+            super::pump();
+        }
+    }
+}
+
 /// Whether any queue is held back.
 pub(crate) fn held() -> bool {
     HELD.load(Ordering::Acquire) > 0
@@ -168,6 +255,9 @@ impl Timeline {
                 }
                 Some(Op::Signal(..) | Op::Work(_)) => match s.ops.pop_front() {
                     Some(Op::Signal(fence, value)) => Box::new(move || {
+                        if late() {
+                            return signal_late(fence, value);
+                        }
                         #[cfg(windows)]
                         crate::host::wait_in_flight_if_ready();
                         fence.signal(value);
