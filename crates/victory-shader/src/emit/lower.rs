@@ -23,6 +23,8 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod f64;
 mod half;
+mod reciprocal;
+mod rsqrt;
 mod scalar_vcc;
 mod tables;
 #[cfg(test)]
@@ -139,6 +141,8 @@ pub(crate) struct Lowered {
     dot4_opcodes: Vec<i64>,
     #[cfg(test)]
     icmps_and_selects: (usize, usize),
+    #[cfg(test)]
+    pub threads: Option<[u32; 3]>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -595,6 +599,10 @@ struct Lower<'a> {
     /// Compute code that reads other lanes: thread ids follow the host
     /// lanes, so lane n is console lane n.
     console_lanes: bool,
+    /// Compute code whose samples take an implicit level in a group of more
+    /// than one row: the console's thread-group dimensions before flattening
+    /// `s.threads` to one row (`[x * y * z, 1, 1]`).
+    rows: Option<[u32; 3]>,
     /// Retry a compute shader with numeric selects only when the normal
     /// translation needs one. Unused selects need no fixed wave size.
     numeric_selects: bool,
@@ -694,76 +702,103 @@ struct Lower<'a> {
     lane_paths: Vec<(usize, V)>,
     /// Heap index phis of per-lane joins with predecessors lowered later.
     pending_paths: Vec<PendingPath>,
-    /// The 16/64-bit round mode (MODE bits 3:2) each block starts with, and
-    /// the one in force at the instruction being lowered (see [`round16`]).
-    round16: Vec<Option<u8>>,
-    mode16: Option<u8>,
+    /// The 16/64-bit floating-point modes at block entry and at the
+    /// instruction being lowered (see [`fp_modes16`]).
+    fp_modes16: Vec<FpMode16>,
+    mode16: FpMode16,
 }
 
-/// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
-/// after `inst`, from `mode` before it (`None`: not known).
-#[inline]
-fn round16_after(inst: &Inst, mode: Option<u8>) -> Option<u8> {
-    if !matches!(inst.machine.encoding, Encoding::Sopp | Encoding::Sopk) {
-        return mode;
-    }
-    match (inst.name(), &inst.fields) {
-        ("s_round_mode", Fields::Sopp { imm }) => Some((imm >> 2 & 3) as u8),
-        (
-            "s_setreg_imm32_b32" | "s_setreg_b32",
-            Fields::Sop {
-                src, imm: Some(h), ..
-            },
-        ) => {
-            let (id, off, size) = (h & 0x3F, h >> 6 & 0x1F, (h >> 11 & 0x1F) + 1);
-            if id != 1 || off >= 4 || off + size <= 2 {
-                return mode;
-            }
-            match src.first() {
-                Some(&Operand::Literal(x)) if off <= 2 && off + size >= 4 => {
-                    Some((x >> (2 - off) & 3) as u8)
-                }
-                _ => None,
-            }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FpMode16 {
+    round: Option<u8>,
+    denorm: Option<u8>,
+}
+
+impl FpMode16 {
+    // The shader entry convention: nearest-even rounding and preserved
+    // input and output subnormals for binary16 and binary64.
+    const INITIAL: Self = Self {
+        round: Some(0),
+        denorm: Some(3),
+    };
+
+    #[inline]
+    fn after(self, inst: &Inst) -> Self {
+        if !matches!(inst.machine.encoding, Encoding::Sopp | Encoding::Sopk) {
+            return self;
         }
-        _ => mode,
+        match (inst.name(), &inst.fields) {
+            ("s_round_mode", Fields::Sopp { imm }) => Self {
+                round: Some((imm >> 2 & 3) as u8),
+                ..self
+            },
+            ("s_denorm_mode", Fields::Sopp { imm }) => Self {
+                denorm: Some((imm >> 2 & 3) as u8),
+                ..self
+            },
+            (
+                "s_setreg_imm32_b32" | "s_setreg_b32",
+                Fields::Sop {
+                    src, imm: Some(h), ..
+                },
+            ) if h & 0x3F == 1 => {
+                let offset = h >> 6 & 0x1F;
+                let end = offset + (h >> 11 & 0x1F) + 1;
+                let update = |old, start| {
+                    if offset >= start + 2 || end <= start {
+                        return old;
+                    }
+                    match src.first() {
+                        Some(&Operand::Literal(bits)) if offset <= start && end >= start + 2 => {
+                            Some((bits >> (start - offset) & 3) as u8)
+                        }
+                        _ => None,
+                    }
+                };
+                Self {
+                    round: update(self.round, 2),
+                    denorm: update(self.denorm, 6),
+                }
+            }
+            _ => self,
+        }
+    }
+
+    fn join(self, other: Self) -> Self {
+        Self {
+            round: self.round.filter(|_| self.round == other.round),
+            denorm: self.denorm.filter(|_| self.denorm == other.denorm),
+        }
     }
 }
 
-/// The 16/64-bit round mode each block starts with: nearest even at the
-/// program's start, then as the MODE writes on the way set it; `None` where
-/// paths that set it differently join (or a write is not a constant).
-fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
-    // Fast path: if no instruction can move MODE bits 3:2 away from the
-    // initial nearest-even (0), every reachable block enters with Some(0).
-    let changes_mode = p
-        .blocks
-        .iter()
-        .any(|b| b.insts.iter().any(|i| round16_after(i, Some(0)) != Some(0)));
+/// Track MODE bits 3:2 and 7:6 independently. A value is unknown after a
+/// dynamic write or a join between paths that disagree.
+fn fp_modes16(p: &crate::ir::Program) -> Vec<FpMode16> {
+    let changes_mode = p.blocks.iter().any(|b| {
+        b.insts
+            .iter()
+            .any(|i| FpMode16::INITIAL.after(i) != FpMode16::INITIAL)
+    });
     if !changes_mode {
-        let mut out = vec![None; p.blocks.len()];
+        let mut out = vec![FpMode16::default(); p.blocks.len()];
         for b in crate::ir::reverse_postorder(&p.blocks) {
-            out[b] = Some(0);
+            out[b] = FpMode16::INITIAL;
         }
         return out;
     }
-    // None: not reached yet; Some(m): the mode (m None: not known).
-    let mut entry: Vec<Option<Option<u8>>> = vec![None; p.blocks.len()];
-    entry[0] = Some(Some(0));
+    let mut entry = vec![None; p.blocks.len()];
+    entry[0] = Some(FpMode16::INITIAL);
     let order = crate::ir::reverse_postorder(&p.blocks);
     loop {
         let mut changed = false;
         for &b in &order {
-            let Some(mut m) = entry[b] else { continue };
+            let Some(mut mode) = entry[b] else { continue };
             for inst in &p.blocks[b].insts {
-                m = round16_after(inst, m);
+                mode = mode.after(inst);
             }
             for s in p.blocks[b].exit.succs() {
-                let new = match entry[s] {
-                    None => Some(m),
-                    Some(old) if old == m => continue,
-                    Some(_) => Some(None),
-                };
+                let new = Some(entry[s].map_or(mode, |old| old.join(mode)));
                 if entry[s] != new {
                     entry[s] = new;
                     changed = true;
@@ -771,7 +806,7 @@ fn round16(p: &crate::ir::Program) -> Vec<Option<u8>> {
             }
         }
         if !changed {
-            return entry.into_iter().map(Option::flatten).collect();
+            return entry.into_iter().map(Option::unwrap_or_default).collect();
         }
     }
 }
@@ -1324,6 +1359,7 @@ impl<'a> Lower<'a> {
         let wide_lds =
             insts().any(|i| ds_integer_atomic(i.name()).is_some_and(|(_, wide, _)| wide));
         let mut console_lanes = false;
+        let mut rows = None;
         let mut split = false;
         let mut wants_console_flow = false;
         if let StageIo::Cs(cs) = x.native.io {
@@ -1446,6 +1482,16 @@ impl<'a> Lower<'a> {
                 || (x.native.wave64 && x.target.runs(64) && super::force_wave64())
             {
                 s.wave_size = Some(wave);
+            }
+            // The console takes an implicit-level sample's derivatives from
+            // quads of x-major lanes, whereas hosts tile 2D groups as 2x2
+            // quads. Run multi-row groups with implicit-level samples as one
+            // flat row so every quad holds four consecutive x-major threads.
+            if cs.threads[1] * cs.threads[2] > 1
+                && live().any(|i| implicit_derivatives(i.name()))
+            {
+                rows = Some(cs.threads);
+                s.threads = Some([cs.threads.iter().product(), 1, 1]);
             }
         }
         let mut no_barrier = FxSet::default();
@@ -1571,6 +1617,7 @@ impl<'a> Lower<'a> {
             wide_lds,
             src0: None,
             console_lanes,
+            rows,
             numeric_selects,
             split,
             console_cf: x.console_cf,
@@ -1618,8 +1665,8 @@ impl<'a> Lower<'a> {
             abort: None,
             lane_paths: Vec::new(),
             pending_paths: Vec::new(),
-            round16: round16(p),
-            mode16: Some(0),
+            fp_modes16: fp_modes16(p),
+            mode16: FpMode16::INITIAL,
             dead,
         }
     }
@@ -2221,6 +2268,8 @@ impl<'a> Lower<'a> {
             dot4_opcodes: self.s.m.written_call_opcodes("dx.op.dot4AddPacked.i32"),
             #[cfg(test)]
             icmps_and_selects: self.s.m.written_icmps_and_selects(),
+            #[cfg(test)]
+            threads: self.s.threads,
             stride_table,
             dxil: self.s.finish(),
             user_data,
@@ -2338,11 +2387,11 @@ impl<'a> Lower<'a> {
                 }
             }
             let mut i = 0;
-            self.mode16 = self.round16[b];
+            self.mode16 = self.fp_modes16[b];
             let has_sections = self.sections.contains_key(&b);
             while i < p.blocks[b].insts.len() {
                 self.inst(b, i)?;
-                self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
+                self.mode16 = self.mode16.after(&p.blocks[b].insts[i]);
                 if has_sections
                     && let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end)
                 {
@@ -3755,7 +3804,7 @@ impl<'a> Lower<'a> {
     // shortcut: rounding toward +-infinity, or a mode not known at this
     // point (paths that set it differently join), rounds to nearest even.
     fn narrow16(&mut self, f: V) -> V {
-        let rtz = self.mode16 == Some(3);
+        let rtz = self.mode16.round == Some(3);
         let c = self.cur;
         let x = self.as_int(f);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -4678,7 +4727,9 @@ impl<'a> Lower<'a> {
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
-        let [x, y, _] = self.s.threads.expect("compute");
+        let [x, y, _] = self
+            .rows
+            .unwrap_or_else(|| self.s.threads.expect("compute"));
         let e = self.s.entry;
         let f = self.console_flat();
         let (xk, yk, xy) = (self.s.m.i32(x), self.s.m.i32(y), self.s.m.i32(x * y));
@@ -8713,6 +8764,7 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            "v_rcp_f64" => self.reciprocal_f64(inst, guard),
             "v_rcp_f32" | "v_rcp_iflag_f32" => {
                 // shortcut: the hardware reciprocal is approximate (1 ULP); this divides.
                 let a = f(self, 0)?;
@@ -8720,6 +8772,7 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::SDiv, one, a);
                 float(self, r)
             }
+            "v_rsq_f64" => self.rsqrt_f64(inst, guard),
             "v_rsq_f32" | "v_sqrt_f32" | "v_log_f32" | "v_exp_f32" | "v_fract_f32"
             | "v_trunc_f32" | "v_floor_f32" | "v_ceil_f32" | "v_rndne_f32" | "v_sin_f32"
             | "v_cos_f32" => {
@@ -16351,5 +16404,234 @@ mod select_tests {
             let wave_ops = u64::from_le_bytes(features.data.try_into().unwrap()) & 0x4000 != 0;
             assert_eq!(wave_ops, uses_select);
         }
+    }
+}
+
+#[cfg(test)]
+mod loop85_tests {
+    use super::super::emit;
+    use crate::native::{ComputeIo, RootParam};
+    use crate::{Container, FourCC, HwStage, NativeProgram, ResourceType, RootType, UsedResource};
+
+    #[test]
+    fn f64_reciprocal_and_rsqrt_lower_without_doubles_or_int64() {
+        let container = crate::dxbc::build(&[]);
+        let c = Container::parse(&container).unwrap();
+        let table = RootParam {
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            sgprs: 1,
+            base_register: 0,
+            user_data: 0,
+            slot: 0,
+        };
+        let uav = UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        for op_words in [
+            vec![0x7E0C_5F01],             // VOP1 v_rcp_f64 v[6:7], v1 (0x2F << 9 = 0x5E00 | 1 -> 0x5F01? wait: 0x02F << 9 | 0x101 = 0x5F01)
+            vec![0xD5AF_0006, 0x0000_0000], // VOP3 v_rcp_f64 v[6:7], s0
+            vec![0x7E0C_6301],             // VOP1 v_rsq_f64 v[6:7], v1 (0x031 << 9 | 0x101 = 0x6301)
+            vec![0xD5B1_0006, 0x0000_0000], // VOP3 v_rsq_f64 v[6:7], s0
+        ] {
+            for mode_inst in [0xBFA4_0000u32, 0xBFA5_000C] {
+                let mut words = vec![
+                    mode_inst,     // s_round_mode / s_denorm_mode
+                    0xBE81_0380,   // s_mov_b32 s1, 0
+                    0xF408_0200,
+                    0xFA00_0000,   // s_load_dwordx4 s[8:11], s[0:1], 0
+                    0xBF8C_C07F,   // s_waitcnt lgkmcnt(0)
+                ];
+                words.extend_from_slice(&op_words);
+                words.extend_from_slice(&[
+                    0x3404_0083, // v_lshlrev_b32 v2, 3, v0
+                    0xE074_1000,
+                    0x8002_0602, // buffer_store_dwordx2 v[6:7], v2, s[8:11], 0 offen
+                    0xBF81_0000,
+                ]);
+                let native = NativeProgram {
+                    stage: HwStage::Cs,
+                    wave64: false,
+                    vgprs: 8,
+                    layout: vec![table.clone()],
+                    used: vec![uav.clone()],
+                    io: crate::native::StageIo::Cs(ComputeIo {
+                        rsrc2: 2,
+                        threads: [32, 1, 1],
+                    }),
+                    code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+                };
+                let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
+                let st = crate::structure::structure(&p).unwrap();
+                let io = crate::io::raise(&p, &native).unwrap();
+                let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+                let shader =
+                    emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).unwrap();
+                let emitted = Container::parse(&shader.dxil).unwrap();
+                let sfi0 = emitted.part(FourCC::SFI0).unwrap();
+                let flags = u64::from_le_bytes(sfi0.data.try_into().unwrap());
+                assert_eq!(flags & 0x8001, 0, "SFI0 {flags:#x} for {op_words:x?}");
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_mtbuf_loads_need_no_int64() {
+        let formats = [1u8, 7, 14, 23, 30, 37, 44, 50, 56, 65];
+        let container = crate::dxbc::build(&[]);
+        let c = Container::parse(&container).unwrap();
+        let range = |kind, table_offset_dwords| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 0,
+            slot: 0,
+        };
+        for unorm in formats {
+            for format in [unorm, unorm + 1] {
+                let words = [
+                    0x8F02_8601u32, // s_lshl_b32 s2, s1, 6
+                    0x4A00_0002,    // v_add_nc_u32 v0, s2, v0
+                    0x3400_0084,    // v_lshlrev_b32 v0, 4, v0
+                    0xBE81_0380,    // s_mov_b32 s1, 0
+                    0xF408_0200,
+                    0xFA00_0000,    // s_load_dwordx4 s[8:11], s[0:1], 0
+                    0xF408_0300,
+                    0xFA00_0020,    // s_load_dwordx4 s[12:15], s[0:1], 32
+                    0xE803_1000 | (u32::from(format) << 19),
+                    0x8002_0100,    // tbuffer_load_format_xyzw
+                    0xE078_1000,
+                    0x8003_0100,    // buffer_store_dwordx4
+                    0xBF81_0000,
+                ];
+                let native = NativeProgram {
+                    stage: HwStage::Cs,
+                    wave64: false,
+                    vgprs: 5,
+                    layout: vec![RootParam {
+                        root: RootType::Table,
+                        table_offset_dwords: 0,
+                        sgprs: 1,
+                        base_register: 0,
+                        user_data: 0,
+                        slot: 0,
+                    }],
+                    used: vec![range(ResourceType::Srv, 0), range(ResourceType::Uav, 8)],
+                    io: crate::native::StageIo::Cs(ComputeIo {
+                        rsrc2: 1 << 7 | 1 << 1,
+                        threads: [64, 1, 1],
+                    }),
+                    code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+                };
+                let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
+                let st = crate::structure::structure(&p).unwrap();
+                let io = crate::io::raise(&p, &native).unwrap();
+                let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+                let shader =
+                    emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).unwrap();
+                let emitted = Container::parse(&shader.dxil).unwrap();
+                let sfi0 = emitted.part(FourCC::SFI0).unwrap();
+                let flags = u64::from_le_bytes(sfi0.data.try_into().unwrap());
+                assert_eq!(flags & 0x8000, 0, "format {format}, SFI0 {flags:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn compute_implicit_sample_flattens_2d_group_to_one_row() {
+        let range = |kind, table_offset_dwords, dwords, stride| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords,
+            lower_bound: 0,
+            stride,
+            dwords,
+            user_data: 0,
+            slot: 0,
+        };
+        let words = [
+            0xBE84_0300u32, // s_mov_b32 s4, s0
+            0xBE85_0380,    // s_mov_b32 s5, 0
+            0xF40C_0302,
+            0xFA00_0000,    // s_load_dwordx8 s[12:19], s[4:5], 0x0
+            0xF408_0502,
+            0xFA00_0020,    // s_load_dwordx4 s[20:23], s[4:5], 0x20
+            0xF408_0A02,
+            0xFA00_0040,    // s_load_dwordx4 s[40:43], s[4:5], 0x40
+            0xB008_01B6,    // s_movk_i32 s8, 0x1b6
+            0xBE89_03FF,
+            0x00C0_0000,    // s_mov_b32 s9, 0xc00000
+            0xBE8A_03FF,
+            0x1850_0000,    // s_mov_b32 s10, 0x18500000
+            0xBE8B_0380,    // s_mov_b32 s11, 0
+            0x3404_0283,    // v_lshlrev_b32 v2, 3, v1
+            0x4A04_0500,    // v_add_nc_u32 v2, v0, v2
+            0x3420_0483,    // v_lshlrev_b32 v16, 3, v2
+            0x3428_0482,    // v_lshlrev_b32 v20, 2, v2
+            0xBF8C_C07F,    // s_waitcnt lgkmcnt(0)
+            0xE034_1000,
+            0x8005_0C10,    // buffer_load_dwordx2 v[12:13], v16, s[20:23], 0 offen
+            0xBF8C_3F70,    // s_waitcnt vmcnt(0)
+            0xF080_0108,
+            0x0043_040C,    // image_sample v4, v[12:13], s[12:19], s[8:11] dmask:0x1 dim:2D
+            0xBF8C_3F70,    // s_waitcnt vmcnt(0)
+            0xE070_1000,
+            0x800A_0414,    // buffer_store_dword v4, v20, s[40:43], 0 offen
+            0xBF81_0000,
+        ];
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 32,
+            layout: vec![RootParam {
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                sgprs: 1,
+                base_register: 0,
+                user_data: 0,
+                slot: 0,
+            }],
+            used: vec![
+                range(ResourceType::Srv, 0, 8, 0),
+                range(ResourceType::Srv, 8, 4, 8),
+                range(ResourceType::Uav, 16, 4, 0),
+            ],
+            io: crate::native::StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 1 | 1 << 11,
+                threads: [8, 8, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let p = crate::ir::build(&native.code, false, native.vgprs).unwrap();
+        let st = crate::structure::structure(&p).unwrap();
+        let io = crate::io::raise(&p, &native).unwrap();
+        let res = crate::resource::track(&p, &native.layout, native.stage).unwrap();
+        let lowered = super::lower(&super::Parts {
+            native: &native,
+            psv: None,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+            target: crate::emit::Target::ANY,
+            console_cf: false,
+            per_lane_only: false,
+        })
+        .unwrap();
+        assert_eq!(lowered.threads, Some([64, 1, 1]));
     }
 }

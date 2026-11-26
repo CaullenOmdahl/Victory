@@ -50,7 +50,7 @@ const TWO_OVER_PI: [u32; 38] = [
 impl<'a> Lower<'a> {
     /// Reads the raw `(low, high)` 32-bit words of a binary64 source operand
     /// without marking the shader as using native f64 or int64 operations.
-    fn f64_raw_words(&mut self, inst: &Inst, op: Operand) -> Result<(V, V), Why> {
+    pub(super) fn f64_raw_words(&mut self, inst: &Inst, op: Operand) -> Result<(V, V), Why> {
         let pair = |l: &mut Self, lo: Reg, hi: Reg| -> Result<(V, V), Why> {
             let lo = l.i32_of(inst.read(lo).ok_or("an unread operand")?)?;
             let hi = l.i32_of(inst.read(hi).ok_or("an unread operand")?)?;

@@ -14,7 +14,7 @@ impl Lower<'_> {
     /// nearest even (or its rounding mode is unknown, which `narrow16` also
     /// rounds to nearest even). Toward zero / infinity stays in f32.
     pub(super) fn native16(&self) -> bool {
-        self.x.target.native16 && matches!(self.mode16, Some(0) | None)
+        self.x.target.native16 && matches!(self.mode16.round, Some(0) | None)
     }
 
     /// The low 16 bits of `x` as a `half`.

@@ -87,7 +87,7 @@ pub(super) fn value_count(p: &Program) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::emit::lower::{round16, round16_after};
+    use crate::emit::lower::{FpMode16, fp_modes16};
     use crate::ir;
 
     const S_ENDPGM: u32 = 0xBF81_0000;
@@ -110,7 +110,7 @@ mod tests {
             .flat_map(|w| w.to_le_bytes())
             .collect();
         let p = ir::build(&plain, false, 8).unwrap();
-        assert_eq!(round16(&p), vec![Some(0)]);
+        assert_eq!(fp_modes16(&p), vec![FpMode16::INITIAL]);
 
         let rtz: Vec<u8> = [
             0xBFA4_000Cu32, // s_round_mode 0xC (RTZ for f16/f64)
@@ -122,8 +122,8 @@ mod tests {
         .flat_map(|w| w.to_le_bytes())
         .collect();
         let p2 = ir::build(&rtz, false, 8).unwrap();
-        let modes = round16(&p2);
-        assert_eq!(modes[0], Some(0));
-        assert_eq!(round16_after(&p2.blocks[0].insts[0], Some(0)), Some(3));
+        let modes = fp_modes16(&p2);
+        assert_eq!(modes[0], FpMode16::INITIAL);
+        assert_eq!(FpMode16::INITIAL.after(&p2.blocks[0].insts[0]).round, Some(3));
     }
 }
