@@ -1094,6 +1094,7 @@ fn out_of_bounds_view_and_sampler_indices_clamp_to_sentinel_slots() {
         lanes_max: 128,
         view_slots: super::MEMORY_SLOTS + 4, // own_slots = 4 -> sentinel view slot = 3
         sampler_slots: 2,                    // sentinel sampler slot = 1
+        ..super::Target::ANY
     };
     let shader = emit(&c, &n, &p, &st, &io, &res, target).expect("emit");
     if let Ok(mut v) =

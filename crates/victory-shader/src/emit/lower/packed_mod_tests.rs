@@ -9,7 +9,7 @@ use crate::native::{
 };
 use crate::{ShaderError, io, ir, resource, structure};
 
-fn lower_packed(inst_words: &[u32]) -> Result<super::Lowered, ShaderError> {
+fn lower_packed_for(inst_words: &[u32], target: crate::emit::Target) -> Result<super::Lowered, ShaderError> {
     let mut words = vec![
         0xBE8C_0302u32, // s_mov_b32 s12, s2
         0xBE8D_0380,    // s_mov_b32 s13, 0
@@ -68,11 +68,15 @@ fn lower_packed(inst_words: &[u32]) -> Result<super::Lowered, ShaderError> {
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
-        target: crate::emit::Target::ANY,
+        target,
         psv: None,
         console_cf: false,
         per_lane_only: false,
     })
+}
+
+fn lower_packed(inst_words: &[u32]) -> Result<super::Lowered, ShaderError> {
+    lower_packed_for(inst_words, crate::emit::Target::ANY)
 }
 
 #[test]
@@ -200,4 +204,47 @@ fn dot4_lowers_to_dxil_dot4_add_packed_and_expands_constants() {
         lowered_const.dot4_opcodes.is_empty(),
         "constant dot4 multiplicand must expand without dot4AddPacked"
     );
+}
+
+#[test]
+fn native16_sets_sfi0_when_supported_and_skips_omod_and_rtz() {
+    let declares_native16 = |dxil: &[u8]| -> bool {
+        let c = crate::dxbc::Container::parse(dxil).unwrap();
+        let sfi0 = c.part(crate::dxbc::FourCC::SFI0).unwrap();
+        let flags = u64::from_le_bytes(sfi0.data[..8].try_into().unwrap());
+        flags & 0x4_0000 != 0
+    };
+    let native_target = crate::emit::Target {
+        native16: true,
+        ..crate::emit::Target::ANY
+    };
+
+    // v_add_f16 v2, v1, v2 (VOP2 opcode 0x32)
+    let add_f16 = [(0x32u32 << 25) | (2 << 17) | (2 << 9) | 257];
+    assert!(!declares_native16(&lower_packed_for(&add_f16, crate::emit::Target::ANY).unwrap().dxil));
+    assert!(declares_native16(&lower_packed_for(&add_f16, native_target).unwrap().dxil));
+
+    // VOP3P v_pk_fma_f16 v2, v1, v2, v2 (opcode 0x0E)
+    let pk_fma = [
+        0xCC00_0000u32 | (0x0E << 16) | 2,
+        (3 << 27) | (258 << 18) | (258 << 9) | 257,
+    ];
+    assert!(!declares_native16(&lower_packed_for(&pk_fma, crate::emit::Target::ANY).unwrap().dxil));
+    assert!(declares_native16(&lower_packed_for(&pk_fma, native_target).unwrap().dxil));
+
+    // Output modifier (`omod = 1` = mul:2 on VOP3 v_add_f16 0x132) falls back to f32 path.
+    let add_omod = [0xD400_0000u32 | (0x132 << 16) | 2, (1 << 27) | (258 << 9) | 257];
+    match (
+        lower_packed_for(&add_omod, crate::emit::Target::ANY),
+        lower_packed_for(&add_omod, native_target),
+    ) {
+        (Ok(_), Ok(n)) => assert!(!declares_native16(&n.dxil)),
+        (Err(a), Err(b)) => assert_eq!(a, b),
+        (a, b) => panic!("omod mismatch: {:?} vs {:?}", a.is_ok(), b.is_ok()),
+    }
+
+    // s_setreg_imm32_b32 mode[3:2]=3 (RTZ 16-bit) disables native16 path.
+    let mut rtz_add = vec![0xBA80_0881u32, 3];
+    rtz_add.extend_from_slice(&add_f16);
+    assert!(!declares_native16(&lower_packed_for(&rtz_add, native_target).unwrap().dxil));
 }

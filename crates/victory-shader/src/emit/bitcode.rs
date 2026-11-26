@@ -15,6 +15,8 @@ enum TypeDef {
     Void,
     Int(u32),
     Float,
+    /// IEEE binary16 (native 16-bit operations, SM 6.2).
+    Half,
     Double,
     /// Pointee and address space.
     Ptr(Ty, u32),
@@ -214,6 +216,9 @@ pub(crate) struct Module {
     blocks: Vec<Block>,
     mds: Vec<MdDef>,
     named: Vec<(String, Vec<Md>)>,
+    /// The module uses native 16-bit types ([`Uses::native16`]): written
+    /// with their data layout.
+    pub native16: bool,
 }
 
 /// Summary of written `cbufferLoadLegacy.i32` calls and their extracts.
@@ -284,6 +289,9 @@ impl Module {
     }
     pub fn float(&mut self) -> Ty {
         self.ty(TypeDef::Float)
+    }
+    pub fn half(&mut self) -> Ty {
+        self.ty(TypeDef::Half)
     }
     pub fn double(&mut self) -> Ty {
         self.ty(TypeDef::Double)
@@ -729,12 +737,17 @@ impl Module {
     pub fn uses(&self) -> Uses {
         let plan = self.plan();
         let wide = |t: Ty| self.types[t.0 as usize] == TypeDef::Int(64);
+        let narrow = |t: Ty| matches!(self.types[t.0 as usize], TypeDef::Half | TypeDef::Int(16));
         let mut u = Uses::default();
         for b in plan.layout.iter().map(|&b| &self.blocks[b]) {
             for &i in b.phis.iter().chain(&b.body).filter(|&&i| plan.live[i as usize]) {
                 let inst = &self.insts[i as usize];
                 u.int64 |= wide(inst.ty);
-                for_each_operand(&inst.op, |v| u.int64 |= wide(self.type_of(v)));
+                u.native16 |= narrow(inst.ty);
+                for_each_operand(&inst.op, |v| {
+                    u.int64 |= wide(self.type_of(v));
+                    u.native16 |= narrow(self.type_of(v));
+                });
                 let Op::Call(f, args) = &inst.op else {
                     continue;
                 };
@@ -1169,6 +1182,7 @@ impl Module {
             match t {
                 TypeDef::Void => w.record(2, &[]),
                 TypeDef::Float => w.record(3, &[]),
+                TypeDef::Half => w.record(10, &[]),
                 TypeDef::Double => w.record(4, &[]),
                 TypeDef::Int(b) => w.record(7, &[u64::from(*b)]),
                 TypeDef::Ptr(p, space) => w.record(8, &[u64::from(p.0), u64::from(*space)]),
@@ -1194,11 +1208,15 @@ impl Module {
         w.exit();
 
         w.record(2, &chars("dxil-ms-dx"));
+        // Native 16-bit types are laid out in 16 bits, minimum precision in
+        // 32 (the validator wants the layout that matches the flags).
         w.record(
             3,
-            &chars(
-                "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64",
-            ),
+            &chars(if self.native16 {
+                "e-m:e-p:32:32-i1:32-i8:8-i16:16-i32:32-i64:64-f16:16-f32:32-f64:64-n8:16:32:64"
+            } else {
+                "e-m:e-p:32:32-i1:32-i8:32-i16:32-i32:32-i64:64-f16:32-f32:32-f64:64-n8:16:32:64"
+            }),
         );
         let first_const = u64::from(g_n) + u64::from(n);
         for g in self
@@ -1473,6 +1491,8 @@ pub struct Uses {
     pub wave: bool,
     /// 64-bit integers.
     pub int64: bool,
+    /// Native 16-bit floats or integers.
+    pub native16: bool,
 }
 
 /// What [`Module::write`] writes ([`Module::plan`]).

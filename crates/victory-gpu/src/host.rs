@@ -1279,17 +1279,45 @@ impl Host {
                 crate::descriptor::host::PORTABLE_VIEWS
             };
             drop(probe);
+            let mut options4 = D3D12_FEATURE_DATA_D3D12_OPTIONS4::default();
+            // SAFETY: the query writes the structure of the given size.
+            let opts4_ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(
+                        D3D12_FEATURE_D3D12_OPTIONS4,
+                        (&raw mut options4).cast(),
+                        size_of_val(&options4) as u32,
+                    )
+                    .is_ok()
+            };
+            let is_warp = unsafe {
+                let luid = self.device.GetAdapterLuid();
+                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                    .ok()
+                    .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(luid).ok())
+                    .and_then(|a| a.GetDesc1().ok())
+                    .is_some_and(|d| {
+                        d.VendorId == 0x1414
+                            || (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0
+                    })
+            };
+            let native16 = opts4_ok
+                && options4.Native16BitShaderOpsSupported.as_bool()
+                && !is_warp
+                && !std::env::var_os("VICTORY_F16_IN_F32").is_some_and(|v| v != "0");
             let target = if ok && options.WaveOps.as_bool() && options.WaveLaneCountMin > 0 {
                 victory_shader::emit::Target {
                     lanes_min: options.WaveLaneCountMin,
                     lanes_max: options.WaveLaneCountMax,
                     view_slots,
                     sampler_slots: victory_shader::emit::SAMPLER_SLOTS,
+                    native16,
                 }
             } else {
                 victory_shader::emit::Target {
                     view_slots,
                     sampler_slots: victory_shader::emit::SAMPLER_SLOTS,
+                    native16,
                     ..victory_shader::emit::Target::ANY
                 }
             };
@@ -1298,6 +1326,7 @@ impl Host {
                 lanes_max = target.lanes_max,
                 view_slots = target.view_slots,
                 sampler_slots = target.sampler_slots,
+                native16 = target.native16,
                 "host wave sizes and descriptor heap limits"
             );
             if !target.runs(64) {

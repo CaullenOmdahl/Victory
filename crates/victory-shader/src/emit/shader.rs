@@ -20,6 +20,9 @@ pub const STRIDE_SPACE: u32 = 2;
 pub(crate) mod flags {
     pub const DOUBLES: u64 = 1 << 2;
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    /// 16-bit types are used; with [`NATIVE_LOW_PRECISION`], as native
+    /// 16-bit ones (SM 6.2), not minimum precision.
+    pub const LOW_PRECISION: u64 = 1 << 5;
     pub const DOUBLE_EXT: u64 = 1 << 6;
     pub const STENCIL_REF: u64 = 1 << 11;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
@@ -28,6 +31,7 @@ pub(crate) mod flags {
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const BARYCENTRICS: u64 = 1 << 22;
     pub const INT64: u64 = 1 << 20;
+    pub const NATIVE_LOW_PRECISION: u64 = 1 << 23;
     pub const ATOMIC_TYPED64: u64 = 1 << 27;
     pub const ATOMIC_INT64_GROUP_SHARED: u64 = 1 << 28;
     pub const ATOMIC_HEAP64: u64 = 1 << 32;
@@ -502,9 +506,14 @@ impl Shader {
             (flags::SAMPLER_HEAP, uses.sampler_heap),
             (flags::WAVE_OPS, uses.wave),
             (flags::INT64, uses.int64),
+            (
+                flags::LOW_PRECISION | flags::NATIVE_LOW_PRECISION,
+                uses.native16,
+            ),
         ] {
             self.flags = if used { self.flags | flag } else { self.flags & !flag };
         }
+        self.m.native16 = uses.native16;
         let mut resources = None;
         let mut bindings = Vec::new();
         let i32c = |s: &mut Self, v: u32| {
@@ -844,6 +853,9 @@ impl Shader {
         }
         if self.flags & flags::INT64 != 0 {
             features |= 0x8000;
+        }
+        if self.flags & flags::NATIVE_LOW_PRECISION != 0 {
+            features |= 0x4_0000;
         }
         if self.flags & flags::BARYCENTRICS != 0 {
             features |= 0x2_0000;

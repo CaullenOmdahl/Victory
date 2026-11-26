@@ -318,6 +318,9 @@ pub struct Target {
     /// `0` uses [`SAMPLER_SLOTS`] outside tests without forcing clamping in
     /// synthetic unit tests.
     pub sampler_slots: u32,
+    /// The host runs native 16-bit float operations (`half`, SM 6.2+) and
+    /// rounds a 16-bit `FMad` once (not in f32 first, as WARP does).
+    pub native16: bool,
 }
 
 impl Target {
@@ -328,6 +331,7 @@ impl Target {
         lanes_max: 128,
         view_slots: 0,
         sampler_slots: 0,
+        native16: false,
     };
 
     /// Whether the host runs waves of `lanes`.
@@ -368,13 +372,15 @@ impl Target {
         }
     }
 
-    /// The wave range and descriptor heap limits as bytes, for cache keys.
-    pub fn key(self) -> [u8; 16] {
-        let mut k = [0; 16];
+    /// The wave range, descriptor heap limits, and native16 flag as bytes,
+    /// for cache keys.
+    pub fn key(self) -> [u8; 17] {
+        let mut k = [0; 17];
         k[0..4].copy_from_slice(&self.lanes_min.to_le_bytes());
         k[4..8].copy_from_slice(&self.lanes_max.to_le_bytes());
         k[8..12].copy_from_slice(&self.view_slots.to_le_bytes());
         k[12..16].copy_from_slice(&self.sampler_slots.to_le_bytes());
+        k[16] = u8::from(self.native16);
         k
     }
 }
