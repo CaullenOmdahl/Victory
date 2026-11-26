@@ -95,10 +95,20 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         cost = g.x * g.y * g.z * 64u;
         groups = g;
     } else if (active) {
-        // Mesh dispatches: the console's are one-dimensional.
+        // Mesh dispatches: linearize consecutive 3D groups into [x*y*z, 1, 1]
+        // within the 65,535 host 1D group limit without dropping Y/Z tiles.
         uint3 g = src_args.Load3(src_at);
-        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-        cost = g.x * g.y * g.z * 128u;
+        if (g.x == 0u || g.y == 0u || g.z == 0u) {
+            g = uint3(0u, 0u, 0u);
+        } else {
+            uint x = min(g.x, 65535u);
+            uint y = min(g.y, 65535u);
+            uint z = min(g.z, 65535u);
+            uint xy = (x > 65535u / y) ? 65535u : (x * y);
+            uint total = (xy > 65535u / z) ? 65535u : (xy * z);
+            g = uint3(total, 1u, 1u);
+        }
+        cost = g.x * 128u;
         groups = g;
     }
     costs[gi] = cost;

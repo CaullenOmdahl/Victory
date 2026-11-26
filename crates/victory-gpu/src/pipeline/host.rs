@@ -180,6 +180,15 @@ fn host_blend(blend: &D3D12_BLEND_DESC, targets: &D3D12_RT_FORMAT_ARRAY) -> D3D1
     host
 }
 
+/// Clamps render-target count to 8 and clears unused `RTFormats` entries so
+/// out-of-range title counts or stale trailing formats never reach D3D12 PSO creation.
+fn clean_targets(mut targets: D3D12_RT_FORMAT_ARRAY) -> D3D12_RT_FORMAT_ARRAY {
+    let count = targets.NumRenderTargets.min(8);
+    targets.NumRenderTargets = count;
+    targets.RTFormats[count as usize..].fill(DXGI_FORMAT_UNKNOWN);
+    targets
+}
+
 impl GraphicsState {
     /// A state that declares one render target, of format `format` (tests).
     #[cfg(test)]
@@ -807,6 +816,7 @@ impl HostPipeline {
             .then(|| stages.first().and_then(|(s, _)| s.translated()))
             .flatten()
             .and_then(|t| victory_shader::emit::rectangle_geometry(&t.host.dxil));
+        let clean = clean_targets(g.targets);
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
@@ -818,7 +828,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: host_blend(&g.blend, &g.targets),
+            BlendState: host_blend(&g.blend, &clean),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -833,8 +843,8 @@ impl HostPipeline {
                 RECTANGLES | QUADS => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
                 _ => g.topology,
             },
-            NumRenderTargets: g.targets.NumRenderTargets,
-            RTVFormats: g.targets.RTFormats,
+            NumRenderTargets: clean.NumRenderTargets,
+            RTVFormats: clean.RTFormats,
             DSVFormat: g.depth_format,
             SampleDesc: g.samples,
             ..Default::default()
@@ -943,18 +953,19 @@ fn stream_pipeline<S, D>(
         dsv: Sub<DXGI_FORMAT>,
         samples: Sub<DXGI_SAMPLE_DESC>,
     }
+    let clean = clean_targets(g.targets);
     let mut stream = Stream {
         root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
         stages,
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(&g.blend, &g.targets)),
+        blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, host_blend(&g.blend, &clean)),
         mask: Sub(
             D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
             g.sample_mask,
         ),
         raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
         depth,
-        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
+        targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, clean),
         dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),
         samples: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, g.samples),
     };
@@ -1216,5 +1227,23 @@ mod tests {
         assert_eq!((v.formats(), v.targets.NumRenderTargets), (bound, 2));
         assert_eq!(g.with_formats(&g.formats()).formats(), g.formats());
         assert_eq!(v.describe(), g.with_formats(&bound).describe());
+    }
+
+    #[test]
+    fn clean_targets_clamps_count_and_clears_trailing_formats() {
+        let dirty = D3D12_RT_FORMAT_ARRAY {
+            RTFormats: [DXGI_FORMAT(28); 8],
+            NumRenderTargets: 12,
+        };
+        let clamped = clean_targets(dirty);
+        assert_eq!(clamped.NumRenderTargets, 8);
+        assert_eq!(clamped.RTFormats, [DXGI_FORMAT(28); 8]);
+
+        let mut over_zero = dirty;
+        over_zero.NumRenderTargets = 2;
+        let cleared = clean_targets(over_zero);
+        assert_eq!(cleared.NumRenderTargets, 2);
+        assert_eq!(cleared.RTFormats[..2], [DXGI_FORMAT(28); 2]);
+        assert!(cleared.RTFormats[2..].iter().all(|&f| f == DXGI_FORMAT_UNKNOWN));
     }
 }

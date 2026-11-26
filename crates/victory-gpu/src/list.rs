@@ -580,6 +580,49 @@ const UAV_BARRIER: Barrier = Barrier {
     last: 0,
 };
 
+/// Drops no-op transitions and merges consecutive/duplicate transitions for the
+/// same `(resource, subresource)` within one `ResourceBarrier` batch when no
+/// aliasing or UAV barrier separates them.
+fn coalesce_barriers(barriers: Vec<Barrier>) -> Vec<Barrier> {
+    let mut out: Vec<Barrier> = Vec::with_capacity(barriers.len());
+    let mut active: Vec<((usize, u32), usize)> = Vec::new();
+    for b in barriers {
+        if b.kind != 0 {
+            active.clear();
+            out.push(b);
+            continue;
+        }
+        let before = (b.second >> 32) as u32;
+        let after = b.last as u32;
+        if before == after {
+            continue;
+        }
+        let key = (b.first as usize, b.second as u32);
+        if let Some(pos) = active.iter().rposition(|&(k, _)| k == key) {
+            let idx = active[pos].1;
+            let prev = &mut out[idx];
+            let prev_before = (prev.second >> 32) as u32;
+            let prev_after = prev.last as u32;
+            if prev_after == before {
+                prev.last = u64::from(after);
+                if prev_before == after {
+                    active.swap_remove(pos);
+                }
+                continue;
+            }
+            if prev_before == before && prev_after == after {
+                continue;
+            }
+            active[pos].1 = out.len();
+        } else {
+            active.push((key, out.len()));
+        }
+        out.push(b);
+    }
+    out.retain(|b| b.kind != 0 || (b.second >> 32) as u32 != b.last as u32);
+    out
+}
+
 /// Returns the console's barrier "actions" (none).
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     #[cfg(windows)]
@@ -599,6 +642,7 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }) {
             host.push(UAV_BARRIER);
         }
+        let host = coalesce_barriers(host);
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
             const _: () = assert!(size_of::<Barrier>() == size_of::<D3D12_RESOURCE_BARRIER>());
@@ -765,6 +809,75 @@ fn readback_extent(
     (total != u64::MAX).then_some([fp.Width, fp.Height, fp.Depth])
 }
 
+#[cfg(windows)]
+fn texture_subresource_dims(
+    desc: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC,
+    subresource: u32,
+) -> Option<[u32; 3]> {
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
+    };
+    let mips = u32::from(desc.MipLevels.max(1));
+    let is_3d = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+    let array = if is_3d {
+        1
+    } else {
+        u32::from(desc.DepthOrArraySize.max(1))
+    };
+    let depth0 = if is_3d {
+        u32::from(desc.DepthOrArraySize.max(1))
+    } else {
+        1
+    };
+    let planes = if desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 != 0 {
+        2
+    } else {
+        1
+    };
+    if subresource >= mips.saturating_mul(array).saturating_mul(planes) {
+        return None;
+    }
+    let mip = subresource % mips;
+    Some([
+        ((desc.Width as u32) >> mip).max(1),
+        (desc.Height >> mip).max(1),
+        (depth0 >> mip).max(1),
+    ])
+}
+
+#[cfg(windows)]
+fn valid_copy_box(format: u32, dims: [u32; 3], source_box: &[u32; 6]) -> Option<[u32; 3]> {
+    let &[l, t, f, r, b, bk] = source_box;
+    if l >= r || t >= b || f >= bk || r > dims[0] || b > dims[1] || bk > dims[2] {
+        return None;
+    }
+    if crate::resource::element(format).is_some_and(|(_, block)| block == 4)
+        && (!l.is_multiple_of(4)
+            || !t.is_multiple_of(4)
+            || (!r.is_multiple_of(4) && r != dims[0])
+            || (!b.is_multiple_of(4) && b != dims[1]))
+    {
+        return None;
+    }
+    Some([r - l, b - t, bk - f])
+}
+
+#[cfg(windows)]
+fn valid_copy_dst(format: u32, dims: [u32; 3], xyz: [u32; 3], extent: [u32; 3]) -> bool {
+    if xyz[0].checked_add(extent[0]).is_none_or(|e| e > dims[0])
+        || xyz[1].checked_add(extent[1]).is_none_or(|e| e > dims[1])
+        || xyz[2].checked_add(extent[2]).is_none_or(|e| e > dims[2])
+    {
+        return false;
+    }
+    if crate::resource::element(format).is_some_and(|(_, block)| block == 4)
+        && (!xyz[0].is_multiple_of(4) || !xyz[1].is_multiple_of(4))
+    {
+        return false;
+    }
+    true
+}
+
 /// Texture to texture on the GPU, buffer to texture through an upload
 /// buffer filled at submission, and texture to buffer through a readback
 /// buffer copied into title memory once the submission completes.
@@ -812,6 +925,16 @@ extern "system" fn copy_texture_region(
             };
             // SAFETY: `from_tex` is a live D3D12 resource.
             let from_desc = unsafe { from_tex.GetDesc() };
+            let Some(src_dims) = texture_subresource_dims(&from_desc, src.footprint.offset as u32)
+            else {
+                return;
+            };
+            // SAFETY: the optional source box is read during this call.
+            if let Some(sb) = unsafe { source_box.as_ref() }
+                && valid_copy_box(from_desc.Format.0 as u32, src_dims, sb).is_none()
+            {
+                return;
+            }
             if from_desc.Flags.0
                 & windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0
                 != 0
@@ -971,11 +1094,35 @@ extern "system" fn copy_texture_region(
         let Some(to) = crate::resource::host_resource(dst.resource) else {
             return;
         };
+        if crate::resource::skipped_mips(dst.resource) > 0 {
+            return;
+        }
+        // SAFETY: `to` is a live D3D12 resource.
+        let to_desc = unsafe { to.GetDesc() };
+        let Some(dst_dims) = texture_subresource_dims(&to_desc, dst.footprint.offset as u32) else {
+            return;
+        };
         let mut from = src;
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
+            let src_dims = [
+                src.footprint.width,
+                src.footprint.height,
+                src.footprint.depth.max(1),
+            ];
+            // SAFETY: the optional source box is read during this call.
+            let extent = match unsafe { source_box.as_ref() } {
+                Some(sb) => match valid_copy_box(src.footprint.format, src_dims, sb) {
+                    Some(ext) => ext,
+                    None => return,
+                },
+                None => src_dims,
+            };
+            if !valid_copy_dst(to_desc.Format.0 as u32, dst_dims, [x, y, z], extent) {
+                return;
+            }
             let Some(bytes) = src.footprint.bytes() else {
                 return;
             };
@@ -1003,15 +1150,28 @@ extern "system" fn copy_texture_region(
             if crate::resource::skipped_mips(src.resource) > 0 {
                 return;
             }
+            // SAFETY: `texture` is a live D3D12 resource.
+            let from_desc = unsafe { texture.GetDesc() };
+            let Some(src_dims) = texture_subresource_dims(&from_desc, src.footprint.offset as u32)
+            else {
+                return;
+            };
+            // SAFETY: the optional source box is read during this call.
+            let extent = match unsafe { source_box.as_ref() } {
+                Some(sb) => match valid_copy_box(from_desc.Format.0 as u32, src_dims, sb) {
+                    Some(ext) => ext,
+                    None => return,
+                },
+                None => src_dims,
+            };
+            if !valid_copy_dst(to_desc.Format.0 as u32, dst_dims, [x, y, z], extent) {
+                return;
+            }
             if crate::texture::title_written(texture) {
                 crate::texture::upload(&list, src.resource, texture);
             }
             ensure_state(&list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
-        }
-        // shortcut: as in `copy_resource`.
-        if crate::resource::skipped_mips(dst.resource) > 0 {
-            return;
         }
         ensure_state(&list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
@@ -2507,5 +2667,45 @@ mod tests {
         }
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);
+    }
+
+    #[test]
+    fn coalesce_barriers_merges_chains_and_drops_noops() {
+        let a = 0x1000usize as This;
+        let b = 0x2000usize as This;
+        let tr = |res: This, sub: u32, before: u32, after: u32| Barrier {
+            kind: 0,
+            flags: 0,
+            first: res,
+            second: u64::from(sub) | (u64::from(before) << 32),
+            last: u64::from(after),
+        };
+        let out = coalesce_barriers(vec![
+            tr(a, 0, 1, 1),         // no-op
+            tr(a, 0, 1, 2),         // chained 1 -> 2 -> 4
+            tr(b, 0, 1, 2),         // canceled 1 -> 2 -> 1
+            tr(a, 0, 2, 4),
+            tr(b, 0, 2, 1),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].first, a);
+        assert_eq!((out[0].second >> 32) as u32, 1);
+        assert_eq!(out[0].last as u32, 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_validation_rejects_bad_boxes_and_unaligned_bc() {
+        // Inverted or out-of-bounds box is rejected.
+        assert_eq!(valid_copy_box(28, [16, 16, 4], &[4, 0, 0, 4, 8, 1]), None);
+        assert_eq!(valid_copy_box(28, [16, 16, 4], &[0, 0, 3, 4, 4, 5]), None);
+        // Unaligned BC3 (format 77) box is rejected unless ending on mip edge.
+        assert_eq!(valid_copy_box(77, [16, 16, 1], &[2, 0, 0, 8, 8, 1]), None);
+        assert_eq!(
+            valid_copy_box(77, [14, 14, 1], &[4, 4, 0, 14, 14, 1]),
+            Some([10, 10, 1])
+        );
+        assert!(!valid_copy_dst(77, [16, 16, 1], [2, 0, 0], [4, 4, 1]));
+        assert!(valid_copy_dst(77, [16, 16, 1], [4, 4, 0], [8, 8, 1]));
     }
 }

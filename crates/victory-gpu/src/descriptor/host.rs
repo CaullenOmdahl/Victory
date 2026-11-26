@@ -2759,6 +2759,13 @@ impl HostHeap {
         let mut clear_bounce = false;
         match &view {
             &View::Constant(address, size) => {
+                if address == 0 || size == 0 {
+                    self.set_unmapped_null(index, &view);
+                    return Some(SlotEval {
+                        slot,
+                        clear_bounce: false,
+                    });
+                }
                 let capped = size.min(65_536);
                 if !valid_title_address(address, u64::from(capped)) {
                     return unmapped(&view, address, u64::from(capped));
