@@ -878,6 +878,22 @@ fn valid_copy_dst(format: u32, dims: [u32; 3], xyz: [u32; 3], extent: [u32; 3]) 
     true
 }
 
+/// Whether `CopyTextureRegion` overwrites only part of a `title_written`
+/// destination texture, requiring its initial contents to be uploaded first.
+fn is_partial_texture_copy(
+    is_3d: bool,
+    mip_levels: u32,
+    depth_or_array_size: u32,
+    dst_dims: [u32; 3],
+    origin: [u32; 3],
+    extent: [u32; 3],
+) -> bool {
+    mip_levels > 1
+        || (!is_3d && depth_or_array_size > 1)
+        || origin != [0, 0, 0]
+        || extent != dst_dims
+}
+
 /// Texture to texture on the GPU, buffer to texture through an upload
 /// buffer filled at submission, and texture to buffer through a readback
 /// buffer copied into title memory once the submission completes.
@@ -1106,7 +1122,7 @@ extern "system" fn copy_texture_region(
         let _upload; // keeps the source alive while this call records it
         #[cfg(feature = "diagnostics")]
         let mut read = None;
-        if src.kind == FOOTPRINT {
+        let extent = if src.kind == FOOTPRINT {
             let src_dims = [
                 src.footprint.width,
                 src.footprint.height,
@@ -1143,6 +1159,7 @@ extern "system" fn copy_texture_region(
                 read = Some((unsafe { buffer.GetGPUVirtualAddress() } + at, bytes));
             }
             _upload = buffer;
+            extent
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
@@ -1172,6 +1189,21 @@ extern "system" fn copy_texture_region(
             }
             ensure_state(&list, src.resource, COPY_SOURCE);
             from.resource = texture.as_raw().cast_const().cast();
+            extent
+        };
+        let is_3d = to_desc.Dimension
+            == windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        if crate::texture::title_written(&to)
+            && is_partial_texture_copy(
+                is_3d,
+                u32::from(to_desc.MipLevels),
+                u32::from(to_desc.DepthOrArraySize),
+                dst_dims,
+                [x, y, z],
+                extent,
+            )
+        {
+            crate::texture::upload(&list, dst.resource, &to);
         }
         ensure_state(&list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
@@ -2707,5 +2739,15 @@ mod tests {
         );
         assert!(!valid_copy_dst(77, [16, 16, 1], [2, 0, 0], [4, 4, 1]));
         assert!(valid_copy_dst(77, [16, 16, 1], [4, 4, 0], [8, 8, 1]));
+    }
+
+    #[test]
+    fn partial_texture_copy_detection_handles_mips_arrays_3d_and_subrects() {
+        assert!(!is_partial_texture_copy(false, 1, 1, [64, 64, 1], [0, 0, 0], [64, 64, 1]));
+        assert!(!is_partial_texture_copy(true, 1, 8, [16, 16, 8], [0, 0, 0], [16, 16, 8]));
+        assert!(is_partial_texture_copy(false, 1, 1, [64, 64, 1], [0, 0, 0], [32, 64, 1]));
+        assert!(is_partial_texture_copy(false, 1, 1, [64, 64, 1], [4, 0, 0], [60, 64, 1]));
+        assert!(is_partial_texture_copy(false, 4, 1, [64, 64, 1], [0, 0, 0], [64, 64, 1]));
+        assert!(is_partial_texture_copy(false, 1, 6, [64, 64, 1], [0, 0, 0], [64, 64, 1]));
     }
 }

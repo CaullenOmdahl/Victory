@@ -494,16 +494,14 @@ impl State {
         }
     }
 
-    /// Goes on in another host list, open: gives it the state set so far.
-    pub(crate) fn continue_in(&mut self, list: &HostList) {
+    /// Restores bindings after an internal pass runs on the same host list,
+    /// leaving list-local table caches (`fresh_tables`, `fresh_records`,
+    /// `large_tables`) intact.
+    pub(crate) fn host_state_lost(&mut self, list: &HostList) {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
         self.host_targets = None;
-        // Making one refreshes what it names, which is each list's own work.
-        self.fresh_tables.clear();
-        self.fresh_records.clear();
-        self.large_tables.clear();
         if self.topology != 0 {
             self.set_topology(list, self.topology);
         }
@@ -522,6 +520,15 @@ impl State {
         if let Some((targets, depth)) = self.fixed.views.take() {
             self.bind_targets(list, targets, depth);
         }
+    }
+
+    /// Goes on in another host list, open: gives it the state set so far.
+    pub(crate) fn continue_in(&mut self, list: &HostList) {
+        // Making one refreshes what it names, which is each list's own work.
+        self.fresh_tables.clear();
+        self.fresh_records.clear();
+        self.large_tables.clear();
+        self.host_state_lost(list);
     }
 
     pub(crate) fn set_viewports(&mut self, list: &HostList, items: &[D3D12_VIEWPORT]) {
@@ -1167,7 +1174,7 @@ impl State {
         // title's state goes back on the list.
         let lit = self.ambient(list, p);
         if crate::twin::resolve(list) | lit {
-            self.continue_in(list);
+            self.host_state_lost(list);
         }
     }
 
@@ -2094,7 +2101,7 @@ impl State {
             list.count_work();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             if crate::twin::resolve(list) {
-                self.continue_in(list);
+                self.host_state_lost(list);
             }
         } else {
             list.count_work();
@@ -2612,6 +2619,43 @@ mod table_stage_tests {
         assert_eq!(state.dynamic[0].2, 5);
         drop(state);
         crate::object::slot::<extern "system" fn(This) -> u32>(title_heap, 0x10)(title_heap);
+        list.close();
+    }
+
+    #[test]
+    fn host_state_lost_preserves_table_caches_while_continue_in_clears_them() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let list = host.new_list().expect("a host list");
+        let mut state = State::default();
+        state.host_pipeline = 0x1111;
+        state.host_roots = [0x2222, 0x3333];
+        state.host_heaps = [0x4444, 0x5555];
+        state.fresh_tables.insert(
+            7,
+            Fresh {
+                table: 99,
+                n: 2,
+                at: 0,
+                first: 3,
+            },
+        );
+        state.fresh_records.push([1, 2, 3]);
+        state.large_tables.insert(7, vec![(vec![[1, 2, 3]], 3)]);
+
+        state.host_state_lost(&list);
+        assert_eq!(state.host_pipeline, 0);
+        assert_eq!(state.host_roots, [0, 0]);
+        assert_eq!(state.host_heaps, [0, 0]);
+        assert_eq!(state.fresh_tables.len(), 1);
+        assert_eq!(state.fresh_records.len(), 1);
+        assert_eq!(state.large_tables.len(), 1);
+
+        state.continue_in(&list);
+        assert!(state.fresh_tables.is_empty());
+        assert!(state.fresh_records.is_empty());
+        assert!(state.large_tables.is_empty());
         list.close();
     }
 }
