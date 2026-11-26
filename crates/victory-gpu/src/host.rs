@@ -1178,23 +1178,23 @@ struct Deferred {
     kept: Vec<windows::core::IUnknown>,
     /// The host pipelines `bind_pipeline` kept (by address), so a pipeline
     /// the list binds again is not kept again.
-    bound: std::collections::HashSet<usize>,
+    bound: crate::fx::Set<usize>,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
-    refreshed: std::collections::HashSet<(usize, usize, usize)>,
+    refreshed: crate::fx::Set<(usize, usize, usize)>,
     /// Buffer ranges declared written by shaders since the last title copy
     /// (host copy, address, bytes): declaring them again would change nothing.
-    gpu_written: std::collections::HashSet<(usize, usize, usize)>,
+    gpu_written: crate::fx::Set<(usize, usize, usize)>,
     /// Upload memory filled from title memory since the last title write
     /// (source, bytes): its host address, which a second fill would find
     /// holding the same bytes.
-    filled: std::collections::HashMap<(usize, usize), u64>,
+    filled: crate::fx::Map<(usize, usize), u64>,
     /// View heaps the list's draws index directly (`ResourceDescriptorHeap[]`),
     /// and whether any of their shaders may write memory: their slots are
     /// brought up to date once per submission, after every other step.
     bindless: Vec<(std::sync::Arc<crate::descriptor::host::HostHeap>, bool)>,
     /// Textures whose contents the list brings up to date.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::fx::Set<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -1700,7 +1700,7 @@ impl Host {
             Vec::new();
         let mut cpu_back: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
         // A copy is either a card's or not, so one set of ranges serves both.
-        let mut declared = std::collections::HashSet::new();
+        let mut declared = crate::fx::Set::default();
         for list in runs {
             for step in &list.deferred().copies {
                 if let Step::GpuWrite(shadow, address, len) = step
@@ -3940,7 +3940,7 @@ struct Batch {
     /// The same of sparse copies.
     pieces: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
-    textures: std::collections::HashSet<usize>,
+    textures: crate::fx::Set<usize>,
     /// View heaps the submission's draws index directly, and whether their
     /// shaders may write memory.
     bindless: Vec<(std::sync::Arc<crate::descriptor::host::HostHeap>, bool)>,
@@ -4107,7 +4107,7 @@ impl Early {
         if first.is_empty() {
             return;
         }
-        let mut used = std::collections::HashSet::new();
+        let mut used = crate::fx::Set::default();
         if late {
             for list in runs {
                 let states = list.states.lock().unwrap_or_else(|e| e.into_inner());
@@ -4907,6 +4907,15 @@ impl Meter {
                 crate::descriptor::host::BACKLOG[1].load(Ordering::Relaxed),
                 making = crate::pipeline::making()
             );
+            {
+                let reuses = crate::shadow::REUSES.load(Ordering::Relaxed);
+                let (windows, window_bytes) = crate::shadow::loose_stats();
+                tracing::info!(
+                    "loose windows: {windows} ({:.0} MB, never freed), {reuses} covered by a wider \
+                     one since start",
+                    window_bytes as f64 / 1e6,
+                );
+            }
             #[cfg(feature = "diagnostics")]
             {
                 tracing::info!(

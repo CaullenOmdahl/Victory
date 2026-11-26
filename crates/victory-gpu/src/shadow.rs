@@ -51,10 +51,10 @@ pub(crate) struct Shadow {
     /// copied either way.
     direct: Option<Direct>,
     /// Ranges that cannot be watched, with the frame they were copied in.
-    unwatched: Mutex<std::collections::HashMap<(usize, usize), u64>>,
+    unwatched: Mutex<crate::fx::Map<(usize, usize), u64>>,
     /// Ranges already guarded and copied at `region_epoch(from, to)` (O(1) fast
     /// path when no guard fault/remap/rewrite occurred in those 64 MiB regions).
-    clean_spans: Mutex<std::collections::HashMap<(usize, usize), u64>>,
+    clean_spans: Mutex<crate::fx::Map<(usize, usize), u64>>,
     /// The buffer has memory only where it was brought up to date.
     sparse: Option<Sparse>,
     /// Device-local VRAM mirror (`DEFAULT`) + Wave64 GPU hash state (`card.rs`).
@@ -128,7 +128,21 @@ fn pooled(n: usize) -> Vec<u8> {
         .map(|(i, _)| i);
     let mut v = match fit {
         Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+        None => {
+            // `Vec::with_capacity` aborts when the allocation fails: try it
+            // first, and on failure free the idle buffers (none fits) before
+            // one last attempt, which still aborts if that fails too.
+            let mut v = Vec::new();
+            if v.try_reserve_exact(n).is_err() && !pool.is_empty() {
+                tracing::warn!(
+                    bytes = n,
+                    "snapshot allocation failed; freeing the idle pool"
+                );
+                pool.clear();
+            }
+            v.reserve_exact(n);
+            v
+        }
     };
     v.clear();
     v
@@ -2531,14 +2545,14 @@ fn lookup_cache() -> bool {
 
 struct FindCache {
     generation: u64,
-    map: std::collections::HashMap<(u64, u64), Weak<Shadow>>,
+    map: crate::fx::Map<(u64, u64), Weak<Shadow>>,
 }
 
 impl Default for FindCache {
     fn default() -> Self {
         Self {
             generation: u64::MAX,
-            map: std::collections::HashMap::new(),
+            map: crate::fx::Map::default(),
         }
     }
 }
@@ -2765,7 +2779,20 @@ pub(crate) fn find_reaching(address: u64, reach: u64) -> Option<Arc<Shadow>> {
 const WINDOW: u64 = 4 << 20;
 
 /// Copies of title memory outside buffers, by (start, length).
+/// Copies of title memory outside buffers, by (start, length).
 static LOOSE: Mutex<BTreeMap<(u64, u64), Arc<Shadow>>> = Mutex::new(BTreeMap::new());
+
+/// Windows a covering window answered instead of a new copy (diagnostics).
+pub(crate) static REUSES: AtomicU64 = AtomicU64::new(0);
+
+/// The loose windows by count and bytes (diagnostics): the shared segment's
+/// own content; the copies are never freed, so what this reaches is what
+/// the segment carries until the process ends.
+pub(crate) fn loose_stats() -> (usize, u64) {
+    let map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    let bytes = map.iter().map(|((_, len), _)| *len).sum();
+    (map.len(), bytes)
+}
 
 fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     if let Some(copy) = sparse(address, end) {
@@ -2774,6 +2801,9 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
     let start = address & !(WINDOW - 1);
     let len = end.next_multiple_of(WINDOW) - start;
     let mut map = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(shadow) = map.get(&(start, len)) {
+        return Some(shadow.clone());
+    }
     // Any window copied already that holds the range: a range crossing a
     // window's end used to get a second copy of the same bytes.
     if let Some(shadow) = map
@@ -2783,6 +2813,12 @@ fn loose(address: u64, end: u64) -> Option<Arc<Shadow>> {
         .find(|((s, l), _)| *s <= address && s + l >= end)
         .map(|(_, shadow)| shadow.clone())
     {
+        REUSES.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(
+            start = format_args!("{start:#x}"),
+            len,
+            "loose memory covered by a wider window"
+        );
         return Some(shadow);
     }
     let h = host()?;
@@ -2857,6 +2893,87 @@ pub(crate) fn near(va: u64) -> String {
 mod tests {
     use super::*;
     use std::ops::Range;
+
+    /// A loose window wider than a later ask covers it: the narrower ask
+    /// reuses the wider copy instead of making another host buffer for
+    /// memory a copy already spans (the shared segment's bulk was these).
+    #[test]
+    fn a_wider_loose_window_covers_a_later_smaller_ask() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        // One window-aligned pair of pages inside a reservation that
+        // guarantees the addresses, found free again (other tests allocate
+        // meanwhile: tried again if taken).
+        let pair = (0..8)
+            .find_map(|_| {
+                // SAFETY: a fresh reservation, released at once; then the
+                // two window-aligned allocations where it was, kept (as the
+                // other tests' pools: their copies must not name memory a
+                // later test reuses).
+                unsafe {
+                    let p = VirtualAlloc(
+                        std::ptr::null(),
+                        3 * WINDOW as usize,
+                        MEM_RESERVE,
+                        PAGE_READWRITE,
+                    ) as usize;
+                    if p == 0 {
+                        return None;
+                    }
+                    VirtualFree(p as *mut _, 0, MEM_RELEASE);
+                    let aligned = p.next_multiple_of(WINDOW as usize);
+                    let at = |q: usize| {
+                        VirtualAlloc(
+                            q as *const _,
+                            WINDOW as usize,
+                            MEM_RESERVE | MEM_COMMIT,
+                            PAGE_READWRITE,
+                        ) as usize
+                    };
+                    let (one, two) = (at(aligned), at(aligned + WINDOW as usize));
+                    if one == aligned && two == aligned + WINDOW as usize {
+                        return Some((one, two));
+                    }
+                    [one, two].into_iter().filter(|&q| q != 0).for_each(|q| {
+                        VirtualFree(q as *mut _, 0, MEM_RELEASE);
+                    });
+                    None
+                }
+            })
+            .expect("a window-aligned pair of pages");
+        let (one, two) = (pair.0 as u64, pair.1 as u64);
+        let Some(wide) = find(one, 2 * WINDOW) else {
+            return; // no host GPU here
+        };
+        let before = REUSES.load(Ordering::Relaxed);
+        let narrow = find(two, WINDOW);
+        let Some(narrow) = narrow else {
+            return; // no host GPU here (the wide one already was)
+        };
+        assert!(
+            Arc::ptr_eq(&wide, &narrow),
+            "the narrower ask reuses the covering window"
+        );
+        assert_eq!(
+            REUSES.load(Ordering::Relaxed),
+            before + 1,
+            "the reuse is counted"
+        );
+        // An ask the wide window does not reach still gets its own copy.
+        let beyond = find(two, 2 * WINDOW);
+        if let Some(beyond) = beyond {
+            assert!(
+                !Arc::ptr_eq(&wide, &beyond),
+                "an ask past the covering window makes its own"
+            );
+            assert_eq!(
+                REUSES.load(Ordering::Relaxed),
+                before + 1,
+                "no reuse for an ask past the window"
+            );
+        }
+    }
 
     #[test]
     fn partial_match_leaves_unchecked_bytes_visible() {
