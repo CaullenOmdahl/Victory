@@ -1217,6 +1217,48 @@ struct Deferred {
     budget_zeroed: bool,
 }
 
+impl Deferred {
+    /// Clears all per-submission vectors and maps while preserving steady-state
+    /// capacities across list resets, shrinking only extreme loading outliers.
+    fn clear(&mut self) {
+        self.copies.clear();
+        self.readbacks.clear();
+        self.uploads.clear();
+        self.kept.clear();
+        self.bound.clear();
+        self.refreshed.clear();
+        self.gpu_written.clear();
+        self.filled.clear();
+        self.bindless.clear();
+        self.textures.clear();
+        self.writes.clear();
+        self.waits.clear();
+        self.marks.clear();
+        self.wait_marks.clear();
+        self.prefilled = 0;
+        self.early = 0;
+        self.budget_zeroed = false;
+        if self.copies.capacity() > 16_384 {
+            self.copies.shrink_to(4096);
+        }
+        if self.refreshed.capacity() > 8_192 {
+            self.refreshed.shrink_to(1024);
+        }
+        if self.gpu_written.capacity() > 8_192 {
+            self.gpu_written.shrink_to(1024);
+        }
+        if self.filled.capacity() > 8_192 {
+            self.filled.shrink_to(1024);
+        }
+        if self.textures.capacity() > 8_192 {
+            self.textures.shrink_to(1024);
+        }
+        if self.bound.capacity() > 8_192 {
+            self.bound.shrink_to(1024);
+        }
+    }
+}
+
 impl Host {
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
@@ -2527,7 +2569,7 @@ impl HostList {
             h.wait_fence(fence);
         }
         self.release_kept();
-        *self.deferred() = Deferred::default();
+        self.deferred().clear();
         *self.work.lock().unwrap_or_else(|e| e.into_inner()) = 0;
         self.writes.store(0, Ordering::Relaxed);
         {
@@ -6253,6 +6295,38 @@ mod copy_order {
         for &p in &pools {
             free_page(p);
         }
+    }
+
+    #[test]
+    fn deferred_clear_reuses_steady_state_and_shrinks_outliers() {
+        let mut d = super::Deferred {
+            prefilled: 5,
+            early: 3,
+            budget_zeroed: true,
+            ..Default::default()
+        };
+        d.copies.reserve(20_000);
+        d.refreshed.reserve(10_000);
+        d.gpu_written.reserve(10_000);
+        d.filled.reserve(10_000);
+        d.textures.reserve(10_000);
+        d.bound.reserve(10_000);
+        d.marks.reserve(256);
+        d.marks.push(42);
+        d.bound.insert(7);
+        d.clear();
+        assert_eq!(d.prefilled, 0);
+        assert_eq!(d.early, 0);
+        assert!(!d.budget_zeroed);
+        assert!(d.marks.is_empty());
+        assert!(d.bound.is_empty());
+        assert!(d.marks.capacity() >= 256);
+        assert!(d.copies.capacity() <= 8192);
+        assert!(d.refreshed.capacity() <= 2048);
+        assert!(d.gpu_written.capacity() <= 2048);
+        assert!(d.filled.capacity() <= 2048);
+        assert!(d.textures.capacity() <= 2048);
+        assert!(d.bound.capacity() <= 2048);
     }
 }
 

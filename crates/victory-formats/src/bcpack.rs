@@ -263,6 +263,13 @@ impl Tables {
 /// the block count. The stream carries no size: bytes after the last one the
 /// lanes need are ignored, a stream that runs out is an error.
 pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(), Error> {
+    const W1: [u8; 12] = [7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7];
+    const W3: [u8; 12] = [3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7];
+    const W4: [u8; 12] = [7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5];
+    const W5: [u8; 12] = [3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5];
+    const W6: [u8; 16] = [3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4];
+    const W7: [u8; 16] = [3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4];
+
     let block = match bc {
         1 | 4 => 8,
         3 | 5 | 6 | 7 => 16,
@@ -272,29 +279,43 @@ pub fn decode(bc: u8, src: &[u8], dst: &mut [u8], tables: &Tables) -> Result<(),
         return Err(Error("destination is not a whole number of blocks"));
     }
     let blocks = dst.len() / block;
-    let (widths, per): (&[u8], usize) = match bc {
-        1 => (&[7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7], 1),
-        3 => (&[3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7], 2),
-        4 => (&[7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 1),
-        5 => (&[3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5], 2),
-        6 => (&[3, 3, 7, 7, 7, 4, 4, 4, 5, 5, 5, 7, 7, 7, 7, 4], 2),
-        _ => (&[3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4], 2),
-    };
-    let stride = widths.len() * per;
-    let mut records = vec![0u8; blocks * stride];
-    let mut next = src.iter().copied();
-    lanes(tables, widths, per, blocks, |_| next.next(), &mut records)?;
-    let records = records.chunks_exact(stride);
-    let out = dst.chunks_exact_mut(block);
-    let t = tables;
-    match bc {
-        1 => plain(records, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
-        3 => plain(records, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
-        4 => plain(records, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
-        5 => plain(records, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
-        6 => bc6(records, out, &t.bc6),
-        _ => bc7(records, out, t),
+    let stride = if bc >= 6 { 32 } else if matches!(bc, 3 | 5) { 24 } else { 12 };
+    thread_local! {
+        static RECORDS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
+    RECORDS.with_borrow_mut(|records| {
+        records.resize(blocks * stride, 0);
+        let mut next = src.iter().copied();
+        let res = match bc {
+            1 => lanes_const::<12, 1>(tables, &W1, blocks, |_| next.next(), records),
+            3 => lanes_const::<12, 2>(tables, &W3, blocks, |_| next.next(), records),
+            4 => lanes_const::<12, 1>(tables, &W4, blocks, |_| next.next(), records),
+            5 => lanes_const::<12, 2>(tables, &W5, blocks, |_| next.next(), records),
+            6 => lanes_const::<16, 2>(tables, &W6, blocks, |_| next.next(), records),
+            _ => lanes_const::<16, 2>(tables, &W7, blocks, |_| next.next(), records),
+        };
+        let out_res = match res {
+            Ok(()) => {
+                let recs = records.chunks_exact(stride);
+                let out = dst.chunks_exact_mut(block);
+                let t = tables;
+                match bc {
+                    1 => plain(recs, out, &t.bc1, &BC1, |s| bc1_residual(t, s), bc1_pack),
+                    3 => plain(recs, out, &t.bc3, &BC3, |s| bc3_residual(t, s), bc3_pack),
+                    4 => plain(recs, out, &t.bc4, &BC4, |s| bc4_residual(t, s), bc4_pack),
+                    5 => plain(recs, out, &t.bc5, &BC5, |s| bc5_residual(t, s), bc5_pack),
+                    6 => bc6(recs, out, &t.bc6),
+                    _ => bc7(recs, out, t),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        if records.capacity() > (16 << 20) {
+            records.clear();
+            records.shrink_to(0);
+        }
+        out_res
+    })
 }
 
 // Lanes.
@@ -319,6 +340,7 @@ struct Lane {
 impl Lane {
     /// One step: take the latched byte (header, length or payload) and
     /// decode at most one symbol.
+    #[inline(always)]
     fn step(&mut self, t: &Tables) -> Result<(), Error> {
         if self.phase != 3 {
             let Some(b) = self.latch.take() else {
@@ -359,8 +381,9 @@ impl Lane {
         }
         self.need = self.left != 0 && self.latch.is_none();
         if x > LOW {
-            let freq = &t.freq[usize::from(self.model)];
-            let start = &t.start[usize::from(self.model)];
+            let model = usize::from(self.model) & 0x7f;
+            let freq = &t.freq[model];
+            let start = &t.start[model];
             let slot = x & 0xffff;
             // The bucket: starts are ascending, and 65536 past the model's last.
             let b = bucket_of(t, self.model, slot);
@@ -372,7 +395,7 @@ impl Lane {
                 (0, freq[0] - 1, slot.wrapping_sub(1))
             } else {
                 let offset = slot - start[b];
-                let q = ((u64::from(offset) * t.recip[usize::from(self.model)][b]) >> 32) as u32;
+                let q = ((u64::from(offset) * t.recip[model][b]) >> 32) as u32;
                 ((1u32 << (b - 1)) + q, freq[b], offset - q * freq[b])
             };
             self.x = (x >> 16).wrapping_mul(f).wrapping_add(rem);
@@ -396,46 +419,49 @@ impl Lane {
 /// The bucket holding `slot` (below 65536): the last whose start is at or
 /// below it. The window table gives the bucket of the window's first slot;
 /// later buckets that start inside the window are stepped over.
-#[inline]
+#[inline(always)]
 fn bucket_of(t: &Tables, model: u8, slot: u32) -> usize {
-    let start = &t.start[usize::from(model)];
-    let mut b = usize::from(t.bucket[usize::from(model)][(slot >> 8) as usize]);
+    let model = usize::from(model) & 0x7f;
+    let start = &t.start[model];
+    let mut b = usize::from(t.bucket[model][(slot >> 8) as usize]);
     while start[b + 1] <= slot {
         b += 1;
     }
     b
 }
 
-/// Decodes `per` symbols per block on every lane into `records` (one record
-/// of `widths.len() * per` symbols per block), taking input from `fetch`
+/// Decodes `PER` symbols per block on every lane into `records` (one record
+/// of `N * PER` symbols per block), taking input from `fetch`
 /// (given the lane that takes the byte) in the order of the schedule: each
 /// round the lanes step in order and take at most 8 bytes between them.
-// shortcut: one lane step at a time (BC1 roughly 30-60 MB/s, BC7 15-20 MB/s
-// on one core); if texture streaming needs more, run the schedule only to
-// split the input per lane and decode the lanes apart.
-fn lanes(
+fn lanes_const<const N: usize, const PER: usize>(
     t: &Tables,
-    widths: &[u8],
-    per: usize,
+    widths: &[u8; N],
     blocks: usize,
     mut fetch: impl FnMut(usize) -> Option<u8>,
     records: &mut [u8],
 ) -> Result<(), Error> {
-    let mut lanes = [Lane::default(); 16];
-    let lanes = &mut lanes[..widths.len()];
+    let mut lanes = [Lane::default(); N];
     for (lane, &width) in lanes.iter_mut().zip(widths) {
         lane.width = width;
         lane.need = true;
     }
-    let stride = widths.len() * per;
-    let full = (1u32 << widths.len()) - 1;
+    let stride = N * PER;
+    let full = (1u32 << N) - 1;
+    let total = blocks * PER;
     let (mut pos, mut done, mut idle) = (0, 0u32, 0);
-    // Where symbol `pos` of lane 0 goes; lane j's is `per * j` further on.
+    // Where symbol `pos` of lane 0 goes; lane j's is `PER * j` further on.
     let mut at = 0;
-    while pos < blocks * per {
+    while pos < total {
+        let last_pos = pos + 1 == total;
         let (mut taken, mut moved) = (0, false);
         for (j, lane) in lanes.iter_mut().enumerate() {
             let bit = 1 << j;
+            // On the final symbol a lane that has already delivered must stop
+            // stepping and fetching so it cannot consume another lane's tail bytes.
+            if last_pos && (done & bit) != 0 {
+                continue;
+            }
             let before = taken;
             if !lane.stalled {
                 lane.step(t)?;
@@ -452,15 +478,15 @@ fn lanes(
             if !lane.stalled
                 && let Some(sym) = lane.out.take()
             {
-                records[at + j * per] = sym;
+                records[at + j * PER] = sym;
                 done |= bit;
                 moved = true;
             }
         }
         if done == full {
             pos += 1;
-            at += if pos.is_multiple_of(per) {
-                stride - per + 1
+            at += if pos.is_multiple_of(PER) {
+                stride - PER + 1
             } else {
                 1
             };
@@ -476,9 +502,27 @@ fn lanes(
     Ok(())
 }
 
+#[cfg(test)]
+fn lanes(
+    t: &Tables,
+    widths: &[u8],
+    per: usize,
+    blocks: usize,
+    fetch: impl FnMut(usize) -> Option<u8>,
+    records: &mut [u8],
+) -> Result<(), Error> {
+    match (widths.len(), per) {
+        (12, 1) => lanes_const::<12, 1>(t, widths.try_into().unwrap(), blocks, fetch, records),
+        (12, 2) => lanes_const::<12, 2>(t, widths.try_into().unwrap(), blocks, fetch, records),
+        (16, 2) => lanes_const::<16, 2>(t, widths.try_into().unwrap(), blocks, fetch, records),
+        _ => Err(Error("unsupported lane layout")),
+    }
+}
+
 // Blocks.
 
 /// The record's endpoint and index references.
+#[inline(always)]
 fn references(s: &[u8], paired: bool) -> (usize, usize) {
     let (d, ix) = if paired {
         (interleave(s[0], s[1]), interleave(s[2], s[3]))
@@ -489,10 +533,15 @@ fn references(s: &[u8], paired: bool) -> (usize, usize) {
     (usize::from(ix.wrapping_add(delta)), usize::from(ix))
 }
 
+const SPREAD4: [u8; 16] = [
+    0x00, 0x01, 0x04, 0x05, 0x10, 0x11, 0x14, 0x15,
+    0x40, 0x41, 0x44, 0x45, 0x50, 0x51, 0x54, 0x55,
+];
+
 /// Two 4-bit symbols, the first on the even bits.
+#[inline(always)]
 fn interleave(a: u8, b: u8) -> u8 {
-    let spread = |v: u8| (0..4).fold(0, |acc, k| acc | (v >> k & 1) << (2 * k));
-    spread(a) | spread(b) << 1
+    SPREAD4[usize::from(a & 0xf)] | (SPREAD4[usize::from(b & 0xf)] << 1)
 }
 
 /// Block `i`'s reference `r`: 0 none, else `r` blocks back, before the first
@@ -1635,5 +1684,28 @@ mod tests {
         assert_eq!(bc7_precision(4 | (1 << 3)), [6, 5, 5, 5]);
         assert_eq!(bc7_precision(5), [7, 7, 7, 8]);
         assert_eq!(bc7_precision(5 | (2 << 3)), [7, 8, 7, 7]);
+    }
+
+    #[test]
+    fn interleave_table_matches_bit_spread() {
+        let spread = |v: u8| (0..4).fold(0u8, |acc, k| acc | (v >> k & 1) << (2 * k));
+        for a in 0u8..16 {
+            for b in 0u8..16 {
+                assert_eq!(interleave(a, b), spread(a) | (spread(b) << 1));
+            }
+        }
+    }
+
+    #[test]
+    fn completed_lane_does_not_fetch_past_final_symbol() {
+        let t = Tables::parse(&tables()).unwrap();
+        let records = random_records(&BC4_LANES, 1, 8, false);
+        let src = stream(&t, &BC4_LANES, 1, &records);
+        let mut next = src.iter().copied();
+        let mut got = vec![0u8; 8 * BC4_LANES.len()];
+        lanes_const::<12, 1>(&t, &BC4_LANES, 8, |_| next.next(), &mut got).unwrap();
+        assert_eq!(got, records.concat());
+        // With exact schedule bytes fed via a shared iterator, no completed lane steals tail bytes.
+        assert_eq!(next.count(), 0);
     }
 }
