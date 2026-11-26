@@ -155,6 +155,9 @@ pub(crate) struct Lowered {
     tertiary_i32_opcodes: Vec<i64>,
     #[cfg(test)]
     pub unary_f32_opcodes: Vec<i64>,
+    /// The constant table's first byte and dwords, if the program has one.
+    #[cfg(test)]
+    pub code_table: Option<(u32, Vec<u32>)>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -693,6 +696,9 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
+    /// The table's dwords, for a test to check where it starts.
+    #[cfg(test)]
+    code_words: Vec<u32>,
     trig_preop_table: Option<V>,
     /// Private (scratch) memory: the lane's array and its dwords.
     scratch: Option<(V, u32)>,
@@ -1670,6 +1676,8 @@ impl<'a> Lower<'a> {
             ordered: None,
             made: Default::default(),
             code_table: None,
+            #[cfg(test)]
+            code_words: Vec::new(),
             trig_preop_table: None,
             scratch: None,
             counters: HashMap::default(),
@@ -1705,6 +1713,10 @@ impl<'a> Lower<'a> {
                             _ => None,
                         })
                     }))
+                    // A built descriptor's base is not the byte a load through it
+                    // reads: that is the base plus the load's own offset, which can
+                    // lie below the base.
+                    .chain(self.x.res.code_reads.iter())
                     .filter(|a| a.param == CODE)
                     .collect();
                 let lowest = addresses
@@ -1733,6 +1745,10 @@ impl<'a> Lower<'a> {
                 let g = self.s.m.constant_global("code", init);
                 let t = (g, first, words.len() as u32);
                 self.code_table = Some(t);
+                #[cfg(test)]
+                {
+                    self.code_words = words;
+                }
                 t
             }
         };
@@ -2307,6 +2323,8 @@ impl<'a> Lower<'a> {
             tertiary_i32_opcodes: self.s.m.written_call_opcodes("dx.op.tertiary.i32"),
             #[cfg(test)]
             unary_f32_opcodes: self.s.m.written_call_opcodes("dx.op.unary.f32"),
+            #[cfg(test)]
+            code_table: self.code_table.map(|t| (t.1, std::mem::take(&mut self.code_words))),
             stride_table,
             write_marks,
             dxil: self.s.finish(),
@@ -3867,8 +3885,19 @@ impl<'a> Lower<'a> {
     /// conversion rounds as it likes (toward zero on the RX 6700 XT and WARP).
     // shortcut: rounding toward +-infinity, or a mode not known at this
     // point (paths that set it differently join), rounds to nearest even.
+    /// Narrows a computed result with the rounding modes modelled by the
+    /// arithmetic paths. Only direct conversion (`v_cvt_f16_f32`) uses directed
+    /// rounding (`narrow16_in_mode`).
     fn narrow16(&mut self, f: V) -> V {
-        let rtz = self.mode16.round == Some(3);
+        let mode = if self.mode16.round == Some(3) { 3 } else { 0 };
+        self.narrow16_in_mode(f, mode)
+    }
+
+    /// `f` as an f16 in the low bits, rounded on the bits per `mode`
+    /// (`0` nearest even, `1` +inf, `2` -inf, `3` toward zero). f32 denormals
+    /// read as zero.
+    fn narrow16_in_mode(&mut self, f: V, mode: u8) -> V {
+        let rtz = mode == 3;
         let c = self.cur;
         let x = self.as_int(f);
         let k = |l: &mut Self, v: u32| l.s.m.i32(v);
@@ -3876,12 +3905,26 @@ impl<'a> Lower<'a> {
         let t = self.s.m.bin(c, Bin::LShr, x, k16);
         let m = k(self, 0x8000);
         let sign = self.s.m.bin(c, Bin::And, t, m);
+        // A directed mode increases the magnitude only toward its own sign.
+        let away = match mode {
+            1 | 2 => {
+                let zero = k(self, 0);
+                let p = if mode == 1 { pred::EQ } else { pred::NE };
+                Some(self.s.m.cmp(c, p, sign, zero))
+            }
+            _ => None,
+        };
         let m = k(self, 0x7FFF_FFFF);
         let a = self.s.m.bin(c, Bin::And, x, m);
         // Normal halves: the exponent rebased, the mantissa rounded.
         let bias = k(self, 0x3800_0000);
         let rebased = self.s.m.bin(c, Bin::Sub, a, bias);
-        let normal = if rtz {
+        let normal = if let Some(away) = away {
+            let (low, zero) = (k(self, 0x1FFF), k(self, 0));
+            let add = self.s.m.select(c, away, low, zero);
+            let up = self.s.m.bin(c, Bin::Add, rebased, add);
+            self.s.m.bin(c, Bin::LShr, up, k13)
+        } else if rtz {
             self.s.m.bin(c, Bin::LShr, rebased, k13)
         } else {
             let one = k(self, 1);
@@ -3892,7 +3935,15 @@ impl<'a> Lower<'a> {
             let up = self.s.m.bin(c, Bin::Add, up, lsb);
             self.s.m.bin(c, Bin::LShr, up, k13)
         };
-        let (inf, big) = (k(self, 0x7C00), k(self, if rtz { 0x7BFF } else { 0x7C00 }));
+        let inf = k(self, 0x7C00);
+        let max_finite = k(self, 0x7BFF);
+        let big = if let Some(away) = away {
+            self.s.m.select(c, away, inf, max_finite)
+        } else if rtz {
+            max_finite
+        } else {
+            inf
+        };
         let over = self.s.m.cmp(c, pred::IUGE, normal, inf);
         let normal = self.s.m.select(c, over, big, normal);
         let infinity = k(self, 0x7F80_0000);
@@ -3911,7 +3962,16 @@ impl<'a> Lower<'a> {
         let f32_denormal = self.s.m.cmp(c, pred::EQ, e, zero);
         let mant = self.s.m.select(c, f32_denormal, zero, mant);
         let q = self.s.m.bin(c, Bin::LShr, mant, s);
-        let den = if rtz {
+        let den = if let Some(away) = away {
+            let one = k(self, 1);
+            let below = self.s.m.bin(c, Bin::Shl, one, s);
+            let below = self.s.m.bin(c, Bin::Sub, below, one);
+            let rest = self.s.m.bin(c, Bin::And, mant, below);
+            let rest = self.s.m.cmp(c, pred::NE, rest, zero);
+            let up = self.s.m.bin(c, Bin::And, rest, away);
+            let up = self.s.m.cast(c, Cast::ZExt, up, self.s.t.i32);
+            self.s.m.bin(c, Bin::Add, q, up)
+        } else if rtz {
             q
         } else {
             let one = k(self, 1);
@@ -9789,7 +9849,11 @@ impl<'a> Lower<'a> {
             if v.clamp {
                 f = l.unary(7, f);
             }
-            let h = l.narrow16(f);
+            let h = if name == "v_cvt_f16_f32" {
+                l.narrow16_in_mode(f, l.mode16.round.unwrap_or_default())
+            } else {
+                l.narrow16(f)
+            };
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
@@ -14360,6 +14424,30 @@ mod tests {
         assert_eq!(code_table_start(&p, &[&computed, &fixed_after], 0), 8);
         assert_eq!(code_table_start(&p, &[&computed, &fixed_inside], 0), 0);
         assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
+    }
+
+    #[test]
+    fn the_code_table_starts_at_the_lowest_byte_a_load_reads() {
+        let mut words = vec![
+            0xBE88_1F00, // 0x00: s_getpc_b64 s[8:9]
+            0x8008_FF08,
+            0x0000_007C, // s_add_u32 s8, s8, 0x7c (the base is 0x80)
+            0x8209_8009, // s_addc_u32 s9, s9, 0
+            0xBE8A_0380, // s_mov_b32 s10, 0
+            0xBE8B_0380, // s_mov_b32 s11, 0
+            0xF420_0304,
+            0xFA1F_FFC0, // 0x18: s_buffer_load_dword s12, s[8:11], -64
+            0x7E02_030C, // 0x20: v_mov_b32 v1, s12
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+        ];
+        words.extend(std::iter::repeat_n(0xBF80_0000, 28));
+        words.push(S_ENDPGM);
+        assert_eq!(words.len() * 4, 0xa0);
+        let l = lower_with(&words, vec![], vec![]).unwrap();
+        let (first, dwords) = l.code_table.expect("a code table");
+        assert_eq!(first, 0x40, "the table starts at the load's byte");
+        assert_eq!(dwords, words[0x10..], "the table holds the code from 0x40 on");
     }
 
     /// Mesh output size as the validator counts it (53 programs were over

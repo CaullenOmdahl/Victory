@@ -136,6 +136,9 @@ pub struct Resources {
     /// every global memory access (`global_*`, the dynamic term per lane).
     pub scalar: Vec<(Site, Address)>,
     pub descriptors: Vec<Descriptor>,
+    /// Effective byte offsets read by fixed-offset `s_buffer_*` instructions
+    /// through a built [`CODE`] descriptor (may lie below the descriptor base).
+    pub code_reads: Vec<Address>,
     /// User SGPRs holding root parameters: value on entry, layout index,
     /// dword within the parameter.
     pub params: Vec<(Value, usize, u32)>,
@@ -216,7 +219,7 @@ pub fn track_with(
                 offset: inst.machine.offset,
                 what,
             };
-            let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
+            let mut descriptor = |op: &Operand, role| -> Result<Source, ShaderError> {
                 let buffer = matches!(
                     inst.fields,
                     Fields::Buffer { .. } | Fields::Smem { .. }
@@ -226,19 +229,23 @@ pub fn track_with(
                     found => found.map_err(fail)?,
                 };
                 first_lane.extend(t.first_lane_words(inst, op).unwrap_or_default());
-                out.descriptors.push(Descriptor { site, role, source });
-                Ok(())
+                out.descriptors.push(Descriptor {
+                    site,
+                    role,
+                    source: source.clone(),
+                });
+                Ok(source)
             };
             match &inst.fields {
                 Fields::Image { .. } if inst.name().starts_with("image_bvh") => {}
                 Fields::Image { rsrc, sampler, .. } => {
-                    descriptor(rsrc, Role::Resource)?;
+                    let _ = descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {
-                        descriptor(s, Role::Sampler)?;
+                        let _ = descriptor(s, Role::Sampler)?;
                     }
                 }
                 Fields::Buffer { rsrc, .. } => {
-                    descriptor(rsrc, Role::Resource)?;
+                    let _ = descriptor(rsrc, Role::Resource)?;
                     // Per-lane descriptors may be fetched from a buffer over
                     // the heap (see `Tracer::fetched`).
                     if inst.name().starts_with("buffer_load_dword")
@@ -247,8 +254,27 @@ pub fn track_with(
                         out.scalar.push((site, address));
                     }
                 }
-                Fields::Smem { base, .. } if inst.name().starts_with("s_buffer_") => {
-                    descriptor(base, Role::Resource)?;
+                Fields::Smem {
+                    base,
+                    offset,
+                    soffset,
+                    ..
+                } if inst.name().starts_with("s_buffer_") => {
+                    let source = descriptor(base, Role::Resource)?;
+                    // A load through a descriptor built around the code table reads the
+                    // descriptor's base plus the load's own byte offset, which can lie
+                    // before the base (`s_sub_u32` against `s_getpc_b64`).
+                    if let Source::Built { address, .. } = source
+                        && address.param == CODE
+                        && matches!(soffset, Operand::Scalar { code: NULL, .. })
+                    {
+                        out.code_reads.push(Address {
+                            param: CODE,
+                            offset: address.offset.wrapping_add(*offset as u32),
+                            dynamic: address.dynamic,
+                            includes_base: address.includes_base,
+                        });
+                    }
                 }
                 Fields::Smem {
                     base,
