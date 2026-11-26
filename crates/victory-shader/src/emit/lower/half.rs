@@ -106,26 +106,31 @@ impl Lower<'_> {
         self.s.m.select(c, bad, zero, r)
     }
 
+    /// Applies VOP3 `abs` and `neg` sign-bit modifiers for source `k` to 16-bit bits.
+    pub(super) fn half_bits_mods(&mut self, mut x: V, abs: u8, neg: u8, k: usize) -> V {
+        let c = self.cur;
+        if abs >> k & 1 != 0 {
+            let m = self.s.m.i32(0x7FFF);
+            x = self.s.m.bin(c, Bin::And, x, m);
+        }
+        if neg >> k & 1 != 0 {
+            let m = self.s.m.i32(0x8000);
+            x = self.s.m.bin(c, Bin::Xor, x, m);
+        }
+        x
+    }
+
     /// An f16 source's bits (high half zero) with its abs/neg modifiers.
     pub(super) fn half_bits_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let mut x = self.half_src(inst, k)?;
-        let c = self.cur;
-        if v.abs >> k & 1 != 0 {
-            let m = self.s.m.i32(0x7FFF);
-            x = self.s.m.bin(c, Bin::And, x, m);
-        }
-        if v.neg >> k & 1 != 0 {
-            let m = self.s.m.i32(0x8000);
-            x = self.s.m.bin(c, Bin::Xor, x, m);
-        }
-        Ok(x)
+        let x = self.half_src(inst, k)?;
+        Ok(self.half_bits_mods(x, v.abs, v.neg, k))
     }
 
     /// The accumulator of `v_fmac_f16`/`v_mac_f16`: the written destination half,
-    /// as bits (high half zero).
+    /// as bits (high half zero), with its VOP3 `abs`/`neg` modifiers (`src2`).
     pub(super) fn mac_acc_bits(&mut self, inst: &Inst) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -142,7 +147,8 @@ impl Lower<'_> {
             x
         };
         let m = self.s.m.i32(0xFFFF);
-        Ok(self.s.m.bin(c, Bin::And, x, m))
+        let x = self.s.m.bin(c, Bin::And, x, m);
+        Ok(self.half_bits_mods(x, v.abs, v.neg, 2))
     }
 
     /// `valu16_op` in native `half` when `native16()` holds and `v.omod == 0`.

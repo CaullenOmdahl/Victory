@@ -147,6 +147,8 @@ pub(crate) struct Lowered {
     pub instructions: usize,
     #[cfg(test)]
     tertiary_i32_opcodes: Vec<i64>,
+    #[cfg(test)]
+    pub unary_f32_opcodes: Vec<i64>,
 }
 
 pub(crate) struct Parts<'a> {
@@ -2278,6 +2280,8 @@ impl<'a> Lower<'a> {
             instructions: self.s.m.written_instructions(),
             #[cfg(test)]
             tertiary_i32_opcodes: self.s.m.written_call_opcodes("dx.op.tertiary.i32"),
+            #[cfg(test)]
+            unary_f32_opcodes: self.s.m.written_call_opcodes("dx.op.unary.f32"),
             stride_table,
             dxil: self.s.finish(),
             user_data,
@@ -3608,7 +3612,10 @@ impl<'a> Lower<'a> {
     /// `operand` gives, whose low half is 0.
     fn f16_operand(&mut self, inst: &Inst, op: &Operand) -> Result<V, Why> {
         match *op {
-            Operand::Const(c @ 240..=248) => Ok(self.s.m.i32(inline_f16(c))),
+            Operand::Const(c @ 240..=248) => {
+                let h = inline_f16(c);
+                Ok(self.s.m.i32(h | (h << 16)))
+            }
             _ => self.operand(inst, op),
         }
     }
@@ -3675,6 +3682,17 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, op, t, right)
     }
 
+    fn f32_mods(&mut self, mut f: V, abs: u8, neg: u8, k: usize) -> V {
+        if abs >> k & 1 != 0 {
+            f = self.unary(6, f);
+        }
+        if neg >> k & 1 != 0 {
+            let z = self.s.m.f32(0x8000_0000);
+            f = self.s.m.bin(self.cur, Bin::Sub, z, f);
+        }
+        f
+    }
+
     /// A float source with its abs/neg modifiers.
     fn fsrc(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
@@ -3682,7 +3700,7 @@ impl<'a> Lower<'a> {
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
         let selected = Self::sdwa_src(inst, k);
-        let mut f = match op {
+        let f = match op {
             _ if selected.is_some() => {
                 let (sel, sext) = selected.expect("checked");
                 let x = self.operand(inst, &op)?;
@@ -3715,14 +3733,7 @@ impl<'a> Lower<'a> {
                 self.as_float(x)
             }
         };
-        if v.abs >> k & 1 != 0 {
-            f = self.unary(6, f);
-        }
-        if v.neg >> k & 1 != 0 {
-            let z = self.s.m.f32(0x8000_0000);
-            f = self.s.m.bin(self.cur, Bin::Sub, z, f);
-        }
-        Ok(f)
+        Ok(self.f32_mods(f, v.abs, v.neg, k))
     }
 
     fn src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
@@ -8827,6 +8838,7 @@ impl<'a> Lower<'a> {
                         self.as_float(x)
                     }
                 };
+                let acc = self.f32_mods(acc, v.abs, v.neg, 2);
                 let r = match name {
                     "v_fmac_f32" => self.fmad(a, bb, acc),
                     "v_mac_f32" => {
@@ -9594,17 +9606,10 @@ impl<'a> Lower<'a> {
         };
         let h = self.half_src(inst, k)?;
         let f32t = self.s.t.f32;
-        let mut f = self
+        let f = self
             .s
             .op(self.cur, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
-        if v.abs >> k & 1 != 0 {
-            f = self.unary(6, f);
-        }
-        if v.neg >> k & 1 != 0 {
-            let z = self.s.m.f32(0x8000_0000);
-            f = self.s.m.bin(self.cur, Bin::Sub, z, f);
-        }
-        Ok(f)
+        Ok(self.f32_mods(f, v.abs, v.neg, k))
     }
 
     /// Writes a 16-bit result (low bits of `x`) into the destination's low
@@ -9779,18 +9784,7 @@ impl<'a> Lower<'a> {
             let (a, b) = (self.half_fsrc(inst, 0)?, self.half_fsrc(inst, 1)?);
             let acc = if matches!(name, "v_fmac_f16" | "v_mac_f16") {
                 // The accumulator is the destination's half that is written.
-                let Some(Operand::Vector { reg, .. }) = v.dst else {
-                    return Err("an accumulator");
-                };
-                let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("an accumulator")?)?;
-                let x = if v.opsel >> 3 & 1 != 0 {
-                    let k16 = self.s.m.i32(16);
-                    self.s.m.bin(c, Bin::LShr, x, k16)
-                } else {
-                    x
-                };
-                let m = self.s.m.i32(0xFFFF);
-                let x = self.s.m.bin(c, Bin::And, x, m);
+                let x = self.mac_acc_bits(inst)?;
                 self.s
                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x])
             } else {
@@ -10056,11 +10050,8 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err("a packed half FMA's destination");
         };
-        if v.src.iter().any(|o| matches!(o, Operand::Const(_) | Operand::Literal(_)))
-            || v.sdwa.is_some()
-            || v.dpp.is_some()
-        {
-            return Err("a packed half FMA of constants");
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("a packed half FMA with SDWA or DPP");
         }
         if v.omod != 0 || v.abs != 0 || v.neg != 0 || v.opsel != 0 {
             return Err("modifiers on a packed 16-bit operation");
@@ -10068,7 +10059,11 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let f32t = self.s.t.f32;
         let old = inst.read(Reg::V(reg)).ok_or("an unread destination")?;
-        let words = [self.operand(inst, &v.src[0])?, self.operand(inst, &v.src[1])?, self.i32_of(old)?];
+        let words = [
+            self.f16_operand(inst, &v.src[0])?,
+            self.f16_operand(inst, &v.src[1])?,
+            self.i32_of(old)?,
+        ];
         let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
         let native = self.native16();
         let mut halves = Vec::new();
@@ -11266,6 +11261,7 @@ impl<'a> Lower<'a> {
         let Some(&interp) = self.interps.get(&site) else {
             return Err("the first half of an interpolation");
         };
+        let guard = self.guard(site.0, site.1)?;
         let name = inst.name();
         let (dst, src) = match &inst.fields {
             Fields::Vintrp { dst, src, .. } => (*dst, Some(*src)),
@@ -11410,7 +11406,7 @@ impl<'a> Lower<'a> {
                     // picks the destination half.
                     let f = self.half_modifiers(inst, f);
                     let lo = to_f16(self, f);
-                    return self.write_half(inst, lo, None);
+                    return self.write_half(inst, lo, guard);
                 } else if matches!(eval, Eval::Mode(1)) {
                     // The whole dword of a flat input: both halves.
                     let h = 2 * attribute.channel;
@@ -11431,8 +11427,8 @@ impl<'a> Lower<'a> {
                 }
             }
         };
-        // A pixel interpolates in every lane; guards only hide inactive ones.
-        self.write(inst, Reg::V(reg), x, None);
+        // A pixel interpolates in every lane; EXEC guards preserve inactive lanes.
+        self.write(inst, Reg::V(reg), x, guard);
         Ok(())
     }
 
@@ -17010,6 +17006,82 @@ mod loop86_tests {
         let sel = (0..8).fold(0, |s, i| s | (in_quad[i] << (3 * i)));
         assert!(run([0x7E00_02E9 | (3 << 17), (sel << 8) | 2]).is_ok());
         assert!(run([0x7E00_02E9 | (3 << 17), ((sel ^ 4) << 8) | 2]).is_err());
+    }
+
+    #[test]
+    fn interp_respects_exec_guard() {
+        let mut target = elem("SV_Target", 16, 0);
+        target.usage = 15;
+        let attr = PsInput {
+            usage: Usage::Generic,
+            row: 0,
+            mask: 0b1111,
+            attr: 0,
+            flat: false,
+            fp16: false,
+            pack2: false,
+            row2: 0,
+        };
+        let lower_words = |words: &[u32]| {
+            let native = NativeProgram {
+                stage: HwStage::Ps,
+                wave64: false,
+                vgprs: 8,
+                layout: vec![],
+                used: vec![],
+                io: StageIo::Ps {
+                    inputs: vec![attr.clone()],
+                    input_addr: 1 << 1,
+                    db_shader_control: 0,
+                    patches: vec![],
+                },
+                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+            };
+            let p = crate::ir::build(&native.patched_code(), false, native.vgprs).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let res = crate::resource::track(&p, &native.layout, HwStage::Ps).unwrap();
+            let io = crate::io::raise(&p, &native).unwrap();
+            super::lower(&super::Parts {
+                native: &native,
+                psv: None,
+                p: &p,
+                st: &st,
+                io: &io,
+                res: &res,
+                inputs: vec![elem("TEXCOORD", 0, 0)],
+                outputs: vec![target.clone()],
+                prims: vec![],
+                mesh_stride: 0,
+                target: crate::emit::Target::ANY,
+                console_cf: true,
+                per_lane_only: false,
+            })
+            .unwrap()
+        };
+
+        let unguarded = lower_words(&[
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0 v2, v2, v2, v2
+            0xBF81_0000, // s_endpgm
+        ]);
+        let guarded = lower_words(&[
+            0x7E04_0280, // v_mov_b32 v2, 0
+            0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            0xF800_180F,
+            0x0202_0202, // exp mrt0 v2, v2, v2, v2
+            0xBF81_0000, // s_endpgm
+        ]);
+        assert!(
+            guarded.icmps_and_selects.1 > unguarded.icmps_and_selects.1,
+            "v_interp_* under narrowed EXEC must emit guarded selects ({:?} vs {:?})",
+            guarded.icmps_and_selects,
+            unguarded.icmps_and_selects
+        );
     }
 }
 

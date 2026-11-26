@@ -248,3 +248,85 @@ fn native16_sets_sfi0_when_supported_and_skips_omod_and_rtz() {
     rtz_add.extend_from_slice(&add_f16);
     assert!(!declares_native16(&lower_packed_for(&rtz_add, native_target).unwrap().dxil));
 }
+
+#[test]
+fn fmac_acc_modifiers_lower_for_f32_and_f16() {
+    let native_target = crate::emit::Target {
+        native16: true,
+        ..crate::emit::Target::ANY
+    };
+    let vop3 = |op: u32, opsel: u32, abs: u32, neg: u32| -> [u32; 2] {
+        [
+            0xD400_0000u32 | (op << 16) | (opsel << 11) | (abs << 8) | 2,
+            (neg << 29) | (257 << 9) | 256,
+        ]
+    };
+    let with_runtime = |op: u32, opsel: u32, abs: u32, neg: u32, target| {
+        let mut w = vec![
+            0x3402_0081u32, // v_lshlrev_b32 v1, 1, v0
+            0x4A04_0082,    // v_add_nc_u32 v2, 2, v0
+        ];
+        w.extend_from_slice(&vop3(op, opsel, abs, neg));
+        lower_packed_for(&w, target).unwrap()
+    };
+
+    // #3158: v_fmac_f32 (0x12B) and v_fmac_legacy_f32 (0x106) accumulator abs/neg (bit 2).
+    for op in [0x12Bu32, 0x106] {
+        let base = with_runtime(op, 0, 0, 0, crate::emit::Target::ANY);
+        let abs_acc = with_runtime(op, 0, 4, 0, crate::emit::Target::ANY);
+        let neg_acc = with_runtime(op, 0, 0, 4, crate::emit::Target::ANY);
+        let both_acc = with_runtime(op, 0, 4, 4, crate::emit::Target::ANY);
+        let base_fabs = base.unary_f32_opcodes.iter().filter(|&&c| c == 6).count();
+        let abs_fabs = abs_acc.unary_f32_opcodes.iter().filter(|&&c| c == 6).count();
+        let both_fabs = both_acc.unary_f32_opcodes.iter().filter(|&&c| c == 6).count();
+        assert_eq!(abs_fabs, base_fabs + 1, "op {op:#x}: abs on src2 must emit FAbs");
+        assert_eq!(both_fabs, base_fabs + 1, "op {op:#x}: abs|neg on src2 must emit FAbs");
+        assert!(
+            neg_acc.instructions > base.instructions,
+            "op {op:#x}: neg on src2 must emit negation"
+        );
+    }
+
+    // #3192: v_fmac_f16 (0x136) accumulator abs/neg (bit 2) across both f32-widened & native16 paths.
+    for target in [crate::emit::Target::ANY, native_target] {
+        for opsel in [0u32, 1 << 3] {
+            let base = with_runtime(0x136, opsel, 0, 0, target);
+            let abs_acc = with_runtime(0x136, opsel, 4, 0, target);
+            let neg_acc = with_runtime(0x136, opsel, 0, 4, target);
+            let both_acc = with_runtime(0x136, opsel, 4, 4, target);
+            assert!(abs_acc.instructions > base.instructions);
+            assert!(neg_acc.instructions > base.instructions);
+            assert!(both_acc.instructions > abs_acc.instructions);
+        }
+    }
+}
+
+#[test]
+fn pk_fmac_f16_accepts_inline_float_constants_and_literals() {
+    let native_target = crate::emit::Target {
+        native16: true,
+        ..crate::emit::Target::ANY
+    };
+    for target in [crate::emit::Target::ANY, native_target] {
+        for src0 in [242u32, 241, 128] {
+            // VOP2 v_pk_fmac_f16 v2, src0, v1
+            let vop2 = (0x3Cu32 << 25) | (2 << 17) | (1 << 9) | src0;
+            assert!(
+                lower_packed_for(&[vop2], target).is_ok(),
+                "VOP2 v_pk_fmac_f16 with inline const {src0} must lower"
+            );
+        }
+        // VOP2 v_pk_fmac_f16 v2, literal, v1
+        let vop2_lit = [(0x3Cu32 << 25) | (2 << 17) | (1 << 9) | 0xFF, 0x3C00_4000];
+        assert!(
+            lower_packed_for(&vop2_lit, target).is_ok(),
+            "VOP2 v_pk_fmac_f16 with 32-bit literal must lower"
+        );
+        // VOP3 v_pk_fmac_f16 v2, 1.0, v1
+        let vop3_const = [0xD400_0000u32 | (0x13C << 16) | 2, (257 << 9) | 242];
+        assert!(
+            lower_packed_for(&vop3_const, target).is_ok(),
+            "VOP3 v_pk_fmac_f16 with inline float const must lower"
+        );
+    }
+}
