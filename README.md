@@ -110,6 +110,9 @@ Speed:
 - Newly visible bindless textures can be pre-detiled and uploaded to VRAM
   ahead of submission on a dedicated `COPY` command queue
   (`VICTORY_HEAP_WORKER=1`, off by default).
+- Single-view guard faults and re-arming `VirtualProtect` calls can run off the
+  global guard lock under 1 MiB stripe locks (`VICTORY_PORT_GUARD=1`, off by
+  default).
 
 Memory the title shows at several addresses:
 - Every view of a guarded physical page is guarded with it, so a write of

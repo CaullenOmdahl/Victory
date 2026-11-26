@@ -790,6 +790,82 @@ impl Shadow {
         self.update_lazily(address, len, false)
     }
 
+    /// Refreshes multiple sorted non-overlapping `[from, to)` byte spans of
+    /// this shadow in one batch, coalescing adjacent `GetWriteWatch` syscalls
+    /// when spans share or border the same 64 KiB page.
+    pub(crate) fn update_spans(&self, spans: &[(usize, usize)], lazy: bool) -> usize {
+        if spans.len() <= 1
+            || self.direct.is_some()
+            || self.sparse.as_ref().is_some_and(|s| s.of.is_some())
+            || self.pending_len.load(Ordering::Relaxed) != 0
+            || self.watched.load(Ordering::Relaxed) != 1
+        {
+            return spans
+                .iter()
+                .map(|&(from, to)| self.update_lazily(from, to.saturating_sub(from), lazy))
+                .sum();
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let clamped: Vec<(usize, usize)> = spans
+            .iter()
+            .filter_map(|&(a, b)| {
+                let (from, to) = (a.max(start), b.min(end));
+                (from < to).then_some((from, to))
+            })
+            .collect();
+        if clamped.len() <= 1 {
+            return clamped
+                .iter()
+                .map(|&(from, to)| self.update_lazily(from, to - from, lazy))
+                .sum();
+        }
+        let mut copied = 0usize;
+        let mut i = 0;
+        while i < clamped.len() {
+            let c_start = clamped[i].0;
+            let mut c_end = clamped[i].1;
+            let mut last_page = (c_end - 1) / PAGE;
+            let mut j = i + 1;
+            while j < clamped.len() {
+                let next_first_page = clamped[j].0 / PAGE;
+                if next_first_page > last_page + 1 {
+                    break;
+                }
+                c_end = c_end.max(clamped[j].1);
+                last_page = (c_end - 1) / PAGE;
+                j += 1;
+            }
+            if j - i == 1 {
+                let (from, to) = clamped[i];
+                copied += self.update_lazily(from, to - from, lazy);
+            } else if let Some((now, written)) = crate::watch::writes(c_start, c_end, false) {
+                let subs = crate::watch::subpages(c_start, c_end);
+                for &(from, to) in &clamped[i..j] {
+                    let p0 = from / PAGE;
+                    let p1 = to.div_ceil(PAGE);
+                    let w0 = written.partition_point(|&(p, _)| p < p0);
+                    let w1 = written.partition_point(|&(p, _)| p < p1);
+                    let s0 = subs.partition_point(|&(p, ..)| p < p0);
+                    let s1 = subs.partition_point(|&(p, ..)| p < p1);
+                    let n = self.copy_stale(from, to, now, &written[w0..w1], &subs[s0..s1]);
+                    copied += n;
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        use crate::copystat::{C, add};
+                        add(C::Checked, (to - from) as u64);
+                        add(C::Unchanged, (to - from).saturating_sub(n) as u64);
+                    }
+                }
+            } else {
+                for &(from, to) in &clamped[i..j] {
+                    copied += self.update_lazily(from, to - from, lazy);
+                }
+            }
+            i = j;
+        }
+        copied
+    }
+
     /// [`Shadow::update`]; `lazy`: the tiles of a sparse copy that did not
     /// change the last times are looked at less often.
     pub(crate) fn update_lazily(&self, address: usize, len: usize, lazy: bool) -> usize {
@@ -4604,5 +4680,54 @@ mod buffer_map_tests {
         assert_ne!(gen1, gen0);
         unregister(resource, start);
         assert_ne!(BUFFER_GENERATION.load(Ordering::Acquire), gen1);
+    }
+
+    #[test]
+    fn update_spans_coalesces_write_watch_across_same_page_spans() {
+        let Some(_host) = crate::host::host() else { return };
+        use crate::watch::PAGE;
+        use crate::shadow::{find, register, unregister};
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        const MEM_WRITE_WATCH: u32 = 0x20_0000;
+        let total = 2 * PAGE;
+        // SAFETY: allocates a private write-watched buffer owned exclusively by this test.
+        let base = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                total,
+                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+                PAGE_READWRITE,
+            )
+        } as usize;
+        assert_ne!(base, 0);
+        // SAFETY: `base` spans `total` committed bytes.
+        unsafe { std::ptr::write_bytes(base as *mut u8, 0x11, total) };
+        register(base, base as u64, total as u64);
+        let shadow = find(base as u64, total as u64).unwrap();
+        let spans = [
+            (base, base + 256),
+            (base + 4096, base + 4352),
+            (base + PAGE, base + PAGE + 256),
+            (base + PAGE + 8192, base + PAGE + 8448),
+        ];
+        // Initial full-page updates mark `watched = 1` and stamp both pages clean.
+        assert!(shadow.update(base, PAGE) > 0);
+        assert!(shadow.update(base + PAGE, PAGE) > 0);
+        assert_eq!(shadow.update_spans(&spans, false), 0, "clean spans must not re-copy");
+
+        // Write only page 1 offset 8192: coalesced update_spans skips clean page 0
+        // (copies 0 bytes from page 0) and copies only the two spans in dirty page 1 (512 bytes).
+        // SAFETY: inside second 64 KiB page.
+        unsafe { ((base + PAGE + 8192) as *mut u8).write(0x7a) };
+        let copied = shadow.update_spans(&spans, false);
+        assert_eq!(copied, 512);
+        assert_eq!(shadow.byte_at(PAGE + 8192), 0x7a);
+
+        drop(shadow);
+        unregister(base, base as u64);
+        // SAFETY: frees test allocation.
+        unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
     }
 }

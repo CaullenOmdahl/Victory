@@ -343,6 +343,36 @@ fn journal_record_range(first: usize, last: usize, now: u64) {
     }
 }
 
+#[cfg(test)]
+fn journal_clear_range(first: usize, last: usize) {
+    if first >= last {
+        return;
+    }
+    let s0 = first >> JOURNAL_PAGE_STRIPE_SHIFT;
+    let s1 = (last - 1) >> JOURNAL_PAGE_STRIPE_SHIFT;
+    for stripe in s0..=s1 {
+        let lo = first.max(stripe << JOURNAL_PAGE_STRIPE_SHIFT);
+        let hi = last.min((stripe + 1) << JOURNAL_PAGE_STRIPE_SHIFT);
+        let shard = stripe & (JOURNAL_SHARDS - 1);
+        {
+            let mut j = JOURNALS[shard].write().unwrap_or_else(|e| e.into_inner());
+            let keys: Vec<usize> = j.range(lo..hi).map(|(&p, _)| p).collect();
+            for p in keys {
+                j.remove(&p);
+            }
+        }
+        if dirty4k() {
+            let mut sub = SUB_JOURNALS[shard]
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            let keys: Vec<usize> = sub.range(lo..hi).map(|(&p, _)| p).collect();
+            for p in keys {
+                sub.remove(&p);
+            }
+        }
+    }
+}
+
 #[allow(dead_code)]
 enum WwGuard {
     One(std::sync::MutexGuard<'static, ()>),
@@ -509,6 +539,54 @@ pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usiz
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
+/// Blocks per [`BLOCK_LOCKS`] stripe (`16 * 64 KiB = 1 MiB`), and stripes
+/// protecting off-lock `VirtualProtect` calls when `VICTORY_PORT_GUARD=1`.
+const STRIPE_BLOCKS: usize = 16;
+const BLOCK_STRIPES: usize = 256;
+static BLOCK_LOCKS: [Mutex<()>; BLOCK_STRIPES] = [const { Mutex::new(()) }; BLOCK_STRIPES];
+
+#[inline]
+fn block_stripe(block: usize) -> usize {
+    (block / STRIPE_BLOCKS) & (BLOCK_STRIPES - 1)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread override for [`port_guard`] in unit tests.
+    pub(crate) static PORT_GUARD_HERE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Whether single-view `VirtualProtect` calls run off `GUARDS` under
+/// [`BLOCK_LOCKS`] (`VICTORY_PORT_GUARD=1`, off by default).
+pub(crate) fn port_guard() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = PORT_GUARD_HERE.get() {
+        return enabled;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PORT_GUARD").is_some_and(|v| v == "1"))
+}
+
+static PORT_GUARD_OPENED: AtomicU64 = AtomicU64::new(0);
+static PORT_GUARD_ARMED: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_port_guard(frames: f64) {
+    if !port_guard() {
+        return;
+    }
+    let opened = PORT_GUARD_OPENED.swap(0, Ordering::Relaxed);
+    let armed = PORT_GUARD_ARMED.swap(0, Ordering::Relaxed);
+    if opened + armed > 0 {
+        tracing::info!(
+            "port_guard (VICTORY_PORT_GUARD=1) per frame: {:.1} faults opened off-lock, {:.1} blocks re-armed off-lock",
+            opened as f64 / frames,
+            armed as f64 / frames,
+        );
+    }
+}
+
 struct Guards {
     /// Blocks we made read-only.
     protected: BTreeSet<usize>,
@@ -526,6 +604,8 @@ struct Guards {
     /// Blocks whose page was guarded together with its other views (those
     /// views' blocks are in it too): a write to one opens them all.
     aliased: BTreeSet<usize>,
+    /// Incremented whenever [`remapped_locked`] invalidates mappings.
+    remap_epoch: u64,
     /// Blocks the kernel is about to write for the runtime ([`writing`]),
     /// from, to, and until when they are left writable: a read may be
     /// asynchronous and land after the call that asked for it returned, and
@@ -541,6 +621,7 @@ static GUARDS: RwLock<Guards> = RwLock::new(Guards {
     covered: BTreeMap::new(),
     dirty: BTreeSet::new(),
     aliased: BTreeSet::new(),
+    remap_epoch: 0,
     pins: Vec::new(),
 });
 
@@ -821,36 +902,70 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
                 return Some(Vec::new());
             }
             let mut written = Vec::new();
-            let mut run: Option<(usize, usize)> = None;
+            let mut to_arm = Vec::new();
             for block in dirty {
                 if !g.pins.is_empty() && g.pinned(block) {
-                    if let Some((r_from, r_to)) = run.take() {
-                        protect(&mut g, r_from, r_to, &mut written);
-                    }
                     written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
                     bump_region_epochs(block * BLOCK, (block + 1) * BLOCK);
                 } else if g.holes.contains(&block) || g.clean.contains(&block) {
                     g.dirty.remove(&block);
                 } else if g.protected.contains(&block) {
-                    if let Some((r_from, r_to)) = run.take() {
-                        protect(&mut g, r_from, r_to, &mut written);
-                    }
                     g.clean.insert(block);
                     g.dirty.remove(&block);
                     written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
                 } else {
-                    match run {
-                        Some((r_from, r_to)) if r_to == block => run = Some((r_from, block + 1)),
-                        Some((r_from, r_to)) => {
-                            protect(&mut g, r_from, r_to, &mut written);
-                            run = Some((block, block + 1));
-                        }
-                        None => run = Some((block, block + 1)),
-                    }
+                    to_arm.push(block);
                 }
             }
-            if let Some((r_from, r_to)) = run {
-                protect(&mut g, r_from, r_to, &mut written);
+            if !to_arm.is_empty() {
+                if !port_guard() {
+                    let mut run: Option<(usize, usize)> = None;
+                    for block in to_arm {
+                        match run {
+                            Some((r_from, r_to)) if r_to == block => run = Some((r_from, block + 1)),
+                            Some((r_from, r_to)) => {
+                                protect(&mut g, r_from, r_to, &mut written);
+                                run = Some((block, block + 1));
+                            }
+                            None => run = Some((block, block + 1)),
+                        }
+                    }
+                    if let Some((r_from, r_to)) = run {
+                        protect(&mut g, r_from, r_to, &mut written);
+                    }
+                } else {
+                    let mut single_runs: Vec<(usize, usize)> = Vec::new();
+                    let mut aliased_blocks: Vec<usize> = Vec::new();
+                    {
+                        let views = VIEWS.read().unwrap_or_else(|e| e.into_inner());
+                        let views_ref = views.as_ref();
+                        for block in to_arm {
+                            let is_multi = view_guard()
+                                && views_ref.is_some_and(|v| v.shown(block * BLOCK).len() > 1);
+                            if is_multi {
+                                aliased_blocks.push(block);
+                            } else {
+                                match single_runs.last_mut() {
+                                    Some((_, r_to))
+                                        if *r_to == block
+                                            && block_stripe(*r_to - 1) == block_stripe(block) =>
+                                    {
+                                        *r_to = block + 1;
+                                    }
+                                    _ => single_runs.push((block, block + 1)),
+                                }
+                            }
+                        }
+                    }
+                    for b in aliased_blocks {
+                        protect(&mut g, b, b + 1, &mut written);
+                    }
+                    if !single_runs.is_empty() {
+                        let epoch = g.remap_epoch;
+                        drop(g);
+                        arm_stripes_off_lock(&single_runs, epoch, &mut written);
+                    }
+                }
             }
             return Some(written);
         }
@@ -1163,6 +1278,90 @@ fn protect(g: &mut Guards, from: usize, to: usize, written: &mut Vec<usize>) {
                 }
             }
         }
+    }
+}
+
+/// Re-arms single-view dirty block runs `[r_from, r_to)` split per
+/// `BLOCK_LOCKS` stripe with `GUARDS` unlocked across `VirtualProtect`.
+fn arm_stripes_off_lock(runs: &[(usize, usize)], epoch: u64, written: &mut Vec<usize>) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, PAGE_READWRITE, VirtualProtect};
+    let mut armed_total = 0u64;
+    for &(r_from, r_to) in runs {
+        let _stripe = BLOCK_LOCKS[block_stripe(r_from)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut protected_blocks = Vec::new();
+        let mut hole_blocks = Vec::new();
+        let mut at = r_from;
+        while at < r_to {
+            let (end, can_guard) = view_run(at, r_to);
+            if !can_guard {
+                hole_blocks.extend(at..end);
+            } else {
+                let mut old = 0;
+                // SAFETY: title view memory; protected by `_stripe` off `GUARDS`.
+                let ok = unsafe {
+                    VirtualProtect(
+                        (at * BLOCK) as *const _,
+                        (end - at) * BLOCK,
+                        PAGE_READONLY,
+                        &mut old,
+                    ) != 0
+                };
+                if ok {
+                    protected_blocks.extend(at..end);
+                } else {
+                    for b in at..end {
+                        // SAFETY: as above, one block.
+                        if unsafe {
+                            VirtualProtect((b * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old)
+                                != 0
+                        } {
+                            protected_blocks.push(b);
+                        } else {
+                            hole_blocks.push(b);
+                        }
+                    }
+                }
+            }
+            at = end;
+        }
+        let mut to_undo = Vec::new();
+        {
+            let mut g = guards_mut();
+            let valid_epoch = g.remap_epoch == epoch;
+            for b in hole_blocks {
+                if valid_epoch && g.is_covered(b, b + 1) {
+                    g.note_hole(b);
+                }
+            }
+            for b in protected_blocks {
+                if valid_epoch
+                    && g.is_covered(b, b + 1)
+                    && !(!g.pins.is_empty() && g.pinned(b))
+                {
+                    g.protected.insert(b);
+                    g.clean.insert(b);
+                    g.dirty.remove(&b);
+                    written.extend(b * BLOCK / PAGE..(b + 1) * BLOCK / PAGE);
+                    armed_total += 1;
+                } else {
+                    written.extend(b * BLOCK / PAGE..(b + 1) * BLOCK / PAGE);
+                    bump_region_epochs(b * BLOCK, (b + 1) * BLOCK);
+                    to_undo.push(b);
+                }
+            }
+        }
+        for b in to_undo {
+            let mut old = 0;
+            // SAFETY: undoing protection on a block remapped/pinned while `GUARDS` was unlocked.
+            unsafe {
+                VirtualProtect((b * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old);
+            }
+        }
+    }
+    if armed_total > 0 {
+        PORT_GUARD_ARMED.fetch_add(armed_total, Ordering::Relaxed);
     }
 }
 
@@ -1536,6 +1735,7 @@ fn remapped_locked(g: &mut Guards, at: usize, end: usize, protect_blocks: bool) 
     for block in aliased {
         g.aliased.remove(&block);
     }
+    g.remap_epoch = g.remap_epoch.wrapping_add(1);
     if changed {
         bump_region_epochs(at, end);
     }
@@ -1593,14 +1793,52 @@ pub fn title_memory_written(at: usize, len: usize) {
 /// made it read-write). Called both by our own VEH handler and by
 /// `host::safe_copy`'s VEH handler on write faults.
 pub(crate) fn try_open_guarded(at: usize) -> bool {
-    let mut g = guards_mut();
-    if open(&mut g, at, at + 1) {
-        #[cfg(feature = "diagnostics")]
-        crate::copystat::add(crate::copystat::C::GuardFaults, 1);
-        return true;
-    }
-    if writable(at) {
-        return true;
+    if port_guard() {
+        let block = at / BLOCK;
+        let _stripe = BLOCK_LOCKS[block_stripe(block)]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut g = guards_mut();
+        if g.aliased.contains(&block) {
+            if open(&mut g, at, at + 1) {
+                #[cfg(feature = "diagnostics")]
+                crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+                return true;
+            }
+        } else if g.protected.remove(&block) {
+            g.clean.remove(&block);
+            g.dirty.insert(block);
+            drop(g);
+            let mut old = 0;
+            // SAFETY: `block` was guarded `PAGE_READONLY` and is serialized by `_stripe`.
+            unsafe {
+                windows_sys::Win32::System::Memory::VirtualProtect(
+                    (block * BLOCK) as *const _,
+                    BLOCK,
+                    windows_sys::Win32::System::Memory::PAGE_READWRITE,
+                    &mut old,
+                );
+            }
+            bump_region_epochs(block * BLOCK, (block + 1) * BLOCK);
+            PORT_GUARD_OPENED.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            return true;
+        }
+        drop(g);
+        if writable(at) {
+            return true;
+        }
+    } else {
+        let mut g = guards_mut();
+        if open(&mut g, at, at + 1) {
+            #[cfg(feature = "diagnostics")]
+            crate::copystat::add(crate::copystat::C::GuardFaults, 1);
+            return true;
+        }
+        if writable(at) {
+            return true;
+        }
     }
     // Read-only, in a view we were told of, and not noted guarded: only we
     // make title views read-only, so it is ours to give back.
@@ -1814,6 +2052,7 @@ mod tests {
             covered: BTreeMap::new(),
             dirty: BTreeSet::new(),
             aliased: BTreeSet::new(),
+            remap_epoch: 0,
             pins: vec![
                 (10, 12, until),
                 (14, 18, until),
@@ -2416,5 +2655,74 @@ mod tests {
         // A whole-page non-kernel write removes any sub-page mask entry.
         sub.remove(&page);
         assert!(sub.get(&page).is_none());
+    }
+
+    #[test]
+    fn port_guard_opens_and_rearms_outside_global_lock() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_ALL_ACCESS, MapViewOfFile, PAGE_READWRITE,
+            UnmapViewOfFile,
+        };
+        struct Reset(Option<bool>);
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                super::PORT_GUARD_HERE.set(self.0);
+            }
+        }
+        let _r = Reset(super::PORT_GUARD_HERE.replace(Some(true)));
+        assert!(super::port_guard());
+
+        let len = 2 * BLOCK;
+        // SAFETY: creating and mapping a private pagefile-backed view owned by this test.
+        let (section, view) = unsafe {
+            let section = CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                PAGE_READWRITE,
+                0,
+                len as u32,
+                std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let mapped = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, len);
+            assert!(!mapped.Value.is_null());
+            (section, mapped.Value as usize)
+        };
+        assert!(mapped(view));
+
+        let (_, initial) = writes_guarded(view, view + len).expect("mapped view should guard");
+        assert_eq!(initial.len(), 2);
+        assert!(!writable(view));
+        assert!(!writable(view + BLOCK));
+
+        // First write hits VEH -> try_open_guarded off-lock.
+        // SAFETY: inside the mapped view; VEH restores PAGE_READWRITE.
+        unsafe { ((view + 64) as *mut u8).write(0xaa) };
+        assert!(writable(view));
+        assert!(!writable(view + BLOCK));
+
+        // Second check runs arm_stripes_off_lock and re-arms page 0 cleanly.
+        let (ask2, second) = writes_guarded(view, view + len).expect("re-arm off-lock");
+        let pages2: Vec<usize> = second
+            .into_iter()
+            .filter(|&(_, w)| w == ask2)
+            .map(|(p, _)| p)
+            .collect();
+        assert_eq!(pages2, vec![view / PAGE]);
+        assert!(!writable(view));
+
+        // Write again after off-lock re-arm -> second fault opens cleanly.
+        // SAFETY: inside the mapped view; VEH restores PAGE_READWRITE.
+        unsafe { ((view + 128) as *mut u8).write(0xbb) };
+        assert!(writable(view));
+
+        title_memory_remapped(view, len);
+        journal_clear_range(view / PAGE, (view + len).div_ceil(PAGE));
+        // SAFETY: unmaps and closes handles owned exclusively by this test.
+        unsafe {
+            assert_ne!(UnmapViewOfFile(windows_sys::Win32::System::Memory::MEMORY_MAPPED_VIEW_ADDRESS { Value: view as *mut _ }), 0);
+            assert_ne!(CloseHandle(section), 0);
+        }
     }
 }

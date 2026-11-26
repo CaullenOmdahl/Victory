@@ -4509,9 +4509,7 @@ impl Batch {
         let refreshes = std::mem::take(&mut self.refreshes);
         in_parallel(&refreshes, 2, |chunk| {
             for (shadow, spans) in chunk {
-                for &(from, to) in spans.as_slice() {
-                    update(shadow, from, to - from);
-                }
+                update_spans(shadow, spans.as_slice());
             }
         });
         let mut pieces = std::mem::take(&mut self.pieces);
@@ -4928,6 +4926,25 @@ fn update(shadow: &crate::shadow::Shadow, from: usize, len: usize) {
     let us = started.elapsed().as_micros() as u64;
     #[cfg(feature = "diagnostics")]
     crate::copystat::range(from, len, us, 0);
+    PREPARING[0].fetch_add(us, Ordering::Relaxed);
+    PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
+}
+
+/// Refreshes multiple sorted non-overlapping `[from, to)` spans of `shadow` in
+/// one batch so write-watch syscalls coalesce across adjacent spans.
+fn update_spans(shadow: &crate::shadow::Shadow, spans: &[(usize, usize)]) {
+    if spans.is_empty() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let copied = shadow.update_spans(spans, false);
+    let us = started.elapsed().as_micros() as u64;
+    #[cfg(feature = "diagnostics")]
+    {
+        let first = spans[0].0;
+        let last = spans[spans.len() - 1].1;
+        crate::copystat::range(first, last.saturating_sub(first), us, 0);
+    }
     PREPARING[0].fetch_add(us, Ordering::Relaxed);
     PREPARING[1].fetch_add(copied as u64, Ordering::Relaxed);
 }
@@ -5561,6 +5578,7 @@ impl Meter {
                 crate::texture::flips::log();
                 crate::port_cbv::log(frames);
                 crate::heap_worker::log(frames);
+                crate::watch::log_port_guard(frames);
                 crate::copystat::log(frames);
                 let beside_frames = f64::from(self.log_frames.max(1));
                 self.log_frames = 0;
