@@ -3082,6 +3082,27 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     checked_view_span(base, buffer.FirstElement, buffer.NumElements, element)
 }
 
+/// The format the host makes a typed buffer view in. Translated shaders
+/// declare every typed buffer load and store as 32-bit float
+/// (`victory_shader` `emit/lower.rs`), and a view in a 32-bit integer format
+/// converts between float and integer values on the way: a store of an
+/// integer's bits as a float is written as the integer the float rounds to
+/// (zero for most of them), where the console moves the bits. The float
+/// format of the same width moves them unchanged, and matches what the
+/// shader declares. (The meshlet culling programs append packed meshlet
+/// numbers to an `R32_UINT` list this way.)
+fn bit_exact_format(format: DXGI_FORMAT) -> DXGI_FORMAT {
+    match format {
+        DXGI_FORMAT_R32G32B32A32_UINT | DXGI_FORMAT_R32G32B32A32_SINT => {
+            DXGI_FORMAT_R32G32B32A32_FLOAT
+        }
+        DXGI_FORMAT_R32G32B32_UINT | DXGI_FORMAT_R32G32B32_SINT => DXGI_FORMAT_R32G32B32_FLOAT,
+        DXGI_FORMAT_R32G32_UINT | DXGI_FORMAT_R32G32_SINT => DXGI_FORMAT_R32G32_FLOAT,
+        DXGI_FORMAT_R32_UINT | DXGI_FORMAT_R32_SINT => DXGI_FORMAT_R32_FLOAT,
+        other => other,
+    }
+}
+
 /// Whether a raw buffer view may start at element `first` (4 bytes each):
 /// the host wants 16-byte aligned starts, the console only 4, and refuses
 /// the call (removing the device) for the rest.
@@ -3173,6 +3194,7 @@ fn buffer_srv(
         );
         return None;
     }
+    desc.Format = bit_exact_format(desc.Format);
     let size = if buffer.StructureByteStride > 0 { u64::from(buffer.StructureByteStride) } else { element_size_of(buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0, element) };
     clamp_buffer_elements(&shadow, buffer.FirstElement, &mut buffer.NumElements, size);
     if !fits_buffer(&shadow, buffer.FirstElement, buffer.NumElements, size) {
@@ -3300,6 +3322,7 @@ fn buffer_uav(
         once!(offset, element, "unordered buffer view not on an element of its host copy");
         return None;
     }
+    desc.Format = bit_exact_format(desc.Format);
     let size = if buffer.StructureByteStride > 0 { u64::from(buffer.StructureByteStride) } else { element_size_of(buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0, element) };
     clamp_buffer_elements(&shadow, buffer.FirstElement, &mut buffer.NumElements, size);
     if !fits_buffer(&shadow, buffer.FirstElement, buffer.NumElements, size) {
@@ -4748,5 +4771,31 @@ void main(uint3 id : SV_DispatchThreadID) {
         assert_eq!(max_elems, 48);
         let fits_after = 16u64.checked_add(u64::from(max_elems)).and_then(|n| n.checked_mul(4));
         assert_eq!(fits_after, Some(256));
+    }
+
+    #[test]
+    fn typed_buffer_views_of_32_bit_integers_move_bits() {
+        for (title, host) in [
+            (DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32_SINT, DXGI_FORMAT_R32_FLOAT),
+            (DXGI_FORMAT_R32G32_UINT, DXGI_FORMAT_R32G32_FLOAT),
+            (DXGI_FORMAT_R32G32B32_SINT, DXGI_FORMAT_R32G32B32_FLOAT),
+            (DXGI_FORMAT_R32G32B32A32_UINT, DXGI_FORMAT_R32G32B32A32_FLOAT),
+        ] {
+            assert_eq!(bit_exact_format(title), host);
+            assert_eq!(
+                crate::resource::element(title.0 as u32),
+                crate::resource::element(host.0 as u32)
+            );
+        }
+        for kept in [
+            DXGI_FORMAT_R32_FLOAT,
+            DXGI_FORMAT_R32_TYPELESS,
+            DXGI_FORMAT_UNKNOWN,
+            DXGI_FORMAT_R16G16_UINT,
+            DXGI_FORMAT_R8G8B8A8_UNORM,
+        ] {
+            assert_eq!(bit_exact_format(kept), kept);
+        }
     }
 }

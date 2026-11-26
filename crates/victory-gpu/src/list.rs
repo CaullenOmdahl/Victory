@@ -810,6 +810,29 @@ extern "system" fn copy_texture_region(
             let Some((lines, row_bytes, total)) = dst.footprint.layout() else {
                 return;
             };
+            // SAFETY: `from_tex` is a live D3D12 resource.
+            let from_desc = unsafe { from_tex.GetDesc() };
+            if from_desc.Flags.0
+                & windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0
+                != 0
+            {
+                let family = crate::resource::family(from_desc.Format.0 as u32);
+                // R32 and R16 have one depth plane with the ordinary row layout.
+                if !matches!(family, 39 | 53)
+                    || crate::resource::family(dst.footprint.format) != family
+                {
+                    return;
+                }
+                let subresources =
+                    u32::from(from_desc.MipLevels.max(1)) * u32::from(from_desc.DepthOrArraySize);
+                if from_desc.SampleDesc.Count != 1
+                    || !source_box.is_null()
+                    || [x, y, z] != [0; 3]
+                    || src.footprint.offset as u32 >= subresources
+                {
+                    return;
+                }
+            }
             let host_format = crate::resource::pc_format(dst.footprint.format);
             if crate::resource::element(host_format)
                 != crate::resource::element(dst.footprint.format)
