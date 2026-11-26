@@ -412,6 +412,74 @@ fn packed_add_selects_halves_of_inline_constants() {
 }
 
 #[test]
+fn directed_f64_floor_and_ceil_match_ieee_binary64() {
+    let values = [
+        0.0,
+        -0.0,
+        f64::from_bits(1),
+        f64::from_bits(0x8000_0000_0000_0001),
+        0.25,
+        -0.25,
+        0.5,
+        -0.5,
+        0.75,
+        -0.75,
+        1.0,
+        -1.0,
+        1.5,
+        -1.5,
+        13.25,
+        -13.25,
+        524_288.0 + 2.0f64.powi(-33),
+        -(524_288.0 + 2.0f64.powi(-33)),
+        1_048_576.125,
+        -1_048_576.125,
+        2_097_152.625,
+        -2_097_152.625,
+        4_503_599_627_370_495.5,
+        -4_503_599_627_370_495.5,
+        4_503_599_627_370_496.0,
+        f64::MAX,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    let inputs: Vec<_> = values
+        .iter()
+        .map(|value| {
+            let bits = value.to_bits();
+            [bits as u32, (bits >> 32) as u32, 0, 0]
+        })
+        .collect();
+    let operations = [(0x018, f64::ceil as fn(f64) -> f64), (0x01a, f64::floor)];
+    for (op, expected) in operations {
+        for source in [vgpr(1), sgpr(0)] {
+            for (word, shift) in [(6, 0), (7, 32)] {
+                let shader = build_valu_cs(&[vop1(op, 6, source), vop1(0x001, 0, vgpr(word))]);
+                run_cases(&shader, &inputs, |backend, case, _, got| {
+                    let want = (expected(values[case]).to_bits() >> shift) as u32;
+                    assert_eq!(got, want, "{backend}: op {op:#x}, source {source}, case {case}, v{word}");
+                });
+            }
+        }
+    }
+}
+
+#[test]
+fn directed_f64_vop3_negated_literal_rounds_in_both_directions() {
+    for (opcode, expected) in [(0x19a, 0xc02c_0000), (0x198, 0xc02a_0000)] {
+        let [op, sources] = vop3(opcode, 6, 255, 0, 0);
+        let shader = build_valu_cs(&[op, sources | 1 << 29, 0x402b_0000, vop1(0x001, 0, vgpr(7))]);
+        let container = crate::dxbc::Container::parse(&shader.dxil).unwrap();
+        let features = container.part(crate::dxbc::FourCC::SFI0).unwrap();
+        let bits = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_eq!(bits & 0x8001, 0, "SFI0 doubles and int64 feature bits");
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, expected, "{backend}: opcode {opcode:#x}, -13.5");
+        });
+    }
+}
+
+#[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
     let shader = build_valu_cs(&vop3(0x157, 0, vgpr(1), vgpr(2), vgpr(3)));
@@ -669,6 +737,178 @@ fn v_fma_legacy_f32_follows_the_d3d9_zero_rule() {
         let want = cases[i].1;
         assert_eq!(got, want, "{backend}: case {i}: {got:#x}, want {want:#x}");
     });
+}
+
+#[test]
+fn fract_f64_vop1_returns_both_words_below_one() {
+    let limit = f64::from_bits(1.0f64.to_bits() - 1);
+    let values = [
+        0.0,
+        -0.0,
+        f64::from_bits(1),
+        f64::from_bits(0x8000_0000_0000_0001),
+        -2.0f64.powi(-54),
+        -3.0 * 2.0f64.powi(-54),
+        -5.0 * 2.0f64.powi(-54),
+        -2.0f64.powi(-22),
+        -2.0f64.powi(-21),
+        -(2.0f64.powi(-21) - 2.0f64.powi(-54)),
+        0.25,
+        -0.25,
+        0.5,
+        -0.5,
+        -limit,
+        1.25,
+        -1.25,
+        -13.5,
+        524_288.0 + 2.0f64.powi(-33),
+        -(524_288.0 + 2.0f64.powi(-33)),
+        1_048_576.125,
+        -1_048_576.125,
+        2_097_152.75,
+        -2_097_152.75,
+        4_503_599_627_370_495.5,
+        4_503_599_627_370_496.0,
+        -4_503_599_627_370_497.0,
+        f64::MAX,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        f64::from_bits(0xfff0_0000_0000_0020),
+    ];
+    let inputs: Vec<_> = values
+        .iter()
+        .map(|x| {
+            let bits = x.to_bits();
+            [bits as u32, (bits >> 32) as u32, 0, 0]
+        })
+        .collect();
+    for source in [vgpr(1), sgpr(0)] {
+        for (word, shift) in [(6, 0), (7, 32)] {
+            let shader = build_valu_cs(&[vop1(0x03e, 6, source), vop1(0x001, 0, vgpr(word))]);
+            run_cases(&shader, &inputs, |backend, idx, _, got| {
+                let value = values[idx];
+                if value.is_finite() {
+                    let expected = (value - value.floor()).min(limit);
+                    let want = (expected.to_bits() >> shift) as u32;
+                    assert_eq!(got, want, "{backend}: source {source}, {value:?}, v{word}");
+                } else if shift == 32 {
+                    assert_eq!(got & 0x7ff8_0000, 0x7ff8_0000, "{backend}: quiet NaN");
+                }
+            });
+        }
+    }
+}
+
+#[test]
+fn fract_f64_vop3_literals_obey_abs_and_neg() {
+    let [op, sources] = vop3(0x1be, 6, 255, 0, 0);
+    let cases = [
+        (op, sources | 1 << 29, 0x402a_8000, 0x3fe8_0000), // 0.75 from negating +13.25.
+        (op | 1 << 8, sources, 0xc02a_8000, 0x3fd0_0000),  // 0.25 from abs(-13.25).
+    ];
+    for (op, sources, literal, expected) in cases {
+        let shader = build_valu_cs(&[op, sources, literal, vop1(0x001, 0, vgpr(7))]);
+        let container = crate::dxbc::Container::parse(&shader.dxil).unwrap();
+        let features = container.part(crate::dxbc::FourCC::SFI0).unwrap();
+        let bits = u64::from_le_bytes(features.data.try_into().unwrap());
+        assert_eq!(bits & 0x8001, 0, "SFI0 doubles and int64 feature bits");
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, expected, "{backend}: literal {literal:#x}");
+        });
+    }
+}
+
+#[test]
+fn binary64_trig_preop_returns_the_argument_reduction_segment() {
+    // Measured RDNA2 rows from AnyPS5 #22688, with f64 denormals kept.
+    let rows: &[(u64, u32, u64)] = &[
+        (0x3ff0_0000_0000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0x3ff0_0000_0000_0000, 0x13, 0x00ff_17b3_d073_9f78),
+        (0xbff0_0000_0000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0xbff0_0000_0000_0000, 0x15, 0x0000_0000_0000_0000),
+        (0x0000_0000_0000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0x0000_0000_0000_0000, 0x0, 0x3fe4_5f30_6dc9_c882),
+        (0x4008_0000_0000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0x4008_0000_0000_0000, 0x12, 0x0446_ba93_dd63_f5f2),
+        (0x4202_a05f_2000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0x4202_a05f_2000_0000, 0x1, 0x3c94_a7f0_9d5f_47d4),
+        (0x4630_0000_0000_0000, 0x13, 0x0000_0000_001e_294a),
+        (0x4630_0000_0000_0000, 0x14, 0x0000_0000_0000_0000),
+        (0x4630_0000_0000_0000, 0x12, 0x016c_be2f_67a0_e73e),
+        (0x4630_0000_0000_0000, 0x15, 0x0000_0000_0000_0000),
+        (0x0000_0000_0000_0001, 0x14, 0x0000_0000_0000_294a),
+        (0x0000_0000_0000_0001, 0x3, 0x35f3_c439_041f_e516),
+        (0x0010_0000_0000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0x0010_0000_0000_0000, 0x13, 0x00ff_17b3_d073_9f78),
+        (0x7fe0_0000_0000_0000, 0x0, 0x0b43_dd63_f5f2_f8bc),
+        (0x7fe0_0000_0000_0000, 0x1, 0x0809_e839_cfbc_5294),
+        (0x7fe0_0000_0000_0000, 0x14, 0x0000_0000_0000_0000),
+        (0x7fe0_0000_0000_0000, 0x1e, 0x0000_0000_0000_0000),
+        (0x7e37_e43c_8800_759c, 0x13, 0x0000_0000_0000_0000),
+        (0x7e37_e43c_8800_759c, 0x14, 0x0000_0000_0000_0000),
+        (0x7ff0_0000_0000_0000, 0x14, 0x0000_0000_0000_0000),
+        (0x7ff0_0000_0000_0000, 0x0, 0x0b43_dd63_f5f2_f8bd),
+        (0xfff0_0000_0000_0000, 0x14, 0x0000_0000_0000_0000),
+        (0xfff0_0000_0000_0000, 0x1, 0x07f3_d073_9f78_a529),
+        (0x7ff8_0000_0000_0000, 0x14, 0x0000_0000_0000_0000),
+        (0x7ff8_0000_0000_0000, 0x2, 0x0487_535f_dafd_88fc),
+        (0x7ff0_0000_0000_0001, 0x14, 0x0000_0000_0000_0000),
+        (0x7ff0_0000_0000_0001, 0x0, 0x0b43_dd63_f5f2_f8bd),
+        (0x8000_0000_0000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0x8000_0000_0000_0000, 0x13, 0x00ff_17b3_d073_9f78),
+        (0x3fe0_0000_0000_0000, 0x14, 0x0000_0000_0000_294a),
+        (0x3fe0_0000_0000_0000, 0x1f, 0x0000_0000_0000_0000),
+        (0x4093_4a45_6d5c_faad, 0x14, 0x0000_0000_0000_294a),
+        (0x4093_4a45_6d5c_faad, 0x11, 0x079d_18fd_9a79_7fa8),
+        (0x3ff0_0000_0000_0000, 0xffffffff, 0x0000_0000_0000_0000),
+        (0x3ff0_0000_0000_0000, 0x20, 0x3fe4_5f30_6dc9_c882),
+        (0x4350_0000_0000_0000, 0x0, 0x3fe4_5f30_6dc9_c882),
+        (0x4350_0000_0000_0000, 0x1, 0x3c94_a7f0_9d5f_47d4),
+        (0x4360_0000_0000_0000, 0x0, 0x3fc1_7cc1_b727_220a),
+        (0x4360_0000_0000_0000, 0x1, 0x3c72_9fc2_757d_1f52),
+        (0x7af0_0000_0000_0000, 0x0, 0x084b_a7a3_1fb3_4f2f),
+        (0x7af0_0000_0000_0000, 0x1, 0x04fe_a2d7_527b_ac7e),
+        (0x7b00_0000_0000_0000, 0x0, 0x1037_4f46_3f66_9e5f),
+        (0x7b00_0000_0000_0000, 0x1, 0x0ced_45ae_a4f7_58fd),
+        (0x7b00_0000_0000_0000, 0x5, 0x0000_180c_c118_0000),
+        (0x7d00_0000_0000_0000, 0x4, 0x00f5_d085_6033_0460),
+        (0x7ff0_0000_0000_0000, 0x4, 0x0000_0000_0008_0000),
+    ];
+    let inputs: Vec<_> = rows
+        .iter()
+        .map(|&(x, sel, _)| [x as u32, (x >> 32) as u32, sel, 0])
+        .collect();
+    for mods in [(0, 0, 0, false), (1, 1, 2, true)] {
+        let [w0, w1] = vop3_mod(0x174, 6, vgpr(1), vgpr(3), 128, mods.0, mods.1, mods.2, mods.3);
+        for (word, shift) in [(6, 0), (7, 32)] {
+            let shader = build_valu_cs(&[w0, w1, vop1(0x001, 0, vgpr(word))]);
+            run_cases(&shader, &inputs, |backend, idx, _, got| {
+                let want = (rows[idx].2 >> shift) as u32;
+                assert_eq!(got, want, "{backend}: mods {mods:?}, case {idx}, v{word}");
+            });
+        }
+    }
+    let sgpr_inst = vop3(0x174, 6, sgpr(0), vgpr(3), 128);
+    let sgpr_inputs = [[0u32, 0x7fe0_0000, 1, 0]];
+    for (word, shift) in [(6, 0), (7, 32)] {
+        let shader = build_valu_cs(&[sgpr_inst[0], sgpr_inst[1], vop1(0x001, 0, vgpr(word))]);
+        run_cases(&shader, &sgpr_inputs, |backend, _, _, got| {
+            let want = (0x0809_e839_cfbc_5294u64 >> shift) as u32;
+            assert_eq!(got, want, "{backend}: sgpr v{word}");
+        });
+    }
+    let lit = vop3(0x174, 6, 255, 128, 128);
+    for (word, shift, want) in [
+        (6, 0, 0x3f66_9e5fu32),
+        (7, 32, 0x1037_4f46u32),
+    ] {
+        let _ = shift;
+        let shader = build_valu_cs(&[lit[0], lit[1], 0x7b00_0000, vop1(0x001, 0, vgpr(word))]);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: literal v{word}");
+        });
+    }
 }
 
 #[test]

@@ -21,6 +21,7 @@ use crate::native::{HwStage, NativeProgram, ResourceType, RootType, StageIo, Usa
 use crate::resource::{Address, CODE, Resources, Role, Site, Source};
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
+mod f64;
 mod half;
 mod tables;
 #[cfg(test)]
@@ -668,6 +669,7 @@ struct Lower<'a> {
     /// The program's constant table (the code from the first byte read
     /// through `s_getpc_b64` on): global, first byte, dwords.
     code_table: Option<(V, u32, u32)>,
+    trig_preop_table: Option<V>,
     /// Private (scratch) memory: the lane's array and its dwords.
     scratch: Option<(V, u32)>,
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
@@ -1604,6 +1606,7 @@ impl<'a> Lower<'a> {
             ordered: None,
             made: Default::default(),
             code_table: None,
+            trig_preop_table: None,
             scratch: None,
             counters: HashMap::default(),
             loop_exits: HashMap::default(),
@@ -8641,6 +8644,11 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
+            "v_ceil_f64" | "v_floor_f64" => {
+                self.round_directed_f64(inst, guard, name == "v_ceil_f64")
+            }
+            "v_fract_f64" => self.fract_f64(inst, guard),
+            "v_trig_preop_f64" => self.trig_preop_f64(inst, guard),
             "v_cvt_i32_f32" | "v_cvt_u32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
                 let mut a = f(self, 0)?;
                 if name == "v_cvt_rpi_i32_f32" {
