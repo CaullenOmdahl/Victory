@@ -59,6 +59,10 @@ pub(crate) struct Shadow {
     sparse: Option<Sparse>,
     /// Device-local VRAM mirror (`DEFAULT`) + Wave64 GPU hash state (`card.rs`).
     card: Option<Arc<crate::card::CardState>>,
+    /// The title released the buffer (`crate::shadow::unregister`) while
+    /// a copy-back may still be pending: writing back through the registered
+    /// address would land in whatever took the addresses, so skip copy-back.
+    gone: std::sync::atomic::AtomicBool,
 }
 
 struct Direct {
@@ -316,6 +320,7 @@ impl Shadow {
             clean_spans: Mutex::default(),
             sparse: None,
             card,
+            gone: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -586,6 +591,9 @@ impl Shadow {
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
     /// written.
     pub(crate) fn copy_back(&self, address: usize, len: usize) -> usize {
+        if self.gone.load(Ordering::Relaxed) {
+            return 0;
+        }
         if self.direct.is_some() || self.card.is_some() {
             return 0;
         }
@@ -612,13 +620,13 @@ impl Shadow {
             }
             return 0;
         }
-        if let Some((taken, before)) = &*snapshot
+        if let Some((taken, before)) = &mut *snapshot
             && *taken <= from
-            && to <= taken + before.len()
+            && to <= *taken + before.len()
             && from < to
         {
-            unchanged.begin(start + taken, start + taken + before.len());
-            let before = &before[from - taken..to - taken];
+            unchanged.begin(start + *taken, start + *taken + before.len());
+            let before = &mut before[from - *taken..to - *taken];
             // By 64 KiB piece: the copy compared with its bytes before the
             // submission, title memory read only where the GPU wrote.
             // An unchanged page is never modified by copy-back, so later
@@ -632,7 +640,7 @@ impl Shadow {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
-                let old = &before[at - from..at - from + n];
+                let old = &mut before[at - from..at - from + n];
                 if unchanged.differs(start + at, host, old) {
                     let buf = title.get_or_insert_with(|| {
                         let mut v = pooled(PAGE);
@@ -642,9 +650,11 @@ impl Shadow {
                     let title_slice = &mut buf[..n];
                     if crate::host::read_into((start + at) as *const u8, title_slice) {
                         // Title memory with the GPU's bytes put in; the copy
-                        // takes the title's bytes in turn.
+                        // and saved snapshot take the title's bytes in turn so
+                        // overlapping copy-backs in one submission don't mistake
+                        // earlier CPU writes for GPU writes.
                         if let Some((dirty_start, dirty_end)) =
-                            merge_gpu_writes(title_slice, host, old)
+                            merge_gpu_writes_mut(title_slice, host, old)
                         {
                             let dirty_len = dirty_end - dirty_start;
                             if mode != 1 {
@@ -1144,6 +1154,7 @@ fn placed(
         clean_spans: Mutex::default(),
         sparse: None,
         card: None,
+        gone: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -2048,6 +2059,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
             of,
         }),
         card: None,
+        gone: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -2597,6 +2609,7 @@ pub(crate) fn unregister(resource: usize, start: u64) {
     };
     drop(map);
     if let Some(shadow) = gone.and_then(|e| e.shadow) {
+        shadow.gone.store(true, Ordering::Relaxed);
         crate::host::retire(shadow);
     }
 }
@@ -2973,6 +2986,118 @@ mod tests {
                 "no reuse for an ask past the window"
             );
         }
+    }
+
+    /// Overlapping copy-backs within a single submission must update the saved
+    /// `before` snapshot after merging so a second overlapping copy-back does
+    /// not mistake earlier CPU writes (copied into `host`) for GPU writes.
+    #[test]
+    fn overlapping_copy_backs_do_not_clobber_newer_cpu_writes() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let len = 2 * PAGE;
+        let cases = [
+            ("partial_then_wider", (0, 0x1000), (0, 0x2000), 0),
+            ("partial_then_whole_page", (0x1000, 0x1000), (0, PAGE), 0x1000),
+        ];
+        for (label, (off1, len1), (off2, len2), probe) in cases {
+            // SAFETY: fresh RW allocation of two pages, freed below.
+            let p = unsafe {
+                VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+            } as usize;
+            assert_ne!(p, 0);
+            let write_title = |at: usize, v: u8| {
+                // SAFETY: bytes inside our allocated test pages.
+                unsafe { ((p + at) as *mut u8).write_volatile(v) };
+            };
+            let read_title = |at: usize| {
+                // SAFETY: bytes inside our allocated test pages.
+                unsafe { ((p + at) as *const u8).read_volatile() }
+            };
+            write_title(probe, 0x11);
+            write_title(probe + 1, 0x11);
+            register(p, p as u64, len as u64);
+            let Some(copy) = find(p as u64, len as u64) else {
+                unregister(p, p as u64);
+                // SAFETY: freeing our allocation.
+                unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+                return;
+            };
+            copy.update(p, len);
+            copy.writing(p + off1, len1);
+            copy.writing(p + off2, len2);
+            // GPU writes byte `probe`; CPU concurrently writes byte `probe + 1`.
+            // SAFETY: `probe` is inside `copy.data` of length `len`.
+            unsafe { copy.data.add(probe).write_volatile(0xAA) };
+            write_title(probe + 1, 0x22);
+            copy.copy_back(p + off1, len1);
+            assert_eq!(read_title(probe), 0xAA, "{label}: first GPU writeback");
+            assert_eq!(read_title(probe + 1), 0x22, "{label}: first CPU write preserved");
+
+            // Title writes a newer byte to `probe + 1` before the overlapping
+            // second copy-back of the same submission runs.
+            write_title(probe + 1, 0x33);
+            copy.copy_back(p + off2, len2);
+            assert_eq!(read_title(probe), 0xAA, "{label}: GPU write stays");
+            assert_eq!(
+                read_title(probe + 1),
+                0x33,
+                "{label}: newer CPU write must not be clobbered by stale before snapshot"
+            );
+            unregister(p, p as u64);
+            // SAFETY: freeing our allocation.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        }
+    }
+
+    /// Pending copy-back when title unregisters and reuses an address range
+    /// must not overwrite the newly allocated title memory.
+    #[test]
+    fn a_pending_copy_back_does_not_write_into_memory_the_title_took_back() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+        };
+        let len = PAGE;
+        // SAFETY: fresh RW allocation of one page, freed below.
+        let p = unsafe {
+            VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(p, 0);
+        register(p, p as u64, len as u64);
+        let Some(copy) = find(p as u64, len as u64) else {
+            unregister(p, p as u64);
+            // SAFETY: freeing our allocation.
+            unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+            return;
+        };
+        copy.update(p, len);
+        copy.writing(p, 64);
+        // SAFETY: inside `copy.data`.
+        unsafe { copy.data.add(24).write_volatile(0x99) };
+        unregister(p, p as u64);
+        // SAFETY: freeing our own allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+        // SAFETY: re-allocating a fresh page to test reuse guard.
+        let q = unsafe {
+            VirtualAlloc(std::ptr::null(), len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
+        } as usize;
+        assert_ne!(q, 0);
+        // SAFETY: filling our fresh page.
+        unsafe { std::ptr::write_bytes(q as *mut u8, 0xee, len) };
+        if q != p {
+            // SAFETY: freeing our page.
+            unsafe { VirtualFree(q as *mut _, 0, MEM_RELEASE) };
+            // Still verify `copy_back` short-circuits via `gone`.
+            assert_eq!(copy.copy_back(p, 64), 0);
+            return;
+        }
+        assert_eq!(copy.copy_back(p, 64), 0);
+        // SAFETY: reading from our re-used page.
+        let after = unsafe { (q as *const u8).add(24).read_volatile() };
+        // SAFETY: freeing our page.
+        unsafe { VirtualFree(q as *mut _, 0, MEM_RELEASE) };
+        assert_eq!(after, 0xee);
     }
 
     #[test]

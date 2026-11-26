@@ -470,6 +470,11 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
             }
         } else if let Some(host) = host {
             host.reset();
+        } else {
+            *host = spare();
+            if host.is_none() {
+                return crate::object::E_OUTOFMEMORY;
+            }
         }
         state.reset(pipeline);
     }
