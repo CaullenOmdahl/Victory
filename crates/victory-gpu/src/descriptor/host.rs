@@ -3406,7 +3406,7 @@ fn constant_view_size(size: u32) -> u32 {
         );
         return MOST;
     }
-    size.max(1).next_multiple_of(256)
+    size.next_multiple_of(256)
 }
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
@@ -3786,6 +3786,7 @@ mod tests {
     /// most the host takes.
     #[test]
     fn constant_views_are_at_most_64_kib() {
+        assert_eq!(constant_view_size(0), 0);
         assert_eq!(constant_view_size(16), 256);
         assert_eq!(constant_view_size(256), 256);
         assert_eq!(constant_view_size(65_536), 65_536);
