@@ -50,6 +50,13 @@ pub enum Atom {
     Opaque(Value, Value),
     /// A constant mask other than all lanes or none.
     Constant(u64),
+    /// The register pair of an [`Atom::Opaque`] mask is not zero: the same
+    /// in every lane (`s_cbranch_vccz`/`vccnz` test VCC whole).
+    Nonzero(Value, Value),
+    /// The mask this diagram gives lane by lane, over atoms held in
+    /// scalars (opaque masks, constants, SCC and the above), has some bit
+    /// set: the same in every lane. Lowered as the scalar mask's words.
+    Any(Bool),
 }
 
 /// Reduced ordered binary decision diagrams over [`Atom`]s.
@@ -61,7 +68,7 @@ pub struct Bools {
     memo: Map<(Bool, Bool, Bool), Bool>,
     atoms: Vec<Atom>,
     /// Reverse-postorder index of the block that defines each atom.
-    born: Vec<usize>,
+    pub(crate) born: Vec<usize>,
     ids: Map<Atom, u32>,
     overflow: bool,
 }
@@ -144,7 +151,7 @@ impl Bools {
     /// The variables `b` tests, in the order a depth-first walk meets them.
     /// Each node is visited once: scanning lists of every node and variable
     /// seen made this quadratic in the size of `b`.
-    fn vars(&self, b: Bool) -> Vec<u32> {
+    pub(crate) fn vars(&self, b: Bool) -> Vec<u32> {
         let (mut seen, mut found) = (Seen::default(), Seen::default());
         let (mut vars, mut stack) = (Vec::new(), vec![b]);
         while let Some(b) = stack.pop() {
@@ -321,6 +328,35 @@ impl Bools {
         values.sort_unstable();
         self.restrict(b, &values, &mut Map::default())
     }
+
+    /// Whether some lane below `lanes` holds `b`, which tests constant
+    /// masks beside atoms the same in every lane: a condition over the
+    /// latter, each constant replaced by its bit for the lane.
+    fn some_lane(&mut self, b: Bool, lanes: u32) -> Bool {
+        let mut masks: Vec<(u32, u64)> = self
+            .vars(b)
+            .into_iter()
+            .filter_map(|v| match self.atoms[v as usize] {
+                Atom::Constant(k) => Some((v, k)),
+                _ => None,
+            })
+            .collect();
+        if masks.is_empty() {
+            return b;
+        }
+        masks.sort_unstable();
+        let mut any = Bool::FALSE;
+        for lane in 0..lanes {
+            let values: Vec<(u32, bool)> =
+                masks.iter().map(|&(v, k)| (v, k >> lane & 1 != 0)).collect();
+            let r = self.restrict(b, &values, &mut Map::default());
+            any = self.or(any, r);
+            if any == Bool::TRUE {
+                break;
+            }
+        }
+        any
+    }
 }
 
 /// How a lane leaves a block.
@@ -328,7 +364,8 @@ impl Bools {
 pub enum LaneExit {
     Jump(usize),
     /// To `taken` in lanes where `when` holds. A condition over
-    /// [`Atom::Uniform`]s only is a uniform branch.
+    /// [`Atom::Uniform`]s, [`Atom::Nonzero`]s and [`Atom::Any`]s only is a
+    /// uniform branch.
     Branch {
         when: Bool,
         taken: usize,
@@ -1093,18 +1130,52 @@ impl<'a> Lanes<'a> {
         }
     }
 
+    /// VCC as a whole is not zero, one condition for the wave, when it is
+    /// held in scalars: masks the pass cannot see into, constants and SCC
+    /// selections, however combined (`s_not_b64`, `s_cselect_b64`,
+    /// `s_and_b64` ...). `None` when a lane result or a join feeds it.
+    fn whole(&mut self, vcc: Bool) -> Option<Bool> {
+        let support = self.b.support(vcc);
+        let scalar = |a: &Atom| {
+            matches!(
+                a,
+                Atom::Opaque(..) | Atom::Constant(_) | Atom::Uniform(_) | Atom::Nonzero(..)
+            )
+        };
+        if !support.iter().all(scalar) {
+            return None;
+        }
+        if let Some((Atom::Opaque(lo, hi), Bool::FALSE, Bool::TRUE)) = self.b.node(vcc) {
+            let born = self.born(lo).max(self.born(hi));
+            return Some(self.b.atom(Atom::Nonzero(lo, hi), born));
+        }
+        if !support.iter().any(|a| matches!(a, Atom::Opaque(..))) {
+            // Constants and wave values only: decided here, lane by lane.
+            let lanes = if self.p.wave64 { 64 } else { 32 };
+            return Some(self.b.some_lane(vcc, lanes));
+        }
+        let vars = self.b.vars(vcc);
+        let born = vars.iter().map(|&v| self.b.born[v as usize]).max().unwrap_or(0);
+        Some(self.b.atom(Atom::Any(vcc), born))
+    }
+
     /// The per-lane condition under which a block's closing branch is taken.
     fn branch(&mut self, inst: &Inst) -> Bool {
-        let exec = self.exec(inst);
         match inst.name() {
-            "s_cbranch_execz" => self.b.not(exec),
-            "s_cbranch_execnz" => exec,
+            "s_cbranch_execz" => {
+                let exec = self.exec(inst);
+                self.b.not(exec)
+            }
+            "s_cbranch_execnz" => self.exec(inst),
+            // Hardware tests raw VCC as a whole (RDNA2 ISA 12.5), not
+            // VCC & EXEC: inactive lanes can hold VCC bits; scalar VCC
+            // expressions decide once for the wave (`whole`).
             n @ ("s_cbranch_vccz" | "s_cbranch_vccnz") => {
                 let vcc = match self.key(|r| inst.read(r), VCC) {
                     Some(k) => self.mask(k).0,
                     None => Bool::FALSE,
                 };
-                let any = self.b.and(vcc, exec);
+                let any = self.whole(vcc).unwrap_or(vcc);
                 if n.ends_with("nz") {
                     any
                 } else {
@@ -1333,6 +1404,104 @@ mod tests {
         };
         assert!(matches!(s.bools.support(when)[..], [Atom::Uniform(_)]));
         assert_eq!(guarded(&s), 0);
+    }
+
+    #[test]
+    fn cbranch_vcc_tests_raw_vcc_without_exec_masking() {
+        let p = build(
+            &[
+                0x7D84_0080, // v_cmp_eq_u32 vcc, 0, v0
+                0x7DA4_0281, // v_cmpx_eq_u32 exec, 1, v1 (exec does not gate vcc)
+                0xBF86_0001, // s_cbranch_vccz -> 16
+                0x7E04_0280, // v_mov_b32 v2, 0
+                S_ENDPGM,    // 16
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let cmp = p.blocks[0].insts[0].write(Reg::S(VCC)).unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits)
+        };
+        // `s_cbranch_vccz` tests raw VCC (all active/inactive bits of `cmp`), not `cmp & exec`.
+        assert!(matches!(
+            s.bools.support(when)[..],
+            [Atom::Any(_)] | [Atom::Lane(_)]
+        ));
+        if let [Atom::Lane(id)] = s.bools.support(when)[..] {
+            assert_eq!(id, cmp);
+        }
+        assert!(s.one_way().is_empty());
+    }
+
+    #[test]
+    fn vcc_branches_on_scalar_masks_are_uniform() {
+        let p = build(
+            &[
+                0xBEEA_0300, // s_mov_b32 vcc_lo, s0
+                0xBF86_0001, // s_cbranch_vccz -> 12
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,    // 12
+            ],
+            false,
+        );
+        let s = structure(&p).unwrap();
+        let LaneExit::Branch { when, .. } = s.exits[0] else {
+            panic!("{:?}", s.exits)
+        };
+        assert!(matches!(
+            s.bools.support(when)[..],
+            [Atom::Nonzero(_, _)]
+        ));
+        assert!(matches!(
+            s.exits[0],
+            LaneExit::Branch { .. }
+        ));
+    }
+
+    #[test]
+    fn vcc_branches_on_scalar_expressions_are_uniform() {
+        // Non-mask scalar arithmetic (`s_add_u32`) writing `vcc_lo`: `some_lane` emits `Nonzero`.
+        let add = build(
+            &[
+                0x806A_0100, // s_add_u32 vcc_lo, s0, s1
+                0xBF87_0001, // s_cbranch_vccnz -> 12
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,    // 12
+            ],
+            false,
+        );
+        let s_add = structure(&add).unwrap();
+        let LaneExit::Branch { when, .. } = s_add.exits[0] else {
+            panic!("{:?}", s_add.exits)
+        };
+        assert!(
+            matches!(s_add.bools.support(when)[..], [Atom::Nonzero(_, _)]),
+            "{:?}",
+            s_add.bools.support(when)
+        );
+        assert!(s_add.one_way().is_empty());
+
+        // Mask-modeled scalar bitwise op (`s_and_b32`) writing `vcc_lo`: `some_lane` emits `Any`.
+        let and = build(
+            &[
+                0x876A_0100, // s_and_b32 vcc_lo, s0, s1
+                0xBF87_0001, // s_cbranch_vccnz -> 12
+                0x7E02_0280, // v_mov_b32 v1, 0
+                S_ENDPGM,    // 12
+            ],
+            false,
+        );
+        let s_and = structure(&and).unwrap();
+        let LaneExit::Branch { when, .. } = s_and.exits[0] else {
+            panic!("{:?}", s_and.exits)
+        };
+        assert!(
+            matches!(s_and.bools.support(when)[..], [Atom::Any(_)]),
+            "{:?}",
+            s_and.bools.support(when)
+        );
+        assert!(s_and.one_way().is_empty());
     }
 
     #[test]

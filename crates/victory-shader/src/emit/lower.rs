@@ -23,6 +23,7 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod f64;
 mod half;
+mod scalar_vcc;
 mod tables;
 #[cfg(test)]
 mod packed_mod_tests;
@@ -1423,7 +1424,7 @@ impl<'a> Lower<'a> {
                 x.st.bools
                     .support(when)
                     .iter()
-                    .all(|a| matches!(a, Atom::Uniform(_)))
+                    .all(|a| matches!(a, Atom::Uniform(_) | Atom::Nonzero(..) | Atom::Any(_)))
             };
             wants_console_flow |= x.target.runs(wave)
                 && live().any(|i| matches!(i.name(), "v_readlane_b32" | "v_writelane_b32"))
@@ -4115,6 +4116,22 @@ impl<'a> Lower<'a> {
             }
             Atom::Opaque(..) => Err("an opaque lane mask"),
             Atom::Constant(_) => Err("a constant lane mask"),
+            // The pair as a whole is not zero: one value for the wave.
+            Atom::Nonzero(lo, hi) => {
+                self.check_scalar_vcc_joins(lo, hi)?;
+                let word = |w: Val| match w {
+                    Val::I32(x) => Ok(x),
+                    _ => Err("an opaque lane mask"),
+                };
+                let mut x = word(self.get(lo)?)?;
+                if self.x.native.wave64 && hi != lo {
+                    let h = word(self.get(hi)?)?;
+                    x = self.s.m.bin(at, Bin::Or, x, h);
+                }
+                let z = self.s.m.i32(0);
+                Ok(self.s.m.cmp(at, pred::NE, x, z))
+            }
+            Atom::Any(mask) => self.any_bit(at, mask),
         }
     }
 
@@ -13489,7 +13506,7 @@ impl<'a> Lower<'a> {
                         .bools
                         .support(when)
                         .iter()
-                        .all(|a| matches!(a, Atom::Uniform(_)))
+                        .all(|a| matches!(a, Atom::Uniform(_) | Atom::Nonzero(..) | Atom::Any(_)))
             }
             _ => false,
         })

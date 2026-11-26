@@ -745,7 +745,7 @@ fn tally_structured(program: &ir::Program, s: &structure::Structured, t: &mut Ta
             if s.bools
                 .support(when)
                 .iter()
-                .all(|a| matches!(a, Atom::Uniform(_)))
+                .all(|a| matches!(a, Atom::Uniform(_) | Atom::Nonzero(..) | Atom::Any(_)))
             {
                 t.uniform_branches += 1;
             } else {
