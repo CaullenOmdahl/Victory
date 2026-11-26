@@ -102,6 +102,8 @@ Speed:
   overridable via `VICTORY_CARD_BUFFERS_MB`, minimum size via
   `VICTORY_CARD_BUFFERS_MIN_KB` / `VICTORY_CARD_BUFFERS_MIN_MB`, piece hash
   granularity via `VICTORY_CARD_PIECE_KB=4|16|64`).
+- Stale write-watched 64 KiB pages can copy only the 4 KiB kernel subpages
+  reported by `GetWriteWatch` (`VICTORY_DIRTY_4K=1`, off by default).
 
 Memory the title shows at several addresses:
 - Every view of a guarded physical page is guarded with it, so a write of

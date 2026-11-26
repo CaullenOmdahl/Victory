@@ -880,7 +880,8 @@ impl Shadow {
             // this shadow as guarded so subsequent calls skip GetWriteWatch.
             if let Some((now, written)) = crate::watch::writes(from, to, false) {
                 self.watched.store(1, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let subs = crate::watch::subpages(from, to);
+                let copied = self.copy_stale(from, to, now, &written, &subs);
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -898,7 +899,7 @@ impl Shadow {
             let ge = crate::watch::region_epoch(from, to);
             if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
                 self.watched.store(WATCHED_GUARDED, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written);
+                let copied = self.copy_stale(from, to, now, &written, &[]);
                 if !self.page_epochs.is_empty() {
                     self.stamp_page_epochs(from, to, p0, p1, &pre);
                 } else if crate::watch::region_epoch(from, to) == ge {
@@ -1017,7 +1018,7 @@ impl Shadow {
             }
             let pre: Vec<u64> = (rp0..=rp1).map(|p| crate::watch::block_epoch(p * PAGE)).collect();
             if let Some((now, written)) = crate::watch::writes_guarded(rs, re) {
-                let n = self.copy_stale(rs, re, now, &written);
+                let n = self.copy_stale(rs, re, now, &written, &[]);
                 copied += n;
                 self.stamp_page_epochs(rs, re, rp0, rp1, &pre);
                 if let Some(ge) = partial_ge
@@ -1038,7 +1039,8 @@ impl Shadow {
             } else if self.sparse.is_some()
                 && let Some((now, written)) = crate::watch::writes(rs, re, false)
             {
-                let n = self.copy_stale(rs, re, now, &written);
+                let subs = crate::watch::subpages(rs, re);
+                let n = self.copy_stale(rs, re, now, &written, &subs);
                 copied += n;
                 #[cfg(feature = "diagnostics")]
                 {
@@ -1083,7 +1085,7 @@ impl Shadow {
             }
         }
         if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
-            let copied = self.copy_stale(from, to, now, &written);
+            let copied = self.copy_stale(from, to, now, &written, &[]);
             if crate::watch::region_epoch(from, to) == ge {
                 let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
                 if spans.len() >= 8192 {
@@ -1104,7 +1106,8 @@ impl Shadow {
         if self.sparse.is_some()
             && let Some((now, written)) = crate::watch::writes(from, to, false)
         {
-            let copied = self.copy_stale(from, to, now, &written);
+            let subs = crate::watch::subpages(from, to);
+            let copied = self.copy_stale(from, to, now, &written, &subs);
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1235,12 +1238,22 @@ impl Shadow {
 
     /// Copies the pages of `[from, to)` written after their last copy
     /// (`written`: last writes by page, in page order; `now`: this
-    /// asking), whole pages within the buffer.
-    fn copy_stale(&self, from: usize, to: usize, now: u64, written: &[(usize, u64)]) -> usize {
+    /// asking), whole pages within the buffer, or only the 4 KiB sub-pages in
+    /// `subs` (`VICTORY_DIRTY_4K=1`) when `prev_ask <= taken`.
+    fn copy_stale(
+        &self,
+        from: usize,
+        to: usize,
+        now: u64,
+        written: &[(usize, u64)],
+        subs: &[(usize, u64, u64, u16)],
+    ) -> usize {
+        const KERNEL_PAGE: usize = 4096;
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
         let mut writes = written.iter().peekable();
-        let (mut bytes, mut run) = (0, None);
+        let mut sub_iter = subs.iter().peekable();
+        let (mut bytes, mut run): (usize, Option<usize>) = (0, None);
         let last = (to - 1) / PAGE;
         for page in from / PAGE..=last {
             let write = match writes.peek() {
@@ -1250,15 +1263,50 @@ impl Shadow {
                 }
                 _ => 0,
             };
+            while sub_iter.peek().is_some_and(|s| s.0 < page) {
+                sub_iter.next();
+            }
+            let sub = sub_iter
+                .peek()
+                .filter(|s| s.0 == page && s.1 == write && write != 0)
+                .map(|s| (s.2, s.3));
             let at = &mut copied[page - base];
             if *at == 0 || write > *at {
+                let taken = *at;
                 // A page only partly in the range is copied in part: it
                 // stays stale for the rest.
                 let (start, end) = (self.start as usize, (self.start + self.len) as usize);
                 if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
                     *at = now;
                 }
-                run.get_or_insert(page);
+                if let Some((prev_ask, bits)) = sub
+                    && taken != 0
+                    && prev_ask <= taken
+                    && bits != 0
+                    && bits != u16::MAX
+                {
+                    if let Some(first) = run.take() {
+                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                    }
+                    let mut k = 0usize;
+                    while k < PAGE / KERNEL_PAGE {
+                        if bits & (1 << k) == 0 {
+                            k += 1;
+                            continue;
+                        }
+                        let k_start = k;
+                        while k < PAGE / KERNEL_PAGE && (bits & (1 << k)) != 0 {
+                            k += 1;
+                        }
+                        let sub_from = (page * PAGE + k_start * KERNEL_PAGE).max(from);
+                        let sub_to = (page * PAGE + k * KERNEL_PAGE).min(to);
+                        if sub_from < sub_to {
+                            bytes += self.copy(sub_from, sub_to);
+                        }
+                    }
+                } else {
+                    run.get_or_insert(page);
+                }
             } else if let Some(first) = run.take() {
                 bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
             }
@@ -4448,6 +4496,40 @@ mod find_cache_tests {
         assert_eq!(memory[2 * PAGE + 260], 0x77);
         assert!(s.before.lock().unwrap().segments.is_empty());
         unregister(resource, base);
+    }
+
+    #[test]
+    fn copy_stale_with_subpages_copies_only_dirty_4k_runs() {
+        let mut backing = vec![0x33u8; 2 * PAGE];
+        let base = backing.as_mut_ptr() as usize;
+        let page_addr = (base + PAGE - 1) & !(PAGE - 1);
+        let page = page_addr / PAGE;
+        let resource = page_addr | 0x5;
+        register(resource, page_addr as u64, PAGE as u64);
+        let s = find(page_addr as u64, 1).expect("shadow");
+        // Seed initial copy at ask 10.
+        assert_eq!(s.copy_stale(page_addr, page_addr + PAGE, 10, &[], &[]), PAGE);
+        // Subpages 1 and 4 dirty at ask 20, prev_ask 5 <= taken 10 -> copies 8192 B.
+        let bits = (1u16 << 1) | (1u16 << 4);
+        let copied = s.copy_stale(
+            page_addr,
+            page_addr + PAGE,
+            20,
+            &[(page, 20)],
+            &[(page, 20, 5, bits)],
+        );
+        assert_eq!(copied, 8192);
+        // prev_ask 25 > taken 20 -> falls back to full 64 KiB page copy.
+        let fallback = s.copy_stale(
+            page_addr,
+            page_addr + PAGE,
+            30,
+            &[(page, 30)],
+            &[(page, 30, 25, bits)],
+        );
+        assert_eq!(fallback, PAGE);
+        unregister(resource, page_addr as u64);
+        let _ = backing.len();
     }
 }
 

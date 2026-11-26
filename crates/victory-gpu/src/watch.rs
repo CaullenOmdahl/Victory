@@ -142,6 +142,47 @@ const JOURNAL_SHARDS: usize = WW_SHARDS;
 static WRITE_WATCH_LOCKS: [Mutex<()>; WW_SHARDS] = [const { Mutex::new(()) }; WW_SHARDS];
 static JOURNALS: [RwLock<BTreeMap<usize, u64>>; JOURNAL_SHARDS] =
     [const { RwLock::new(BTreeMap::new()) }; JOURNAL_SHARDS];
+/// With `VICTORY_DIRTY_4K=1`: `(last_ask, prev_ask, mask_4k)` per 64 KiB page
+/// for writes reported by `GetWriteWatch`, sharded identically to [`JOURNALS`].
+static SUB_JOURNALS: [RwLock<BTreeMap<usize, (u64, u64, u16)>>; JOURNAL_SHARDS] =
+    [const { RwLock::new(BTreeMap::new()) }; JOURNAL_SHARDS];
+
+/// Whether refreshes of stale write-watched pages copy only the 4 KiB subpages
+/// reported by `GetWriteWatch` (`VICTORY_DIRTY_4K=1`, off by default).
+pub(crate) fn dirty4k() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DIRTY_4K").is_some_and(|v| v == "1"))
+}
+
+/// Returns `(page, last_ask, prev_ask, mask_4k)` entries in page order for
+/// `[start, end)` when `VICTORY_DIRTY_4K=1` is enabled.
+pub(crate) fn subpages(start: usize, end: usize) -> Vec<(usize, u64, u64, u16)> {
+    if !dirty4k() || start >= end {
+        return Vec::new();
+    }
+    let (first, last) = (start / PAGE, end.div_ceil(PAGE));
+    let s0 = first >> JOURNAL_PAGE_STRIPE_SHIFT;
+    let s1 = (last - 1) >> JOURNAL_PAGE_STRIPE_SHIFT;
+    if s0 == s1 {
+        let sub = SUB_JOURNALS[journal_shard(first)]
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        return sub
+            .range(first..last)
+            .map(|(&p, &(a, b, m))| (p, a, b, m))
+            .collect();
+    }
+    let mut out = Vec::new();
+    for stripe in s0..=s1 {
+        let lo = first.max(stripe << JOURNAL_PAGE_STRIPE_SHIFT);
+        let hi = last.min((stripe + 1) << JOURNAL_PAGE_STRIPE_SHIFT);
+        let sub = SUB_JOURNALS[stripe & (JOURNAL_SHARDS - 1)]
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        out.extend(sub.range(lo..hi).map(|(&p, &(a, b, m))| (p, a, b, m)));
+    }
+    out
+}
 
 #[inline]
 fn journal_shard(page: usize) -> usize {
@@ -172,48 +213,132 @@ fn journal_read_range(first: usize, last: usize) -> Vec<(usize, u64)> {
     out
 }
 
-fn journal_record_and_read(pages: &[usize], now: u64, first: usize, last: usize) -> Vec<(usize, u64)> {
-    if first < last {
+fn journal_record_and_read(
+    pages: &[(usize, u16)],
+    now: u64,
+    first: usize,
+    last: usize,
+    kernel_sub: bool,
+) -> Vec<(usize, u64)> {
+    let track_sub = kernel_sub && dirty4k();
+    let clear_sub = !kernel_sub && dirty4k();
+    let single = if first < last {
         let s0 = first >> JOURNAL_PAGE_STRIPE_SHIFT;
         let s1 = (last - 1) >> JOURNAL_PAGE_STRIPE_SHIFT;
-        if s0 == s1 && pages.iter().all(|&p| (p >> JOURNAL_PAGE_STRIPE_SHIFT) == s0) {
-            let mut j = JOURNALS[s0 & (JOURNAL_SHARDS - 1)]
+        (s0 == s1 && pages.iter().all(|&(p, _)| (p >> JOURNAL_PAGE_STRIPE_SHIFT) == s0)).then_some(s0)
+    } else {
+        None
+    };
+    if let Some(s0) = single {
+        let shard = s0 & (JOURNAL_SHARDS - 1);
+        let mut prevs: Vec<(usize, u64, u16)> = Vec::new();
+        let out = {
+            let mut j = JOURNALS[shard].write().unwrap_or_else(|e| e.into_inner());
+            for &(page, mask) in pages {
+                let before = j.insert(page, now).unwrap_or(0);
+                if track_sub {
+                    prevs.push((page, before, mask));
+                }
+            }
+            j.range(first..last).map(|(&p, &w)| (p, w)).collect()
+        };
+        if track_sub && !prevs.is_empty() {
+            let mut sub = SUB_JOURNALS[shard]
                 .write()
                 .unwrap_or_else(|e| e.into_inner());
-            for &page in pages {
-                j.insert(page, now);
+            for (page, before, mask) in prevs {
+                record_sub_entry(&mut sub, page, now, before, mask);
             }
-            return j.range(first..last).map(|(&p, &w)| (p, w)).collect();
+        } else if clear_sub && !pages.is_empty() {
+            let mut sub = SUB_JOURNALS[shard]
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for &(page, _) in pages {
+                sub.remove(&page);
+            }
         }
+        return out;
     }
     let mut i = 0;
     while i < pages.len() {
-        let stripe = pages[i] >> JOURNAL_PAGE_STRIPE_SHIFT;
-        let mut j = JOURNALS[stripe & (JOURNAL_SHARDS - 1)]
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        while i < pages.len() && (pages[i] >> JOURNAL_PAGE_STRIPE_SHIFT) == stripe {
-            j.insert(pages[i], now);
-            i += 1;
+        let stripe = pages[i].0 >> JOURNAL_PAGE_STRIPE_SHIFT;
+        let shard = stripe & (JOURNAL_SHARDS - 1);
+        let mut prevs: Vec<(usize, u64, u16)> = Vec::new();
+        {
+            let mut j = JOURNALS[shard].write().unwrap_or_else(|e| e.into_inner());
+            while i < pages.len() && (pages[i].0 >> JOURNAL_PAGE_STRIPE_SHIFT) == stripe {
+                let (page, mask) = pages[i];
+                let before = j.insert(page, now).unwrap_or(0);
+                if track_sub {
+                    prevs.push((page, before, mask));
+                }
+                i += 1;
+            }
+        }
+        if track_sub && !prevs.is_empty() {
+            let mut sub = SUB_JOURNALS[shard]
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for (page, before, mask) in prevs {
+                record_sub_entry(&mut sub, page, now, before, mask);
+            }
+        } else if clear_sub {
+            let mut sub = SUB_JOURNALS[shard]
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            // Clear every page belonging to this stripe just processed above.
+            let mut k = i;
+            while k > 0 && (pages[k - 1].0 >> JOURNAL_PAGE_STRIPE_SHIFT) == stripe {
+                k -= 1;
+                sub.remove(&pages[k].0);
+            }
         }
     }
     journal_read_range(first, last)
+}
+
+fn record_sub_entry(
+    sub: &mut BTreeMap<usize, (u64, u64, u16)>,
+    page: usize,
+    now: u64,
+    before: u64,
+    mask: u16,
+) {
+    if before == now {
+        if let Some(entry) = sub.get_mut(&page)
+            && entry.0 == now
+        {
+            entry.2 |= mask;
+        }
+    } else {
+        sub.insert(page, (now, before, mask));
+    }
 }
 
 fn journal_record_range(first: usize, last: usize, now: u64) {
     if first >= last {
         return;
     }
+    let clear_sub = dirty4k();
     let s0 = first >> JOURNAL_PAGE_STRIPE_SHIFT;
     let s1 = (last - 1) >> JOURNAL_PAGE_STRIPE_SHIFT;
     for stripe in s0..=s1 {
         let lo = first.max(stripe << JOURNAL_PAGE_STRIPE_SHIFT);
         let hi = last.min((stripe + 1) << JOURNAL_PAGE_STRIPE_SHIFT);
-        let mut j = JOURNALS[stripe & (JOURNAL_SHARDS - 1)]
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        for page in lo..hi {
-            j.insert(page, now);
+        let shard = stripe & (JOURNAL_SHARDS - 1);
+        {
+            let mut j = JOURNALS[shard].write().unwrap_or_else(|e| e.into_inner());
+            for page in lo..hi {
+                j.insert(page, now);
+            }
+        }
+        if clear_sub {
+            let mut sub = SUB_JOURNALS[shard]
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            for page in lo..hi {
+                sub.remove(&page);
+            }
         }
     }
 }
@@ -303,7 +428,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let ww = lock_write_watch(first * PAGE, last * PAGE);
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
-    let (failed, pages): (bool, Vec<usize>) = FOUND.with(|cell| {
+    let (failed, pages): (bool, Vec<(usize, u16)>) = FOUND.with(|cell| {
         let mut found = cell.borrow_mut();
         if found.len() < needed {
             found.resize(needed, 0);
@@ -324,13 +449,13 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         if failed {
             (true, Vec::new())
         } else {
-            let mut dedup = Vec::with_capacity(count.min(last - first));
-            let mut prev = None;
+            let mut dedup: Vec<(usize, u16)> = Vec::with_capacity(count.min(last - first));
             for &at in &found[..count] {
                 let page = at / PAGE;
-                if prev != Some(page) {
-                    dedup.push(page);
-                    prev = Some(page);
+                let bit = 1u16 << ((at % PAGE) / KERNEL_PAGE);
+                match dedup.last_mut() {
+                    Some((prev_page, mask)) if *prev_page == page => *mask |= bit,
+                    _ => dedup.push((page, bit)),
                 }
             }
             (false, dedup)
@@ -354,7 +479,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         drop(ww);
         return Some((now, journal_read_range(first, last)));
     }
-    let out = journal_record_and_read(&pages, now, first, last);
+    let out = journal_record_and_read(&pages, now, first, last, true);
     drop(ww);
     Some((now, out))
 }
@@ -377,7 +502,8 @@ pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usiz
     if guarded.is_empty() {
         return Some((now, journal_read_range(first, last)));
     }
-    Some((now, journal_record_and_read(&guarded, now, first, last)))
+    let whole: Vec<(usize, u16)> = guarded.into_iter().map(|p| (p, 0)).collect();
+    Some((now, journal_record_and_read(&whole, now, first, last, false)))
 }
 
 /// Guarded blocks of view memory.
@@ -2202,12 +2328,12 @@ mod tests {
         assert_ne!(journal_shard(boundary_lo), journal_shard(boundary_hi));
 
         // Single-stripe insert & read.
-        let got_single = journal_record_and_read(&[p0, p0 + 3], 101, p0, p0 + 4);
+        let got_single = journal_record_and_read(&[(p0, 0), (p0 + 3, 0)], 101, p0, p0 + 4, false);
         assert_eq!(got_single, vec![(p0, 101), (p0 + 3, 101)]);
 
         // Cross-stripe boundary + non-leaking wrap-around stripe.
         journal_record_range(boundary_lo, boundary_hi + 1, 202);
-        let _ = journal_record_and_read(&[wrap], 303, wrap, wrap + 1);
+        let _ = journal_record_and_read(&[(wrap, 0)], 303, wrap, wrap + 1, false);
         assert_eq!(
             journal_read_range(boundary_lo, boundary_hi + 1),
             vec![
@@ -2267,5 +2393,28 @@ mod tests {
         }
         // SAFETY: freeing our private allocation after unprotecting it.
         unsafe { VirtualFree(base as *mut _, 0, MEM_RELEASE) };
+    }
+
+    #[test]
+    fn subpage_mask_tracks_4k_writes_and_clears_on_whole_page_record() {
+        let page = 0x20_000usize;
+        let mut j = BTreeMap::new();
+        let mut sub = BTreeMap::new();
+
+        // First asking: accumulates two 4 KiB bits at ask 100.
+        let before = j.insert(page, 100).unwrap_or(0);
+        record_sub_entry(&mut sub, page, 100, before, 1 << 1);
+        let before = j.insert(page, 100).unwrap_or(0);
+        record_sub_entry(&mut sub, page, 100, before, 1 << 4);
+        assert_eq!(sub.get(&page), Some(&(100, 0, (1 << 1) | (1 << 4))));
+
+        // Second asking at 250 advances prev_ask to 100 and replaces the 4 KiB mask.
+        let before = j.insert(page, 250).unwrap_or(0);
+        record_sub_entry(&mut sub, page, 250, before, 1 << 9);
+        assert_eq!(sub.get(&page), Some(&(250, 100, 1 << 9)));
+
+        // A whole-page non-kernel write removes any sub-page mask entry.
+        sub.remove(&page);
+        assert!(sub.get(&page).is_none());
     }
 }
