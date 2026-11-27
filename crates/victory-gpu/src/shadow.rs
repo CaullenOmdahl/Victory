@@ -1696,7 +1696,7 @@ fn placed(
 const WINDOW_REACH: u64 = 1 << 30;
 
 /// Whether the current process is running under Wine/Proton.
-fn on_wine() -> bool {
+pub(crate) fn on_wine() -> bool {
     static ON_WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON_WINE.get_or_init(|| {
         use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};

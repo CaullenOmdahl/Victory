@@ -45,6 +45,8 @@ pub(crate) struct Pending {
     replaced: AtomicBool,
     /// A pass over the screen (see [`GraphicsState::screen_pass`]).
     screen: bool,
+    /// A single-stage compute pipeline, prioritized and budgeted separately under Wine.
+    compute: bool,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     key: String,
@@ -76,6 +78,7 @@ impl Pending {
         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
         Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
+            compute: matches!(shaders.as_slice(), [cs] if cs.stage == "compute"),
             formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
             variant: OnceLock::new(),
             shaders,
@@ -195,6 +198,34 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
             })
         }
     }
+}
+
+impl Pending {
+    fn waits_alone(&self) -> bool {
+        self.compute && !compute_budget().is_zero()
+    }
+
+    fn priority_lane(&self) -> bool {
+        self.screen || self.waits_alone()
+    }
+}
+
+/// Dedicated per-frame wait budget for first-use compute pipelines under Wine (`VICTORY_COMPUTE_WAIT_MS`).
+fn compute_budget() -> Duration {
+    static BUDGET: OnceLock<Duration> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let asked = std::env::var("VICTORY_COMPUTE_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let millis = asked.unwrap_or(if crate::shadow::on_wine() { 10_000 } else { 0 });
+        if millis != 0 {
+            tracing::info!(
+                millis,
+                "compute passes wait for their host pipeline by a budget of their own (VICTORY_COMPUTE_WAIT_MS)"
+            );
+        }
+        Duration::from_millis(millis)
+    })
 }
 
 /// Signalled whenever a worker has made a pipeline.
@@ -401,15 +432,15 @@ impl Waits {
     }
 }
 
-/// The waits of draws and screen passes for their pipelines.
-static WAITS: [Waits; 2] = [Waits::new(), Waits::new()];
+/// The waits of draws, screen passes, and compute passes for their pipelines.
+static WAITS: [Waits; 3] = [Waits::new(), Waits::new(), Waits::new()];
 
 /// Milliseconds in which a recording thread waited for a pipeline since the
 /// last call (for the frame line): time the title's frame stood still that
 /// no submission's time holds, as the waits are outside the submissions.
 pub(crate) fn take_waited_ms() -> f64 {
     let now = Instant::now();
-    (WAITS[0].take(now) + WAITS[1].take(now)).as_secs_f64() * 1000.0
+    (WAITS[0].take(now) + WAITS[1].take(now) + WAITS[2].take(now)).as_secs_f64() * 1000.0
 }
 
 /// Whether a pipeline is waited for in every frame that draws with it
@@ -432,9 +463,16 @@ fn claim_wait(p: &Pending, frame: u64) -> bool {
 
 /// Waits for `p` while frame `frame` has budget of its kind left.
 fn wait(p: &Pending, frame: u64) {
+    if stuck(p) {
+        return;
+    }
+    if p.waits_alone() {
+        wait_within(&WAITS[2], compute_budget(), p, frame);
+        return;
+    }
     let kind = usize::from(p.screen);
     let budget = [wait_budget(), SCREEN_BUDGET][kind];
-    if budget.is_zero() || stuck(p) {
+    if budget.is_zero() {
         return;
     }
     wait_within(&WAITS[kind], budget, p, frame);
@@ -547,34 +585,34 @@ pub(super) fn worker_lost(id: u32) {
     AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| {
         if w.0 == id {
             w.1.lost.store(true, Ordering::Relaxed);
-            lost = Some(w.1.screen);
+            lost = Some(w.1.priority_lane());
         }
         w.0 != id
     });
-    if let Some(screen) = lost {
+    if let Some(priority) = lost {
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
         drop(_held);
         WAITING.fetch_sub(1, Ordering::Relaxed);
-        worker(LOST.fetch_add(1, Ordering::Relaxed), screen);
+        worker(LOST.fetch_add(1, Ordering::Relaxed), priority);
     }
 }
 
 /// Hands `p` to the workers (half the logical processors, 2 to 8, and two
-/// for screen passes), started on first use.
+/// for priority passes), started on first use.
 fn queue(p: Arc<Pending>, now: bool) {
     static STARTED: [std::sync::Once; 2] = [std::sync::Once::new(), std::sync::Once::new()];
-    let screen = p.screen;
-    let slot = usize::from(screen);
+    let priority = p.priority_lane();
+    let slot = usize::from(priority);
     STARTED[slot].call_once(|| {
-        let workers = if screen {
+        let workers = if priority {
             2
         } else {
             std::thread::available_parallelism().map_or(2, |n| (n.get() * 3 / 4).clamp(2, 16))
         };
         for i in 0..workers {
-            worker(i + if screen { 50 } else { 0 }, screen);
+            worker(i + if priority { 50 } else { 0 }, priority);
         }
     });
     let index = queue_index(&p, now);

@@ -469,8 +469,19 @@ impl State {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         let any_pad = pads.iter().any(Option::is_some);
+        let extra = if any_pad && !keys.is_empty() {
+            fallback(&keys).buttons
+        } else {
+            0
+        };
         for (slot, pad) in pads.into_iter().enumerate() {
-            self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
+            let merged = pad.map(|mut p| {
+                if slot == 0 {
+                    p.buttons |= extra;
+                }
+                p
+            });
+            self.update(devices, slot, merged.map(Value::Pad), now, &mut events);
         }
         let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
@@ -1152,9 +1163,8 @@ mod host {
 
     impl Source for Host {
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            let merge_scripted = |_slot: usize, mut pad: PadState| -> PadState {
-                #[cfg(feature = "diagnostics")]
-                if _slot == 0 {
+            let merge_scripted = |slot: usize, mut pad: PadState| -> PadState {
+                if slot == 0 {
                     for vk in scripted() {
                         for &(mapped_vk, bit) in &FALLBACK_BUTTONS {
                             if mapped_vk == vk {
@@ -1197,10 +1207,7 @@ mod host {
         }
 
         fn keys(&mut self) -> Vec<KeyState> {
-            #[cfg(feature = "diagnostics")]
             let mut down = scripted();
-            #[cfg(not(feature = "diagnostics"))]
-            let mut down = Vec::new();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1241,7 +1248,6 @@ mod host {
     /// 0.2 s that long after input starts, with or without focus. A key is a
     /// letter, a digit, or `Enter`, `Esc`, `Tab`, `Back`, `Up`, `Down`,
     /// `Left`, `Right` (the stand-in pad's table maps them to buttons).
-    #[cfg(feature = "diagnostics")]
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
@@ -1264,7 +1270,6 @@ mod host {
             .collect()
     }
 
-    #[cfg(feature = "diagnostics")]
     fn key_named(name: &str) -> Option<u8> {
         Some(match name {
             "Enter" => 0x0D,
@@ -1284,7 +1289,6 @@ mod host {
 
     /// Debugging aid: keys as in `VICTORY_KEYS`, one per line of the file
     /// `VICTORY_KEYS_FILE`, each held for 0.2 s once its line is there.
-    #[cfg(feature = "diagnostics")]
     fn asked() -> Option<u8> {
         struct Asked {
             looked: Instant,
