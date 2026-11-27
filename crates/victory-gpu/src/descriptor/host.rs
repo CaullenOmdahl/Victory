@@ -1429,6 +1429,7 @@ impl HostHeap {
     /// returned).
     ///
     /// [`dynamic`]: HostHeap::dynamic
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn release(&self, first: u32, n: u32) {
         let Some(at) = first.checked_sub(self.count) else {
             return;
@@ -1437,6 +1438,27 @@ impl HostHeap {
         let end = at.saturating_add(n).min(self.spare) as usize;
         guard.1.clear_range(at as usize, end.saturating_sub(at as usize));
         guard.2 = usize::MAX;
+    }
+
+    /// Gives back multiple `(first, n)` dynamic slot ranges under one lock
+    /// acquisition (`Vice-Tay #234`).
+    pub(crate) fn release_batch(&self, ranges: impl IntoIterator<Item = (u32, u32)>) {
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let mut released = false;
+        for (first, n) in ranges {
+            let Some(at) = first.checked_sub(self.count) else {
+                continue;
+            };
+            let end = at.saturating_add(n).min(self.spare) as usize;
+            let len = end.saturating_sub(at as usize);
+            if len > 0 {
+                guard.1.clear_range(at as usize, len);
+                released = true;
+            }
+        }
+        if released {
+            guard.2 = usize::MAX;
+        }
     }
 
     /// Makes slot `index` (a dynamic one) from `view`; a null view if the

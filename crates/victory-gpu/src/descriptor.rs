@@ -184,6 +184,7 @@ fn mirror(handle: u64) {
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
     if heaps.iter().any(|&(_, _, h)| h == heap)
@@ -191,6 +192,42 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
         && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
     {
         host.release(first, n);
+    }
+}
+
+/// Gives back a list's dynamic descriptor slot ranges under one `SHADER_HEAPS`
+/// read lock and one `HostHeap::next` lock per heap (`Vice-Tay #234`).
+#[cfg(windows)]
+pub(crate) fn release_dynamic_batch(ranges: &[(usize, u32, u32)]) {
+    if ranges.is_empty() {
+        return;
+    }
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    let first_heap = ranges[0].0;
+    if ranges.iter().all(|&(h, _, _)| h == first_heap) {
+        if heaps.iter().any(|&(_, _, h)| h == first_heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(first_heap as *const Heap) }.host.get()
+        {
+            host.release_batch(ranges.iter().map(|&(_, first, n)| (first, n)));
+        }
+        return;
+    }
+    let mut by_heap: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
+    for &(heap, first, n) in ranges {
+        if let Some((_, group)) = by_heap.iter_mut().find(|(h, _)| *h == heap) {
+            group.push((first, n));
+        } else {
+            by_heap.push((heap, vec![(first, n)]));
+        }
+    }
+    for (heap, group) in by_heap {
+        if heaps.iter().any(|&(_, _, h)| h == heap)
+            // SAFETY: registered heaps are live (removed when dropped).
+            && let Some(Some(host)) = unsafe { &*(heap as *const Heap) }.host.get()
+        {
+            host.release_batch(group);
+        }
     }
 }
 
@@ -1332,5 +1369,12 @@ mod tests {
             offset / 32 + 2,
             "the next allocation took the table's second slot"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn release_dynamic_batch_handles_empty_and_stale_heaps() {
+        release_dynamic_batch(&[]);
+        release_dynamic_batch(&[(0xdead_beef, 16, 4), (0xcafe_babe, 32, 8)]);
     }
 }

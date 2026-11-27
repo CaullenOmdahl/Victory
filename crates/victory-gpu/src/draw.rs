@@ -131,9 +131,7 @@ pub(crate) struct State {
 
 impl Drop for State {
     fn drop(&mut self) {
-        for &(heap, first, n) in &self.dynamic {
-            crate::descriptor::release_dynamic(heap, first, n);
-        }
+        crate::descriptor::release_dynamic_batch(&self.dynamic);
     }
 }
 
