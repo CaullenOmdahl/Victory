@@ -282,6 +282,7 @@ impl HeapWorker {
     }
 
     fn run(shared: Arc<Shared>, device: Option<ID3D12Device>) {
+        victory_core::affinity::pin_worker_ccd();
         let mut copy_gpu = device.as_ref().and_then(CopyGpu::new);
         loop {
             let batch: Vec<(Arc<Staging>, Arc<HostTexture>, std::sync::atomic::AtomicBool)> = {

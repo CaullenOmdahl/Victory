@@ -120,6 +120,10 @@ Speed:
   written (`VICTORY_CARD_FETCH_INFLIGHT=1`, off by default), while texture
   change detection uses a fast AVX2 128-bit hash (`texture.rs`) and copy-back
   unchanged checks use AVX2 byte comparisons (`shadow.rs`).
+- On multi-CCD Ryzen CPUs, background worker pools can be pinned off the title's
+  CCD via `VICTORY_CCD=<index|0xmask>` (`0`/`1` by L3 cache topology or hex
+  affinity mask, off by default), and `xmem` skips unmapping/remapping physical
+  pages whose backing slice is unchanged.
 
 Memory the title shows at several addresses:
 - Every view of a guarded physical page is guarded with it, so a write of

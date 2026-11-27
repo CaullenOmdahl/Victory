@@ -1260,6 +1260,66 @@ pub(crate) fn unknown_pages(pages: &[usize]) -> usize {
     pages.iter().filter(|p| !physical.pages.contains_key(p)).count()
 }
 
+/// Count of 64 KiB pages skipped during `XMemMapPhysicalPages` / `map_alias`
+/// because the target address already maps the identical physical slice.
+static SAME_PAGE_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn same_slice_at(physical: &Physical, addr: usize, slice: &Slice) -> bool {
+    physical
+        .views
+        .range(..=addr)
+        .next_back()
+        .is_some_and(|(&vbase, (vlen, vslice))| {
+            addr < vbase + *vlen
+                && Arc::ptr_eq(&vslice.section, &slice.section)
+                && vslice.index + (addr - vbase) / PAGE == slice.index
+        })
+}
+
+/// Applies `slices` across `[base, base + slices.len() * PAGE)`, skipping
+/// pages that already map the identical section slice while unmapping and
+/// remapping only contiguous runs that actually changed.
+fn apply_changed_slices(physical: &mut Physical, base: usize, slices: &[Slice]) -> Option<usize> {
+    let n = slices.len();
+    let mut skipped = 0u64;
+    let mut i = 0;
+    while i < n {
+        if same_slice_at(physical, base + i * PAGE, &slices[i]) {
+            skipped += 1;
+            i += 1;
+            continue;
+        }
+        let changed_start = i;
+        i += 1;
+        while i < n && !same_slice_at(physical, base + i * PAGE, &slices[i]) {
+            i += 1;
+        }
+        unmap(physical, base + changed_start * PAGE, (i - changed_start) * PAGE);
+        let mut j = changed_start;
+        while j < i {
+            let first = slices[j].clone();
+            let run = 1 + slices[j + 1..i]
+                .iter()
+                .zip(1usize..)
+                .take_while(|(s, k)| {
+                    Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + *k
+                })
+                .count();
+            if !map(physical, base + j * PAGE, run * PAGE, first) {
+                if skipped > 0 {
+                    SAME_PAGE_SKIPS.fetch_add(skipped, Ordering::Relaxed);
+                }
+                return Some(j);
+            }
+            j += run;
+        }
+    }
+    if skipped > 0 {
+        SAME_PAGE_SKIPS.fetch_add(skipped, Ordering::Relaxed);
+    }
+    None
+}
+
 /// Maps `n` pages at `address`, replacing any existing mapping in that range;
 /// null `pages` unmaps. Returns `address`, or null if a page is unknown or the
 /// host fails, leaving the range unmapped after rolling back any runs mapped
@@ -1274,45 +1334,31 @@ pub extern "system" fn XMemMapPhysicalPages(
     }
     let base = address as usize;
     let mut physical = physical();
-    if !pages.is_null() {
-        // SAFETY: the title passes `n` page numbers.
-        let pages = unsafe { std::slice::from_raw_parts(pages, n) };
-        if map_whole(&mut physical, base, pages) {
-            return address;
-        }
-    }
-    unmap(&mut physical, base, n * PAGE);
     if pages.is_null() {
+        unmap(&mut physical, base, n * PAGE);
         return address;
     }
     // SAFETY: the title passes `n` page numbers.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
-    let mut i = 0;
-    while i < n {
-        let Some(first) = physical.pages.get(&pages[i]).cloned() else {
-            tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
-            if i > 0 {
-                unmap(&mut physical, base, i * PAGE);
+    if map_whole(&mut physical, base, pages) {
+        return address;
+    }
+    let mut slices = Vec::with_capacity(n);
+    for &page in pages {
+        let Some(slice) = physical.pages.get(&page).cloned() else {
+            tracing::warn!(page, "XMemMapPhysicalPages: unknown page");
+            if !slices.is_empty() {
+                unmap(&mut physical, base, slices.len() * PAGE);
             }
             return std::ptr::null_mut();
         };
-        // One mapping per run of consecutive slices of one section.
-        let run = 1 + pages[i + 1..]
-            .iter()
-            .zip(1..)
-            .take_while(|&(page, k)| {
-                physical.pages.get(page).is_some_and(|s| {
-                    Arc::ptr_eq(&s.section, &first.section) && s.index == first.index + k
-                })
-            })
-            .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
-            if i > 0 {
-                unmap(&mut physical, base, i * PAGE);
-            }
-            return std::ptr::null_mut();
+        slices.push(slice);
+    }
+    if let Some(failed_at) = apply_changed_slices(&mut physical, base, &slices) {
+        if failed_at > 0 {
+            unmap(&mut physical, base, failed_at * PAGE);
         }
-        i += run;
+        return std::ptr::null_mut();
     }
     address
 }
@@ -1489,15 +1535,9 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         else {
             return false;
         };
-        slices.push((to + k, slice));
+        slices.push(slice);
     }
-    unmap(&mut physical, to, len);
-    for (addr, slice) in slices {
-        if !map(&mut physical, addr, PAGE, slice) {
-            return false;
-        }
-    }
-    true
+    apply_changed_slices(&mut physical, to, &slices).is_none()
 }
 
 /// Maps `slice` and the slices after it over `[base, base + len)`, which
@@ -2684,6 +2724,54 @@ mod tests {
         assert_ne!(unsafe { VirtualFree(va, 0, MEM_RELEASE) }, 0);
         assert_eq!(XMemFreePhysicalPages(1, pages.as_ptr()), 1);
     }
+
+    #[test]
+    fn remapping_same_physical_pages_skips_remap_and_preserves_data() {
+        let pages = allocate(3);
+        let va = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            2 * PAGE,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!va.is_null());
+        assert_eq!(XMemMapPhysicalPages(va, 2, pages[0..2].as_ptr()), va);
+        // SAFETY: both mapped 64 KiB pages are committed and writable.
+        unsafe {
+            *(va as *mut u32) = 0xCAFE_BABE;
+            *((va as *mut u8).add(PAGE) as *mut u32) = 0xDEAD_BEEF;
+        }
+
+        let skips_before = super::SAME_PAGE_SKIPS.load(Ordering::Relaxed);
+        // Re-mapping identical pages `[0, 1]` skips both pages cleanly.
+        assert_eq!(XMemMapPhysicalPages(va, 2, pages[0..2].as_ptr()), va);
+        assert_eq!(
+            super::SAME_PAGE_SKIPS.load(Ordering::Relaxed) - skips_before,
+            2
+        );
+        // SAFETY: both pages still hold their written values.
+        unsafe {
+            assert_eq!(*(va as *const u32), 0xCAFE_BABE);
+            assert_eq!(*((va as *const u8).add(PAGE) as *const u32), 0xDEAD_BEEF);
+        }
+
+        // Replacing only page 1 (`[0, 2]`) skips page 0 and remaps only page 1.
+        let mixed = [pages[0], pages[2]];
+        let skips_mid = super::SAME_PAGE_SKIPS.load(Ordering::Relaxed);
+        assert_eq!(XMemMapPhysicalPages(va, 2, mixed.as_ptr()), va);
+        assert_eq!(super::SAME_PAGE_SKIPS.load(Ordering::Relaxed) - skips_mid, 1);
+        // SAFETY: page 0 retains its contents while page 1 reflects the new page 2.
+        unsafe {
+            assert_eq!(*(va as *const u32), 0xCAFE_BABE);
+            assert_eq!(*((va as *const u8).add(PAGE) as *const u32), 0);
+        }
+
+        assert_eq!(XMemMapPhysicalPages(va, 2, std::ptr::null()), va);
+        // SAFETY: `va` is our whole reservation.
+        assert_ne!(unsafe { VirtualFree(va, 0, MEM_RELEASE) }, 0);
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
 }
 
 /// Logs every `VICTORY_MEMORY_LOG_SECS` seconds (5 by default, 0: never)
@@ -2786,7 +2874,7 @@ fn log_memory(peak: &mut usize) {
         target: "victory::memory",
         "commit {} MiB (peak {} MiB): private {} MiB (title range {} MiB; by allocation: {}), \
          mapped {} MiB, image {} MiB; \
-         physical pages {} MiB of sections {} MiB; {}; largest private: {}",
+         physical pages {} MiB of sections {} MiB (same-page skips {}); {}; largest private: {}",
         commit / MIB,
         *peak / MIB,
         private / MIB,
@@ -2796,6 +2884,7 @@ fn log_memory(peak: &mut usize) {
         image / MIB,
         pages / MIB,
         SECTION_BYTES.load(Ordering::Relaxed) / MIB,
+        SAME_PAGE_SKIPS.load(Ordering::Relaxed),
         victory_gpu::memory_report(),
         largest.join(", "),
     );

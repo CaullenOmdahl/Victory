@@ -510,6 +510,7 @@ impl Scheduler {
 
 /// A worker: runs the next read of the most deserving queue.
 fn work(scheduler: &'static Scheduler) {
+    victory_core::affinity::pin_worker_ccd();
     let mut scratch = WorkerScratch::new();
     let mut lanes = scheduler.lock();
     loop {

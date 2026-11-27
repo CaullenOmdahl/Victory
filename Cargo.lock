@@ -670,7 +670,9 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+ "tracing",
  "tracing-subscriber",
+ "windows-sys",
 ]
 
 [[package]]

@@ -4842,6 +4842,7 @@ fn pool() -> &'static Pool {
             if std::thread::Builder::new()
                 .name(format!("victory-pool-{i}"))
                 .spawn(move || {
+                    victory_core::affinity::pin_worker_ccd();
                     struct FinishGuard {
                         shared: &'static PoolShared,
                         remaining: *const std::sync::atomic::AtomicUsize,
