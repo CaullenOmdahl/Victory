@@ -116,15 +116,15 @@ const TEXTURE_3D: u32 = 4;
 /// compression), by DXGI format number. `None` for 1-bit and video
 /// formats. The console adds 116/117 (10-bit float color), 118-120 (16-bit
 /// depth with 8-bit stencil, two planes: 3 bytes per texel), 189 (signed
-/// 10-bit color), 190 (two 4-bit channels) and 191 (24/8 color).
+/// 10-bit color), 190 (two 4-bit channels) and 191 (16-bit two-channel / 8:8).
 pub(crate) fn element(format: u32) -> Option<(u64, u64)> {
     Some(match format {
         1..=4 => (16, 1),
         5..=8 => (12, 1),
         9..=22 => (8, 1),
-        23..=47 | 67 | 87..=93 | 116 | 117 | 189 | 191 => (4, 1),
+        23..=47 | 67 | 87..=93 | 116 | 117 | 189 => (4, 1),
         118..=120 => (3, 1),
-        48..=59 | 68 | 69 | 85 | 86 | 115 => (2, 1),
+        48..=59 | 68 | 69 | 85 | 86 | 115 | 191 => (2, 1),
         60..=65 | 190 => (1, 1),
         70..=72 | 79..=81 => (8, 4),
         73..=78 | 82..=84 | 94..=99 => (16, 4),
@@ -2327,6 +2327,9 @@ mod tests {
         assert!(layout(&rgba) >= 4 * (256 * 256 * 4) / 3, "every mip");
         // BC1 is 8 bytes per 4x4 block: 1024x1024, one mip = 512 KiB.
         assert_eq!(size(&texture(1024, 1024, 71, 1)), Some(512 << 10));
+        assert_eq!(element(189), Some((4, 1)));
+        assert_eq!(element(190), Some((1, 1)));
+        assert_eq!(element(191), Some((2, 1)));
         assert_eq!(size(&texture(16, 16, 66, 1)), None, "1-bit format");
         // Linear layout (1) and an explicit mode (64 KiB display, 0x10a).
         let linear = ResourceDesc {

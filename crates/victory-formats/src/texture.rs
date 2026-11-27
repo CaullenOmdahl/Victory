@@ -998,10 +998,10 @@ pub fn format(dxgi: u32) -> Option<Format> {
         1..=4 => (16, 1, false),
         9..=18 => (8, 1, false),
         19..=22 | 44..=47 => (4, 1, true),
-        23..=43 | 67 | 87..=93 | 116 | 117 => (4, 1, false),
-        48..=59 | 85 | 86 | 115 => (2, 1, false),
+        23..=43 | 67 | 87..=93 | 116 | 117 | 189 => (4, 1, false),
+        48..=59 | 85 | 86 | 115 | 191 => (2, 1, false),
         118..=120 => (2, 1, true),
-        60..=65 => (1, 1, false),
+        60..=65 | 190 => (1, 1, false),
         70..=72 | 79..=81 => (8, 4, false),
         73..=78 | 82..=84 | 94..=99 => (16, 4, false),
         _ => return None,
@@ -2366,5 +2366,33 @@ mod peek {
             eprintln!("mips {mips} size {} first offsets {:?}", t.size, (0..4).map(|x| l.offset(0, x, 0, 0).unwrap()).collect::<Vec<_>>());
             std::fs::write(format!("{path}.{mips}.rgb"), out).unwrap();
         }
+    }
+
+    #[test]
+    fn console_formats_have_expected_sizes() {
+        assert_eq!(
+            format(189),
+            Some(Format {
+                bytes: 4,
+                block: 1,
+                stencil: false
+            })
+        );
+        assert_eq!(
+            format(190),
+            Some(Format {
+                bytes: 1,
+                block: 1,
+                stencil: false
+            })
+        );
+        assert_eq!(
+            format(191),
+            Some(Format {
+                bytes: 2,
+                block: 1,
+                stencil: false
+            })
+        );
     }
 }
