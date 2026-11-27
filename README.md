@@ -124,6 +124,10 @@ Speed:
   CCD via `VICTORY_CCD=<index|0xmask>` (`0`/`1` by L3 cache topology or hex
   affinity mask, off by default), and `xmem` skips unmapping/remapping physical
   pages whose backing slice is unchanged.
+- Draw table span computation (`StageSpans` in `draw.rs`) avoids heap
+  allocations for up to 64 root-table entries per draw, and large (`>= 4 MiB`)
+  host copy reads split across a persistent `victory-wide` pool
+  (`VICTORY_WIDE_THREADS=<n>`, `1` disables).
 
 Memory the title shows at several addresses:
 - Every view of a guarded physical page is guarded with it, so a write of

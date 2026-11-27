@@ -837,6 +837,39 @@ mod tests {
             list.reset();
         }
     }
+
+    #[test]
+    fn read_wide_copies_large_buffer_and_detects_unreadable_page() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+        let len = (4 << 20) + 4096;
+        // SAFETY: test owns these private allocations for the duration of the test.
+        let src = unsafe { VirtualAlloc(std::ptr::null(), len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) }
+            .cast::<u8>();
+        assert!(!src.is_null());
+        // SAFETY: `src` is a fresh `len`-byte writable allocation.
+        let src_slice = unsafe { std::slice::from_raw_parts_mut(src, len) };
+        for (i, b) in src_slice.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(31) ^ (i >> 9)) as u8;
+        }
+        let mut dst = vec![0u8; len];
+        assert!(read_wide(src, dst.as_mut_ptr(), len));
+        assert_eq!(dst.as_slice(), src_slice);
+
+        let mut old = 0u32;
+        // SAFETY: marks only the last page inside `src` inaccessible.
+        let protected = unsafe { VirtualProtect(src.add(4 << 20).cast(), 4096, PAGE_NOACCESS, &mut old) };
+        assert_ne!(protected, 0);
+        assert!(!read_wide(src, dst.as_mut_ptr(), len));
+
+        // SAFETY: restores accessibility and frees the test allocation.
+        unsafe {
+            let _ = VirtualProtect(src.add(4 << 20).cast(), 4096, PAGE_READWRITE, &mut old);
+            assert_ne!(VirtualFree(src.cast(), 0, MEM_RELEASE), 0);
+        }
+    }
 }
 
 /// A host command list and its allocator, always used together.
@@ -4827,66 +4860,154 @@ impl PoolShared {
     }
 }
 
+fn spawn_pool(prefix: &str, total: usize) -> Pool {
+    let shared: &'static PoolShared = Box::leak(Box::new(PoolShared {
+        state: std::sync::Mutex::new(PoolState { epoch: 0, job: None }),
+        wake: std::sync::Condvar::new(),
+        done: std::sync::Condvar::new(),
+    }));
+    let mut spawned = 0usize;
+    for i in 0..total.saturating_sub(1) {
+        if std::thread::Builder::new()
+            .name(format!("{prefix}-{i}"))
+            .spawn(move || {
+                victory_core::affinity::pin_worker_ccd();
+                struct FinishGuard {
+                    shared: &'static PoolShared,
+                    remaining: *const std::sync::atomic::AtomicUsize,
+                }
+                impl Drop for FinishGuard {
+                    fn drop(&mut self) {
+                        // SAFETY: caller keeps `remaining` live until it drops to 0.
+                        let rem = unsafe { &*self.remaining };
+                        if rem.fetch_sub(1, Ordering::AcqRel) == 1 {
+                            let _held = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                            self.shared.done.notify_one();
+                        }
+                    }
+                }
+                let mut seen_epoch = 0u64;
+                let mut guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                loop {
+                    while guard.epoch == seen_epoch || guard.job.is_none() {
+                        guard = shared.wake.wait(guard).unwrap_or_else(|e| e.into_inner());
+                    }
+                    seen_epoch = guard.epoch;
+                    let Some(job) = guard.job else { continue };
+                    drop(guard);
+                    let _done = FinishGuard {
+                        shared,
+                        remaining: job.remaining,
+                    };
+                    shared.execute_chunks(job);
+                    drop(_done);
+                    guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                }
+            })
+            .is_ok()
+        {
+            spawned += 1;
+        }
+    }
+    Pool {
+        dispatch: std::sync::Mutex::new(()),
+        shared,
+        threads: spawned + 1,
+    }
+}
+
+impl Pool {
+    fn run_chunks(
+        &self,
+        len: usize,
+        piece: usize,
+        run: unsafe fn(*const (), usize, usize),
+        ctx: *const (),
+    ) -> bool {
+        if self.threads <= 1 || len <= piece {
+            return false;
+        }
+        let Ok(_dispatch_guard) = self.dispatch.try_lock() else {
+            return false;
+        };
+        let bg_workers = self.threads - 1;
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let remaining = std::sync::atomic::AtomicUsize::new(bg_workers);
+        let job = PoolJob {
+            run,
+            ctx,
+            len,
+            piece,
+            next: &raw const next,
+            remaining: &raw const remaining,
+        };
+        {
+            let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.job = Some(job);
+            state.epoch = state.epoch.wrapping_add(1);
+            self.shared.wake.notify_all();
+        }
+        self.shared.execute_chunks(job);
+        let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
+        while remaining.load(Ordering::Acquire) != 0 {
+            state = self.shared.done.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        state.job = None;
+        true
+    }
+}
+
 fn pool() -> &'static Pool {
     static POOL: OnceLock<Pool> = OnceLock::new();
     POOL.get_or_init(|| {
         let total = std::thread::available_parallelism()
             .map_or(6, |n| n.get().saturating_sub(2).clamp(4, 20));
-        let shared: &'static PoolShared = Box::leak(Box::new(PoolShared {
-            state: std::sync::Mutex::new(PoolState { epoch: 0, job: None }),
-            wake: std::sync::Condvar::new(),
-            done: std::sync::Condvar::new(),
-        }));
-        let mut spawned = 0usize;
-        for i in 0..total.saturating_sub(1) {
-            if std::thread::Builder::new()
-                .name(format!("victory-pool-{i}"))
-                .spawn(move || {
-                    victory_core::affinity::pin_worker_ccd();
-                    struct FinishGuard {
-                        shared: &'static PoolShared,
-                        remaining: *const std::sync::atomic::AtomicUsize,
-                    }
-                    impl Drop for FinishGuard {
-                        fn drop(&mut self) {
-                            // SAFETY: caller keeps `remaining` live until it drops to 0.
-                            let rem = unsafe { &*self.remaining };
-                            if rem.fetch_sub(1, Ordering::AcqRel) == 1 {
-                                let _held =
-                                    self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-                                self.shared.done.notify_one();
-                            }
-                        }
-                    }
-                    let mut seen_epoch = 0u64;
-                    let mut guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-                    loop {
-                        while guard.epoch == seen_epoch || guard.job.is_none() {
-                            guard = shared.wake.wait(guard).unwrap_or_else(|e| e.into_inner());
-                        }
-                        seen_epoch = guard.epoch;
-                        let Some(job) = guard.job else { continue };
-                        drop(guard);
-                        let _done = FinishGuard {
-                            shared,
-                            remaining: job.remaining,
-                        };
-                        shared.execute_chunks(job);
-                        drop(_done);
-                        guard = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-                    }
-                })
-                .is_ok()
-            {
-                spawned += 1;
-            }
-        }
-        Pool {
-            dispatch: std::sync::Mutex::new(()),
-            shared,
-            threads: spawned + 1,
-        }
+        spawn_pool("victory-pool", total)
     })
+}
+
+fn wide_threads() -> usize {
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        if let Some(n) = std::env::var("VICTORY_WIDE_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+        {
+            return n.clamp(1, 32);
+        }
+        std::thread::available_parallelism()
+            .map_or(4, |n| n.get() / 4)
+            .clamp(2, 6)
+    })
+}
+
+fn wide_available() -> bool {
+    wide_threads() > 1
+}
+
+fn wide_pool() -> &'static Pool {
+    static WIDE_POOL: OnceLock<Pool> = OnceLock::new();
+    WIDE_POOL.get_or_init(|| spawn_pool("victory-wide", wide_threads()))
+}
+
+thread_local! {
+    static IN_WIDE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn in_wide_job() -> bool {
+    IN_WIDE.with(|n| n.get() > 0)
+}
+
+fn in_wide<R>(f: impl FnOnce() -> R) -> R {
+    struct Unmark;
+    impl Drop for Unmark {
+        fn drop(&mut self) {
+            IN_WIDE.with(|n| n.set(n.get().saturating_sub(1)));
+        }
+    }
+    IN_WIDE.with(|n| n.set(n.get() + 1));
+    let _unmark = Unmark;
+    f()
 }
 
 /// Runs `f` on pieces of `list`, of `least` items or more, on a persistent worker pool.
@@ -4898,15 +5019,7 @@ pub(crate) fn in_parallel<T: Sync, F: Fn(&[T]) + Sync>(list: &[T], least: usize,
     if pool.threads <= 1 {
         return f(list);
     }
-    let Ok(_dispatch_guard) = pool.dispatch.try_lock() else {
-        // Nested or concurrent `in_parallel` call: run inline instead of spawning or deadlocking.
-        return f(list);
-    };
-    let bg_workers = pool.threads - 1;
     let piece = (list.len() / (pool.threads * 4)).max(least);
-    if list.len() <= piece {
-        return f(list);
-    }
     struct Ctx<'a, T, F> {
         list: &'a [T],
         f: &'a F,
@@ -4917,28 +5030,9 @@ pub(crate) fn in_parallel<T: Sync, F: Fn(&[T]) + Sync>(list: &[T], least: usize,
         (ctx.f)(&ctx.list[from..to]);
     }
     let ctx = Ctx { list, f: &f };
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let remaining = std::sync::atomic::AtomicUsize::new(bg_workers);
-    let job = PoolJob {
-        run: trampoline::<T, F>,
-        ctx: (&raw const ctx).cast(),
-        len: list.len(),
-        piece,
-        next: &raw const next,
-        remaining: &raw const remaining,
-    };
-    {
-        let mut state = pool.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.job = Some(job);
-        state.epoch = state.epoch.wrapping_add(1);
-        pool.shared.wake.notify_all();
+    if !pool.run_chunks(list.len(), piece, trampoline::<T, F>, (&raw const ctx).cast()) {
+        f(list);
     }
-    pool.shared.execute_chunks(job);
-    let mut state = pool.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-    while remaining.load(Ordering::Acquire) != 0 {
-        state = pool.shared.done.wait(state).unwrap_or_else(|e| e.into_inner());
-    }
-    state.job = None;
 }
 
 /// Brings `[from, from + len)` of a host copy up to date now.
@@ -5013,7 +5107,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
         crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
         return;
     }
-    let whole = read(src, dst, len);
+    let wide = !title_dst && len >= WIDE_READ_MIN && wide_available() && !in_wide_job();
+    let whole = if wide {
+        read_wide(src, dst, len)
+    } else {
+        read(src, dst, len)
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -5291,6 +5390,45 @@ fn nt_write_virtual_memory() -> Option<NtWriteVirtualMemoryFn> {
     let addr = (*FN.get_or_init(|| ntdll_export(c"NtWriteVirtualMemory")))?;
     // SAFETY: `addr` came from `GetProcAddress(ntdll, "NtWriteVirtualMemory")`.
     Some(unsafe { std::mem::transmute::<usize, NtWriteVirtualMemoryFn>(addr) })
+}
+
+const WIDE_READ_MIN: usize = 4 << 20;
+const WIDE_READ_CHUNK: usize = 2 << 20;
+
+/// Reads `[src, src + len)` in parallel [`WIDE_READ_CHUNK`] slices on
+/// `wide_pool()`, returning `false` if any slice fails [`read`].
+fn read_wide(src: *const u8, dst: *mut u8, len: usize) -> bool {
+    struct Ctx {
+        src: usize,
+        dst: usize,
+        whole: std::sync::atomic::AtomicBool,
+    }
+    unsafe fn trampoline(ctx: *const (), from: usize, to: usize) {
+        // SAFETY: `ctx` lives on `read_wide`'s stack until all chunks finish;
+        // `[src + from..to)` and `[dst + from..to)` are disjoint slices of the caller's range.
+        unsafe {
+            let ctx = &*ctx.cast::<Ctx>();
+            in_wide(|| {
+                if !read(
+                    (ctx.src as *const u8).add(from),
+                    (ctx.dst as *mut u8).add(from),
+                    to - from,
+                ) {
+                    ctx.whole.store(false, Ordering::Relaxed);
+                }
+            });
+        }
+    }
+    let ctx = Ctx {
+        src: src as usize,
+        dst: dst as usize,
+        whole: std::sync::atomic::AtomicBool::new(true),
+    };
+    if wide_pool().run_chunks(len, WIDE_READ_CHUNK, trampoline, (&raw const ctx).cast()) {
+        ctx.whole.load(Ordering::Acquire)
+    } else {
+        read(src, dst, len)
+    }
 }
 
 /// Copies `len` bytes from `src` to `dst` unless a source page is not

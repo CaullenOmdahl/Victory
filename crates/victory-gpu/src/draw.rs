@@ -954,7 +954,7 @@ impl State {
         let spans = if p.stages.len() > 1 && table_stages() {
             stage_spans(p)
         } else {
-            Vec::new()
+            StageSpans::default()
         };
         for stage in &p.stages {
             let t = stage.translated();
@@ -2597,18 +2597,72 @@ fn table_stages() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_STAGES").is_none_or(|v| v != "0"))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct StageSpans {
+    inline: [(u8, u32, u32); 64],
+    len: usize,
+    overflow: Vec<(u8, u32, u32)>,
+}
+
+impl Default for StageSpans {
+    fn default() -> Self {
+        Self {
+            inline: [(0, 0, 0); 64],
+            len: 0,
+            overflow: Vec::new(),
+        }
+    }
+}
+
+impl StageSpans {
+    fn push(&mut self, item: (u8, u32, u32)) {
+        if self.overflow.is_empty() && self.len < self.inline.len() {
+            self.inline[self.len] = item;
+            self.len += 1;
+            return;
+        }
+        if self.overflow.is_empty() {
+            self.overflow.reserve(self.len + 1);
+            self.overflow.extend_from_slice(&self.inline[..self.len]);
+        }
+        self.overflow.push(item);
+    }
+
+    fn as_slice(&self) -> &[(u8, u32, u32)] {
+        if self.overflow.is_empty() {
+            &self.inline[..self.len]
+        } else {
+            &self.overflow
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [(u8, u32, u32)] {
+        if self.overflow.is_empty() {
+            &mut self.inline[..self.len]
+        } else {
+            &mut self.overflow
+        }
+    }
+}
+
+impl std::ops::Deref for StageSpans {
+    type Target = [(u8, u32, u32)];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
 /// Per root table parameter read by the stages of `p`, the slot count
 /// up to the last entry read by any stage that forces fresh dynamic slots
 /// (`Cbv | Srv`), and up to the last entry read by any stage:
 /// `(root_slot, with_fresh, all)`.
-fn stage_spans(p: &HostPipeline) -> Vec<(u8, u32, u32)> {
+fn stage_spans(p: &HostPipeline) -> StageSpans {
     stage_spans_from(p.stages.iter().map(|s| s.translated().used.as_slice()))
 }
 
-fn stage_spans_from<'a>(
-    stages: impl IntoIterator<Item = &'a [UsedResource]>,
-) -> Vec<(u8, u32, u32)> {
-    let mut spans: Vec<(u8, u32, u32)> = Vec::new();
+fn stage_spans_from<'a>(stages: impl IntoIterator<Item = &'a [UsedResource]>) -> StageSpans {
+    let mut spans = StageSpans::default();
     for used in stages {
         let mut fresh_slot = [false; 256];
         for u in used.iter().filter(|u| {
@@ -2619,7 +2673,7 @@ fn stage_spans_from<'a>(
         for u in used.iter().filter(|u| u.root == RootType::Table) {
             let n = u.table_offset_dwords / 8 + 1;
             let with = if fresh_slot[usize::from(u.slot)] { n } else { 0 };
-            match spans.iter_mut().find(|s| s.0 == u.slot) {
+            match spans.as_mut_slice().iter_mut().find(|s| s.0 == u.slot) {
                 Some(s) => {
                     s.1 = s.1.max(with);
                     s.2 = s.2.max(n);
@@ -2660,9 +2714,29 @@ mod table_stage_tests {
             used_table(2, 4, ResourceType::Uav),
         ];
         assert_eq!(
-            stage_spans_from([stage0.as_slice(), stage1.as_slice()]),
-            vec![(1, 6, 6), (2, 0, 5)]
+            stage_spans_from([stage0.as_slice(), stage1.as_slice()]).as_slice(),
+            &[(1, 6, 6), (2, 0, 5)]
         );
+    }
+
+    #[test]
+    fn stage_spans_handles_inline_and_overflow() {
+        let inline_used: Vec<_> = (0u8..64)
+            .map(|slot| used_table(slot, u32::from(slot), ResourceType::Srv))
+            .collect();
+        let inline = stage_spans_from([inline_used.as_slice()]);
+        assert!(inline.overflow.is_empty());
+        assert_eq!(inline.len(), 64);
+        assert_eq!(inline[63], (63, 64, 64));
+
+        let overflow_used: Vec<_> = (0u8..65)
+            .map(|slot| used_table(slot, u32::from(slot), ResourceType::Uav))
+            .collect();
+        let overflow = stage_spans_from([overflow_used.as_slice()]);
+        assert_eq!(overflow.len(), 65);
+        assert_eq!(overflow.overflow.len(), 65);
+        assert_eq!(overflow[0], (0, 0, 1));
+        assert_eq!(overflow[64], (64, 0, 65));
     }
 
     #[test]
