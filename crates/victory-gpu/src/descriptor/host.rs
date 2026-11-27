@@ -1549,8 +1549,11 @@ impl HostHeap {
         resource: Option<ID3D12Resource>,
         texture: Option<Arc<crate::resource::HostTexture>>,
     ) {
+        let new_raw = resource.as_ref().map(windows::core::Interface::as_raw);
+        let new_tex_ptr = texture.as_ref().map(Arc::as_ptr);
         // A running submission may still read the old resource through
-        // this slot; it is retired outside the lock.
+        // this slot; it is retired outside the lock, except when the slot
+        // still keeps the exact same host resource (common on buffer views).
         let old = self.kept.get((index / KEPT_PIECE) as usize).and_then(|piece| {
             let mut kept = piece.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::replace(&mut kept[(index % KEPT_PIECE) as usize], resource)
@@ -1568,10 +1571,14 @@ impl HostHeap {
         } else {
             None
         };
-        if let Some(old) = old {
+        if let Some(old) = old
+            && new_raw != Some(windows::core::Interface::as_raw(&old))
+        {
             crate::host::retire(old);
         }
-        if let Some(old_tex) = old_tex {
+        if let Some(old_tex) = old_tex
+            && new_tex_ptr != Some(Arc::as_ptr(&old_tex))
+        {
             crate::host::retire(old_tex);
         }
     }

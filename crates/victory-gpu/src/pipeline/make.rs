@@ -37,6 +37,7 @@ pub(crate) struct Pending {
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
     made: OnceLock<Option<HostPipeline>>,
+    done: (Mutex<()>, Condvar),
     /// Its worker was lost to it: it will not be made.
     lost: AtomicBool,
     /// When a worker began it ([`stuck`]).
@@ -85,6 +86,7 @@ impl Pending {
             graphics,
             queued: AtomicBool::new(false),
             made: OnceLock::new(),
+            done: (Mutex::new(()), Condvar::new()),
             lost: AtomicBool::new(false),
             begun: OnceLock::new(),
             replaced: AtomicBool::new(false),
@@ -123,7 +125,14 @@ impl Pending {
             }
         };
         let _ = self.made.set(made);
-        let (lock, done) = &DONE;
+        self.notify_waiters();
+    }
+
+    /// Wakes this pipeline's waiters after publishing its result. Taking the
+    /// lock prevents a waiter from missing the notification between checking
+    /// the result and going to sleep.
+    fn notify_waiters(&self) {
+        let (lock, done) = &self.done;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
@@ -227,9 +236,6 @@ fn compute_budget() -> Duration {
         Duration::from_millis(millis)
     })
 }
-
-/// Signalled whenever a worker has made a pipeline.
-static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
 /// Waiting allowed per title frame, over all threads.
 fn wait_budget() -> Duration {
@@ -494,7 +500,7 @@ fn wait_within(waits: &Waits, budget: Duration, p: &Pending, frame: u64) {
     if end <= now || !claim_wait(p, frame) {
         return;
     }
-    let (lock, done) = &DONE;
+    let (lock, done) = &p.done;
     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
     while p.made.get().is_none() && !p.lost.load(Ordering::Relaxed) && !stuck(p) {
         let rest = end.saturating_duration_since(Instant::now());
@@ -585,15 +591,12 @@ pub(super) fn worker_lost(id: u32) {
     AT_WORK.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| {
         if w.0 == id {
             w.1.lost.store(true, Ordering::Relaxed);
-            lost = Some(w.1.priority_lane());
+            lost = Some((w.1.clone(), w.1.priority_lane()));
         }
         w.0 != id
     });
-    if let Some(priority) = lost {
-        let (lock, done) = &DONE;
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        done.notify_all();
-        drop(_held);
+    if let Some((lost_pending, priority)) = lost {
+        lost_pending.notify_waiters();
         WAITING.fetch_sub(1, Ordering::Relaxed);
         worker(LOST.fetch_add(1, Ordering::Relaxed), priority);
     }
@@ -820,13 +823,27 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(10));
         p.lost.store(true, Ordering::Relaxed);
-        let (lock, done) = &DONE;
-        let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
-        done.notify_all();
-        drop(_held);
+        p.notify_waiters();
 
         let elapsed = waiter.join().expect("waiter thread must not panic");
         assert!(elapsed < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn completing_one_pipeline_does_not_take_another_pipelines_wait_lock() {
+        let pending = Pending::new(Vec::new(), None);
+        let held = pending.done.0.lock().unwrap();
+        let (send, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let unrelated = Pending::new(Vec::new(), None);
+            unrelated.make();
+            send.send(unrelated.made.get().is_some()).unwrap();
+        });
+        let result = finished.recv_timeout(Duration::from_secs(5));
+        drop(held);
+        worker.join().unwrap();
+        assert_eq!(result, Ok(true));
+        assert!(pending.made.get().is_none());
     }
 
     #[test]

@@ -16,7 +16,7 @@ Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on *
 | **In-world rendering** | Lit open world, characters, textures, water, sky, and geometry (constant ambient fallback; no RT) |
 | **Playable** | **Yes** — controller input, walking, and interactions work |
 | **Story progress** | Opening scene only (not progressed further yet) |
-| **World frame rate** | **7.3–7.5 fps** outdoors (`133.3–137.5 ms/frame` steady state across 5 intervals, `4.98 avg_fps`, ~4,920 draws/frame with Loop 145 `Belobug #503` write-watched graphics allocations + `VICTORY_INDIRECT_REST=0` + `VICTORY_WC_NO_BACK=1` + `EARLY_DEPTH` + `VICTORY_PORT_PLACED=1` + `VICTORY_COLD_SKIP=1` + `VICTORY_CCD=1`) · up to **22.9 fps** indoors (`43.6 ms/frame`) · `14.6 fps` cutscene peak |
+| **World frame rate** | **7.40 fps** outdoors (`135.4 ms/frame` median over `n=10` steady `[0 0]` intervals, `4.80 avg_fps`, `4,962` draws/frame with `VICTORY_PORT_PLACED=1` + `VICTORY_WC_NO_BACK=1` + `VICTORY_INDIRECT_REST=0` + `VICTORY_COMPUTE_WAIT_MS=10000` + Loop 150 lock contention fixes) · up to **22.9 fps** indoors (`43.6 ms/frame`) · `14.6 fps` cutscene peak |
 | **Stability** | **0** `0x887A0005` GPUVM/page faults across test runs (long-duration session not yet formally timed) |
 | **Memory** | `~5.6 GiB` commit (`~10.9 GiB` title private, `~19.9 GiB` mapped) |
 
@@ -37,6 +37,7 @@ Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on *
 
 | Area | Change | Measured Result | Ref |
 |------|--------|-----------------|-----|
+| **Lock Contention & List Timing** | Loop 150 per-pipeline wait `Condvar` (`avatarmanz #448`), skip `RETIRED` lock when slot keeps same resource (`Marvisak #3522`), & `with_state` call timing (`Marvisak #3224`) | **7.40 fps** (`135.4 ms/f` med over `n=10` steady `[0 0]`, `-12.2 ms / +8.27%` vs Loop 148, `prep -3.3`, `OTHER -5.2`, `0` faults) | `HEAD` |
 | **Watched Graphics Heap** | Loop 145 `XMemAllocDefault` (`D3D_ALLOCATOR = 128`, `>= 64 KiB` write-watched, `Belobug #503`) | **7.3–7.5 fps** (`133.3–137.5 ms/f` outdoors across 5 intervals, `4.98 avg_fps`, `0` faults) | [`faee699`](https://github.com/CaullenOmdahl/Victory/commit/faee699) |
 | **Non-Blocking XMA Audio** | Loop 146 decoupled `Slot` voice/ring locks & MMCSS `"Pro Audio"` priority (`Belobug #497`) | **7.5 fps** (`133.3 ms/f` steady peak, `357.8 avg_ms` vs `389.4`, `6/6` tests pass, `0` faults) | [`dcdac55`](https://github.com/CaullenOmdahl/Victory/commit/dcdac55) |
 | **Atomic Texture Detile Commit** | Loop 147 preflight all subresources & commit texture digest/asked only after full detile (`avatarmanz #419`) | `39/39` format tests & `15/15` GPU texture tests pass; `6.2 fps` (`161.9 ms/f`) cell transition, `0` faults, crisp textures | [`487d11f`](https://github.com/CaullenOmdahl/Victory/commit/487d11f) |
