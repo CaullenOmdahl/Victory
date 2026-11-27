@@ -16,7 +16,7 @@ Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on *
 | **In-world rendering** | Lit open world, characters, textures, water, sky, and geometry (constant ambient fallback; no RT) |
 | **Playable** | **Yes** — controller input, walking, and interactions work |
 | **Story progress** | Opening scene only (not progressed further yet) |
-| **World frame rate** | **7.45 fps** outdoors (`134.4 ms/frame` median over `n=8` steady `[0 0]` intervals on `proton-custom`, `4,944` draws/frame, `prep 50.7 ms`, `watches 137.8 ms` with Loop 155 lock-free `PUBLISHED` watch bitmap + batched slot release) · up to **22.9 fps** indoors (`43.6 ms/frame`) · `14.6 fps` cutscene peak |
+| **World frame rate** | **7.60 fps** outdoors (`131.2 ms/frame` median over `n=12` steady `[0 0]` intervals on `proton-custom`, range `124.1–142.9 ms`, `4,939` draws/frame, `prep 49.5 ms`, `OTHER 76.5 ms` with Loop 156 wait-free `ShapeArena` + sharded `KeptPiece`) · up to **22.9 fps** indoors (`43.6 ms/frame`) · `14.6 fps` cutscene peak |
 | **Stability** | **0** `0x887A0005` GPUVM/page faults across test runs (long-duration session not yet formally timed) |
 | **Memory** | `~5.6 GiB` commit (`~10.9 GiB` title private, `~19.9 GiB` mapped) |
 
@@ -37,7 +37,8 @@ Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on *
 
 | Area | Change | Measured Result | Ref |
 |------|--------|-----------------|-----|
-| **Lock-Free Watch Bitmap & Batch Release** | Loop 155 lock-free `PUBLISHED` 64 KiB block bitmap (`VICTORY_LIGHT_REFRESH`, `fxceless 94ed363c`) + batched `release_dynamic_batch` (`Vice-Tay #234`) | **`7.45 fps`** (`134.4 ms/f` med over `n=8` on `proton-custom`, **`watches 516.8 → 137.8 ms` (`-73.3%`)**, `copies 162.2 → 122.5 ms`, `prep 54.6 → 50.7 ms`, `0` faults) | `HEAD` |
+| **Wait-Free ShapeArena & Sharded Kept Slots** | Loop 156 wait-free segmented `ShapeArena` + word-hash `ViewHash`/`ShapeKey` (`Vice-Tay #245`) + sharded `KeptPiece` & borrowing `keep_ref` | **`7.60 fps`** (`131.2 ms/f` med over `n=12` on `proton-custom`, peak **`8.1 fps / 124.1 ms`**, **`-3.1 ms/f` (`+2.31%`)**, `OTHER 80.9 → 76.5 ms`, `list calls ~1,271 → 1,165 ms`, `0` faults) | `HEAD` |
+| **Lock-Free Watch Bitmap & Batch Release** | Loop 155 lock-free `PUBLISHED` 64 KiB block bitmap (`VICTORY_LIGHT_REFRESH`, `fxceless 94ed363c`) + batched `release_dynamic_batch` (`Vice-Tay #234`) | **7.45 fps** (`134.4 ms/f` med over `n=8` on `proton-custom`, `watches 516.8 → 137.8 ms` (`-73.3%`), `copies 162.2 → 122.5 ms`, `prep 54.6 → 50.7 ms`, `0` faults) | [`75d7242`](https://github.com/CaullenOmdahl/Victory/commit/75d7242) |
 | **Lock Contention & List Timing** | Loop 150 per-pipeline wait `Condvar` (`avatarmanz #448`), skip `RETIRED` lock when slot keeps same resource (`Marvisak #3522`), & `with_state` call timing (`Marvisak #3224`) | **7.40 fps** (`135.4 ms/f` med over `n=10` steady `[0 0]`, `-12.2 ms / +8.27%` vs Loop 148, `prep -3.3`, `OTHER -5.2`, `0` faults) | [`a782ba8`](https://github.com/CaullenOmdahl/Victory/commit/a782ba8) |
 | **Watched Graphics Heap** | Loop 145 `XMemAllocDefault` (`D3D_ALLOCATOR = 128`, `>= 64 KiB` write-watched, `Belobug #503`) | **7.3–7.5 fps** (`133.3–137.5 ms/f` outdoors across 5 intervals, `4.98 avg_fps`, `0` faults) | [`faee699`](https://github.com/CaullenOmdahl/Victory/commit/faee699) |
 | **Non-Blocking XMA Audio** | Loop 146 decoupled `Slot` voice/ring locks & MMCSS `"Pro Audio"` priority (`Belobug #497`) | **7.5 fps** (`133.3 ms/f` steady peak, `357.8 avg_ms` vs `389.4`, `6/6` tests pass, `0` faults) | [`dcdac55`](https://github.com/CaullenOmdahl/Victory/commit/dcdac55) |

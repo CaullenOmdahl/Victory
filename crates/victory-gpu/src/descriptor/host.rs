@@ -8,7 +8,7 @@
 //! deferred buffer, constant-buffer, and placed-texture slots.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
@@ -21,6 +21,15 @@ use crate::host::{Host, host};
 
 /// The slots of one piece of [`HostHeap::kept`].
 const KEPT_PIECE: u32 = 1024;
+
+/// Per-shard kept COM resources and owning pooled textures.
+struct KeptPiece {
+    resources: Vec<Option<ID3D12Resource>>,
+    /// Owning `HostTexture` (and its `texpool::Slot` / `ID3D12Heap`) for any
+    /// slot in this shard viewing a pooled texture, so the backing heap cannot
+    /// be freed while a shader-visible descriptor slot still points into it.
+    textures: HashMap<u32, Arc<crate::resource::HostTexture>>,
+}
 
 /// Whether a slot made from the same record already is found without the
 /// heap's locks (`HostHeap::made_now`; `VICTORY_HEAP_LOCKS=0` disables it).
@@ -54,11 +63,7 @@ pub(crate) struct HostHeap {
     /// read there is a GPU page fault (the console reads stale memory).
     /// Sharded in pieces of [`KEPT_PIECE`] slots so recording threads
     /// updating disjoint ranges do not serialize on a single mutex.
-    kept: Vec<Mutex<Vec<Option<ID3D12Resource>>>>,
-    /// Owning `HostTexture` (and its `texpool::Slot` / `ID3D12Heap`) for any
-    /// slot viewing a pooled texture, so the backing heap cannot be freed while
-    /// a shader-visible descriptor slot still points into it.
-    kept_textures: Mutex<HashMap<u32, Arc<crate::resource::HostTexture>>>,
+    kept: Vec<Mutex<KeptPiece>>,
     /// Staging heap (non-shader-visible) holding title slots planned ahead of
     /// an active submission; flushed into the live heap once it finishes.
     staging: std::sync::OnceLock<Option<(ID3D12DescriptorHeap, usize)>>,
@@ -89,9 +94,6 @@ pub(crate) struct HostHeap {
     rewrites_seen: AtomicU64,
     /// The views of memory by address made ([`crate::memory::fill`]).
     memory_seen: Mutex<u64>,
-    /// Number of entries currently in `kept_textures` so buffer-only updates
-    /// can skip locking `kept_textures` when it is empty.
-    kept_textures_count: AtomicUsize,
 }
 
 /// The dword of the stride table the element counts start at.
@@ -165,14 +167,12 @@ impl Drop for HostHeap {
     fn drop(&mut self) {
         for piece in &self.kept {
             if let Ok(mut kept) = piece.lock() {
-                for res in kept.drain(..).flatten() {
+                for res in kept.resources.drain(..).flatten() {
                     crate::host::retire(res);
                 }
-            }
-        }
-        if let Ok(mut texs) = self.kept_textures.lock() {
-            for (_, tex) in texs.drain() {
-                crate::host::retire(tex);
+                for (_, tex) in kept.textures.drain() {
+                    crate::host::retire(tex);
+                }
             }
         }
     }
@@ -1223,9 +1223,13 @@ impl HostHeap {
             made: Mutex::new(vec![0; count as usize]),
             made_now: (0..count).map(|_| AtomicU64::new(0)).collect(),
             kept: (0..(count + extra).div_ceil(KEPT_PIECE))
-                .map(|_| Mutex::new(vec![None; KEPT_PIECE as usize]))
+                .map(|_| {
+                    Mutex::new(KeptPiece {
+                        resources: vec![None; KEPT_PIECE as usize],
+                        textures: HashMap::new(),
+                    })
+                })
                 .collect(),
-            kept_textures: Mutex::default(),
             staging: std::sync::OnceLock::new(),
             staged: (0..(count as usize).div_ceil(64))
                 .map(|_| AtomicU64::new(0))
@@ -1243,7 +1247,6 @@ impl HostHeap {
             recheck_at: AtomicU64::new(u64::MAX),
             rewrites_seen: AtomicU64::new(0),
             memory_seen: Mutex::new(0),
-            kept_textures_count: AtomicUsize::new(0),
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -1551,6 +1554,12 @@ impl HostHeap {
         self.keep_owner(index, resource, None);
     }
 
+    /// Borrowing variant of [`HostHeap::keep`] that skips cloning `resource`
+    /// (`AddRef`/`Release`) when the slot already holds the same COM object.
+    fn keep_ref(&self, index: u32, resource: Option<&ID3D12Resource>) {
+        self.keep_owner_ref(index, resource, None);
+    }
+
     fn keep_with_view(&self, index: u32, resource: Option<ID3D12Resource>, view: &View) {
         let tex = if resource.is_some() {
             match view {
@@ -1574,28 +1583,71 @@ impl HostHeap {
         let new_raw = resource.as_ref().map(windows::core::Interface::as_raw);
         let new_tex_ptr = texture.as_ref().map(Arc::as_ptr);
         // A running submission may still read the old resource through
-        // this slot; it is retired outside the lock, except when the slot
-        // still keeps the exact same host resource (common on buffer views).
-        let old = self.kept.get((index / KEPT_PIECE) as usize).and_then(|piece| {
-            let mut kept = piece.lock().unwrap_or_else(|e| e.into_inner());
-            std::mem::replace(&mut kept[(index % KEPT_PIECE) as usize], resource)
-        });
-        let old_tex = if texture.is_some()
-            || self.kept_textures_count.load(Ordering::Acquire) > 0
-        {
-            let mut texs = self.kept_textures.lock().unwrap_or_else(|e| e.into_inner());
-            let old_tex = match texture {
-                Some(t) => texs.insert(index, t),
-                None => texs.remove(&index),
-            };
-            self.kept_textures_count.store(texs.len(), Ordering::Release);
-            old_tex
-        } else {
-            None
-        };
+        // this slot; retire displaced objects strictly outside the shard lock.
+        let (old, old_tex) = self
+            .kept
+            .get((index / KEPT_PIECE) as usize)
+            .map(|piece| {
+                let mut kept = piece.lock().unwrap_or_else(|e| e.into_inner());
+                let slot = &mut kept.resources[(index % KEPT_PIECE) as usize];
+                let old = std::mem::replace(slot, resource);
+                let old_tex = if texture.is_some() || !kept.textures.is_empty() {
+                    match texture {
+                        Some(t) => kept.textures.insert(index, t),
+                        None => kept.textures.remove(&index),
+                    }
+                } else {
+                    None
+                };
+                (old, old_tex)
+            })
+            .unwrap_or((None, None));
         if let Some(old) = old
             && new_raw != Some(windows::core::Interface::as_raw(&old))
         {
+            crate::host::retire(old);
+        }
+        if let Some(old_tex) = old_tex
+            && new_tex_ptr != Some(Arc::as_ptr(&old_tex))
+        {
+            crate::host::retire(old_tex);
+        }
+    }
+
+    fn keep_owner_ref(
+        &self,
+        index: u32,
+        resource: Option<&ID3D12Resource>,
+        texture: Option<Arc<crate::resource::HostTexture>>,
+    ) {
+        let new_raw = resource.map(windows::core::Interface::as_raw);
+        let new_tex_ptr = texture.as_ref().map(Arc::as_ptr);
+        // A running submission may still read the old resource through
+        // this slot; skip cloning when the slot already holds the same object
+        // and retire displaced objects strictly outside the shard lock.
+        let (old, old_tex) = self
+            .kept
+            .get((index / KEPT_PIECE) as usize)
+            .map(|piece| {
+                let mut kept = piece.lock().unwrap_or_else(|e| e.into_inner());
+                let slot = &mut kept.resources[(index % KEPT_PIECE) as usize];
+                let old = if slot.as_ref().map(windows::core::Interface::as_raw) == new_raw {
+                    None
+                } else {
+                    std::mem::replace(slot, resource.cloned())
+                };
+                let old_tex = if texture.is_some() || !kept.textures.is_empty() {
+                    match texture {
+                        Some(t) => kept.textures.insert(index, t),
+                        None => kept.textures.remove(&index),
+                    }
+                } else {
+                    None
+                };
+                (old, old_tex)
+            })
+            .unwrap_or((None, None));
+        if let Some(old) = old {
             crate::host::retire(old);
         }
         if let Some(old_tex) = old_tex
@@ -1670,7 +1722,7 @@ impl HostHeap {
             host.device
                 .CreateShaderResourceView(Some(buffer), Some(&raw), self.cpu(index));
         }
-        self.keep(index, Some(buffer.clone()));
+        self.keep_ref(index, Some(buffer));
         true
     }
 
@@ -1844,6 +1896,7 @@ impl HostHeap {
                         piece
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
+                            .resources
                             .get((index % KEPT_PIECE) as usize)
                             .and_then(Option::as_ref)
                             .is_some_and(crate::shadow::gone)
@@ -1986,6 +2039,7 @@ impl HostHeap {
                 piece
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
+                    .resources
                     .get((index % KEPT_PIECE) as usize)
                     .and_then(Option::as_ref)
                     .is_some_and(|r| r.as_raw() == raw_tex)
@@ -2017,7 +2071,7 @@ impl HostHeap {
             } else {
                 made[index as usize] = key;
             }
-            self.keep(index, res.clone());
+            self.keep_ref(index, res.as_ref());
             self.made_now[index as usize].store(made[index as usize], Ordering::Release);
             return res;
         }
@@ -2027,6 +2081,7 @@ impl HostHeap {
                 piece
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
+                    .resources
                     .get((index % KEPT_PIECE) as usize)
                     .and_then(Option::clone)
             })
@@ -2116,7 +2171,7 @@ impl HostHeap {
                         unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
                     }
                     made[index as usize] = key;
-                    self.keep(index, Some(shadow.buffer.clone()));
+                    self.keep_ref(index, Some(&shadow.buffer));
                     self.made_now[index as usize].store(key, Ordering::Release);
                 }
             }
@@ -2154,7 +2209,7 @@ impl HostHeap {
                     unsafe { host.device.CreateConstantBufferView(Some(&desc), at) };
                 }
                 made[index as usize] = key;
-                self.keep(index, Some(resource.clone()));
+                self.keep_ref(index, Some(&resource));
                 self.made_now[index as usize].store(key, Ordering::Release);
             }
         }
