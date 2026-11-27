@@ -16,7 +16,7 @@ Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on *
 | **In-world rendering** | Lit open world, characters, textures, water, sky, and geometry (constant ambient fallback; no RT) |
 | **Playable** | **Yes** — controller input, walking, and interactions work |
 | **Story progress** | Opening scene only (not progressed further yet) |
-| **World frame rate** | **7.0–7.2 fps** outdoors (`139.6–142.9 ms/frame` steady state, ~5,010 draws/frame with Loop 144 `VICTORY_INDIRECT_REST=0` + Loop 143 `VICTORY_WC_NO_BACK=1` + `EARLY_DEPTH` + `VICTORY_PORT_PLACED=1` + `VICTORY_COLD_SKIP=1` + `VICTORY_CCD=1`) · up to **22.9 fps** indoors (`43.6 ms/frame`) · `14.6 fps` cutscene peak |
+| **World frame rate** | **7.3–7.5 fps** outdoors (`133.3–137.5 ms/frame` steady state across 5 intervals, `4.98 avg_fps`, ~4,920 draws/frame with Loop 145 `Belobug #503` write-watched graphics allocations + `VICTORY_INDIRECT_REST=0` + `VICTORY_WC_NO_BACK=1` + `EARLY_DEPTH` + `VICTORY_PORT_PLACED=1` + `VICTORY_COLD_SKIP=1` + `VICTORY_CCD=1`) · up to **22.9 fps** indoors (`43.6 ms/frame`) · `14.6 fps` cutscene peak |
 | **Stability** | **0** `0x887A0005` GPUVM/page faults across test runs (long-duration session not yet formally timed) |
 | **Memory** | `~5.6 GiB` commit (`~10.9 GiB` title private, `~19.9 GiB` mapped) |
 
@@ -37,6 +37,7 @@ Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on *
 
 | Area | Change | Measured Result | Ref |
 |------|--------|-----------------|-----|
+| **Watched Graphics Heap** | Loop 145 `XMemAllocDefault` (`D3D_ALLOCATOR = 128`, `>= 64 KiB` write-watched, `Belobug #503`) | **7.3–7.5 fps** (`133.3–137.5 ms/f` outdoors across 5 intervals, `4.98 avg_fps`, `0` faults) | — |
 | **WC Copy-Back Bypass** | `VICTORY_WC_NO_BACK=1` (`Belobug #477`, including sparse shadows) | Copy-back **23.5 → 1.7 ms/f** (`39.2 → 0.5 MB/f`); **7.0–7.2 fps** (`139.6–142.9 ms/f`) outdoors with `VICTORY_INDIRECT_REST=0`, `0` faults | [`271eea4`](https://github.com/CaullenOmdahl/Victory/commit/271eea4) |
 | **Placed L0 VRAM** | `VK_LAYER_VICTORY_placed` + `VICTORY_PORT_PLACED=1` | Host refreshes `82.9 → 39.5 GB/f`; **5.1–5.5 fps** (`181–194 ms/f`) outdoors, `0` faults | [`8755d8c`](https://github.com/CaullenOmdahl/Victory/commit/8755d8c) |
 | **Custom Proton Runtime** | 128-way `vm_prot_stripes`, lockless `PAGEMAP_SCAN`, native `VK_EXT_map_memory_placed` | `prot lock` `59–69 → 8.8–10.9 ms` (>6×); **4.6–5.0 → 4.9–5.3 fps** A/B uplift (`prep -12%`, `copies -33%`, `watches -38%`) | [`victory-cachyos-radv-runtime`](https://github.com/CaullenOmdahl/victory-cachyos-radv-runtime) |
