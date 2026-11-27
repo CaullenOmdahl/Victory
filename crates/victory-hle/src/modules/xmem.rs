@@ -169,6 +169,9 @@ pub extern "system" fn XMemVirtualAlloc(
         victory_gpu::title_memory_reserved(at as usize, size, raw_protect);
         victory_gpu::title_memory_committed(at as usize, size);
     }
+    if !at.is_null() {
+        victory_gpu::title_memory_protection(at as usize, size, raw_protect);
+    }
     if base.is_null() {
         tracing::debug!(
             size,

@@ -47,6 +47,8 @@ pub(crate) struct Shadow {
     /// ranges, and most find none).
     pending: Mutex<Vec<(usize, usize)>>,
     pending_len: std::sync::atomic::AtomicUsize,
+    /// Ranges shaders wrote that stay on the card (`VICTORY_WC_NO_BACK=1`).
+    card_owned: Mutex<crate::wc::Ranges>,
     /// The copy's bytes before the submission ran, from an offset on,
     /// covering the ranges its shaders write: what the GPU wrote differs.
     before: Mutex<Before>,
@@ -378,6 +380,7 @@ impl Shadow {
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             pending_len: std::sync::atomic::AtomicUsize::new(0),
+            card_owned: Mutex::default(),
             before: Mutex::default(),
             direct: None,
             unwatched: Mutex::default(),
@@ -391,6 +394,33 @@ impl Shadow {
 
     pub(crate) fn is_card(&self) -> bool {
         self.card.is_some()
+    }
+
+    pub(crate) fn watched_known(&self) -> bool {
+        if let Some(root) = self.sparse.as_ref().and_then(|s| s.of.as_ref()) {
+            return root.watched_known();
+        }
+        matches!(self.watched.load(Ordering::Relaxed), 1 | WATCHED_GUARDED)
+    }
+
+    /// Shaders wrote `[address, address + len)` and it stays on the card
+    /// (`VICTORY_WC_NO_BACK=1`).
+    pub(crate) fn card_owns(&self, address: usize, len: usize) {
+        if let Some(root) = self.sparse.as_ref().and_then(|s| s.of.as_ref()) {
+            return root.card_owns(address, len);
+        }
+        let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+        let (from, to) = (address.max(start), address.saturating_add(len).min(end));
+        if from >= to {
+            return;
+        }
+        self.card_owned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(from, to);
+        if self.card.is_none() && self.sparse.is_none() {
+            crate::wc::uncarded((to - from) as u64);
+        }
     }
 
     pub(crate) fn card_state(&self) -> Option<Arc<crate::card::CardState>> {
@@ -957,6 +987,20 @@ impl Shadow {
                 .filter(|&(a, e)| a < to && e > from)
                 .collect()
         };
+        if !self.watched_known() {
+            let owned = self.card_owned.lock().unwrap_or_else(|e| e.into_inner());
+            if !owned.is_empty() {
+                let before = busy.len();
+                busy.extend(owned.overlapping(from, to));
+                let left: usize = busy[before..]
+                    .iter()
+                    .map(|&(a, e)| e.min(to) - a.max(from))
+                    .sum();
+                if left != 0 {
+                    crate::wc::unwatched(left as u64);
+                }
+            }
+        }
         if !busy.is_empty() {
             // Around ranges shaders are writing: the gaps, each as below
             // (in the world most submissions have such ranges; copying the
@@ -1632,6 +1676,7 @@ fn placed(
         watched: AtomicU8::new(NOT_WATCHED),
         pending: Mutex::default(),
         pending_len: std::sync::atomic::AtomicUsize::new(0),
+        card_owned: Mutex::default(),
         before: Mutex::default(),
         direct: Some(Direct {
             heap: heap.clone(),
@@ -1801,6 +1846,7 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
                 watched: AtomicU8::new(NOT_WATCHED),
                 pending: Mutex::default(),
                 pending_len: std::sync::atomic::AtomicUsize::new(0),
+                card_owned: Mutex::default(),
                 before: Mutex::default(),
                 direct: Some(Direct {
                     heap,
@@ -2645,6 +2691,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
         watched: AtomicU8::new(0),
         pending: Mutex::default(),
         pending_len: std::sync::atomic::AtomicUsize::new(0),
+        card_owned: Mutex::default(),
         before: Mutex::default(),
         direct: None,
         unwatched: Mutex::default(),

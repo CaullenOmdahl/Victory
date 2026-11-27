@@ -106,4 +106,4 @@ pub use watch::{
     writing as kernel_will_write,
 };
 #[cfg(windows)]
-pub use wc::title_memory_reserved;
+pub use wc::{title_memory_protection, title_memory_reserved};

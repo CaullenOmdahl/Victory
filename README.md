@@ -16,7 +16,7 @@ Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on *
 | **In-world rendering** | Lit open world, characters, textures, water, sky, and geometry (constant ambient fallback; no RT) |
 | **Playable** | **Yes** — controller input, walking, and interactions work |
 | **Story progress** | Opening scene only (not progressed further yet) |
-| **World frame rate** | **5.5–5.6 fps** outdoors (`178.9–183.4 ms/frame`, `4.75 avg_fps`, ~5,000 draws/frame with Loop 142 `EARLY_DEPTH` + Loop 141 `VICTORY_PORT_PLACED=1` + `VICTORY_COLD_SKIP=1` + `VICTORY_CCD=1`) · up to **22.9 fps** indoors (`43.6 ms/frame`) · `14.6 fps` cutscene peak |
+| **World frame rate** | **6.4 fps** outdoors (`155.1 ms/frame` steady state, ~5,077 draws/frame with Loop 143 `VICTORY_WC_NO_BACK=1` + `EARLY_DEPTH` + `VICTORY_PORT_PLACED=1` + `VICTORY_COLD_SKIP=1` + `VICTORY_CCD=1`) · up to **22.9 fps** indoors (`43.6 ms/frame`) · `14.6 fps` cutscene peak |
 | **Stability** | **0** `0x887A0005` GPUVM/page faults across test runs (long-duration session not yet formally timed) |
 | **Memory** | `~5.6 GiB` commit (`~10.9 GiB` title private, `~19.9 GiB` mapped) |
 
@@ -37,6 +37,7 @@ Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on *
 
 | Area | Change | Measured Result | Ref |
 |------|--------|-----------------|-----|
+| **WC Copy-Back Bypass** | `VICTORY_WC_NO_BACK=1` (`Belobug #477`, including sparse shadows) | Copy-back **23.5 → 2.0 ms/f** (`39.2 → 0.5 MB/f`); **6.4 fps** (`155.1 ms/f`) outdoors, `0` faults | `wc.rs` / `shadow.rs` |
 | **Placed L0 VRAM** | `VK_LAYER_VICTORY_placed` + `VICTORY_PORT_PLACED=1` | Host refreshes `82.9 → 39.5 GB/f`; **5.1–5.5 fps** (`181–194 ms/f`) outdoors, `0` faults | [`8755d8c`](https://github.com/CaullenOmdahl/Victory/commit/8755d8c) |
 | **Custom Proton Runtime** | 128-way `vm_prot_stripes`, lockless `PAGEMAP_SCAN`, native `VK_EXT_map_memory_placed` | `prot lock` `59–69 → 8.8–10.9 ms` (>6×); **4.6–5.0 → 4.9–5.3 fps** A/B uplift (`prep -12%`, `copies -33%`, `watches -38%`) | [`victory-cachyos-radv-runtime`](https://github.com/CaullenOmdahl/victory-cachyos-radv-runtime) |
 | **Copy-Back Lock Stalls** | `RwLock` on `xmem::PHYSICAL` + `watch::VIEWS` | Peak streaming copy-back stall **4,378.9 → 128.1 ms** | [`15c1b16`](https://github.com/CaullenOmdahl/Victory/commit/15c1b16) |
@@ -52,12 +53,13 @@ Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on *
   - Wine stack unwind guards (`bcd337e`), lazy `ws2_32` export resolution (`#3091`), optional Wine temp-file physical-section backing (`VICTORY_PHYSICAL_BACKING_DIR` / `VICTORY_PHYSICAL_PAGEFILE_FIRST_MB`, `14fdfb8`), `LoaderLock` unwind `Drop` guard (`#3001`), NUL-terminated DualSense HID paths (`#207`), and remap/guard/descriptor fixes eliminating `0x887A0005` GPUVM faults.
 - **Tuning & performance flags:**
   - `VICTORY_PORT_PLACED=1` + `ENABLE_VICTORY_PLACED=1` (`tools/vk-layer-placed/` + `port_placed.rs`): backs 32-bit `XMem` reservations directly in RADV L0 VRAM (`8755d8c`).
+  - `VICTORY_WC_NO_BACK=1` (`wc.rs`, `VICTORY_WC_NO_BACK_MIN_KB=64` default): leaves `>= 64 KiB` write-combined GPU writes on card/sparse shadows without snapshots or copy-back (`copy-back` `23.5 -> 2.0 ms/f`, `0.5 MB/f`, **`6.4 fps` / `155.1 ms/f`**).
   - `VICTORY_COPY_BACK_BESIDE` (default-on, `0` to disable) & `VICTORY_TEXTURE_BACK=1` (`texback.rs`, shader-written ocean/displacement UAV texture readback).
   - `VICTORY_COLD_SKIP=1` (`ada5c7a`), `VICTORY_CCD=1` (`622e793`), `VICTORY_CARD_FETCH_INFLIGHT=1` (`39c7ad6`), `VICTORY_HEAP_WORKER=1` (`129f8c4`), `VICTORY_PORT_CBV=1` (`c65cda7`), `VICTORY_PORT_GUARD=1` (`3961805`).
   - Default-on ReBAR `D3D12_HEAP_TYPE_GPU_UPLOAD` (`VICTORY_GPU_UPLOAD=0` to disable, +45% FPS on RX 6800 16 GiB) and hair simulation (`VICTORY_HAIR=0` to disable).
   - AVX2 copy-back merges & idle `HostList`/chunk trimming (`0e04b91`), `RwLock` on `shadow::BUFFERS` and `shadow::LOOSE` with off-thread `victory-bury` retirement (`7922b08`, `f905d00`), and `victory_shader::SOURCE_HASH` cache keying.
 - **Shader & rendering correctness:**
-  - **Shader & rendering correctness:** Console DXGI formats 189–191 (`35c0619`), `ForceEarlyDepthStencil` (`EARLY_DEPTH`, `avatarmanz #435`) on `DEPTH_BEFORE_SHADER` pixel shaders (prevents glass prepass depth/motion writes over foreground characters; **`5.5–5.6 fps` / `178.9–183.4 ms/frame`** steady state, `4.75 avg_fps`, `frame-4270.png` clean).
+  - `ForceEarlyDepthStencil` (`EARLY_DEPTH`, `avatarmanz #435`, [`2e31861`](https://github.com/CaullenOmdahl/Victory/commit/2e31861)) on `DEPTH_BEFORE_SHADER` pixel shaders (prevents glass prepass depth/motion writes over foreground characters; **`5.5–5.6 fps` / `178.9–183.4 ms/frame`** steady state, `frame-4270.png` clean).
 - Console DXGI formats 189, 190, and 191 (`35c0619`), `R9G9B9E5` format family mapping & SDWA 16-bit `UNUSED_SEXT` sign-extension (`dac3e58`).
   - Directed `f16` rounding (`#3159`) & negative-offset `CODE` descriptor reads (`#3155`, `4b8c9d9`).
   - Cube-map subnormal/signed-zero semantics (`#3127`) & near-unity 1-ULP `v_log_f32` (`#2160`, `12efdd0`).

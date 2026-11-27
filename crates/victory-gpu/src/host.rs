@@ -3245,6 +3245,15 @@ impl HostList {
         address: usize,
         len: usize,
     ) {
+        if crate::wc::skip_no_back(
+            address,
+            len,
+            shadow.is_card() || shadow.is_sparse(),
+            shadow.watched_known(),
+        ) {
+            shadow.card_owns(address, len);
+            return;
+        }
         let mut deferred = self.deferred();
         let key = (std::sync::Arc::as_ptr(shadow) as usize, address, len);
         if deferred.gpu_written.insert(key) {
@@ -5767,6 +5776,7 @@ impl Meter {
                 crate::copystat::log(frames);
                 let beside_frames = f64::from(self.log_frames.max(1));
                 self.log_frames = 0;
+                crate::wc::log(crate::wc::take(beside_frames));
                 if crate::watch::copy_back_beside() {
                     let (beside_writes, beside_bytes) = crate::watch::take_beside_stats();
                     tracing::info!(
