@@ -381,6 +381,8 @@ struct Section {
     generation: Box<[AtomicU32]>,
     fallback_noted: OnceLock<()>,
     holding: Mutex<Vec<(usize, usize)>>,
+    /// Base address when a whole reservation is backed by a placed L0 heap (`0` = none).
+    placed: AtomicUsize,
 }
 
 /// Bytes of the physical-page sections alive (reserved; committed as
@@ -492,6 +494,7 @@ impl Section {
             generation: (0..pages).map(|_| AtomicU32::new(0)).collect(),
             fallback_noted: OnceLock::new(),
             holding: Mutex::new(Vec::new()),
+            placed: AtomicUsize::new(0),
         }
     }
 
@@ -935,6 +938,9 @@ enum Mapping {
 
 impl Mapping {
     fn view(self, slice: &Slice, n: usize) -> Option<View> {
+        if slice.section.placed.load(Ordering::Acquire) != 0 {
+            return View::placed(slice, n);
+        }
         let mapping = match self {
             Mapping::Default if persistent_views() => Mapping::Persistent,
             Mapping::Default => Mapping::Temporary,
@@ -962,6 +968,30 @@ enum View {
 }
 
 impl View {
+    fn placed(slice: &Slice, n: usize) -> Option<View> {
+        let base = slice.section.placed.load(Ordering::Acquire);
+        if base == 0 {
+            return None;
+        }
+        let len = n.checked_mul(PAGE)?;
+        let from = slice.index * PAGE;
+        if !from.checked_add(len).is_some_and(|end| end <= slice.section.size) {
+            return None;
+        }
+        while !slice.section.hold(from, len) {
+            std::thread::yield_now();
+        }
+        slice.section.mark_committed(slice.index, n);
+        // SAFETY: `base..base + size` is committed RW L0 memory and `hold` serializes `[from, from + len)`.
+        let ptr = unsafe { (base as *mut u8).add(from) };
+        Some(View::Persistent {
+            section: slice.section.clone(),
+            ptr,
+            from,
+            len,
+        })
+    }
+
     fn temporary(slice: &Slice, n: usize) -> Option<View> {
         use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
         let (offset, len) = ((slice.index * PAGE) as u64, n * PAGE);
@@ -1332,6 +1362,9 @@ pub extern "system" fn XMemMapPhysicalPages(
     if n == 0 {
         return address;
     }
+    if !pages.is_null() && victory_gpu::port_placed::on() {
+        victory_gpu::port_placed::warm();
+    }
     let base = address as usize;
     let mut physical = physical();
     if pages.is_null() {
@@ -1415,13 +1448,29 @@ fn map_whole(physical: &mut Physical, base: usize, pages: &[usize]) -> bool {
             drop_overlapping_placeholders(&mut physical.placeholders, at, at + len);
             // SAFETY: placeholders of one reservation, none mapped.
             unsafe { VirtualFree(at as *mut c_void, len, MEM_RELEASE | COALESCE) };
-            if !map_view(at, len, &all) {
-                return false;
+            let placed_ok = victory_gpu::port_placed::on()
+                && match map_whole_placed(at, len, &first.section) {
+                    Ok(()) => true,
+                    Err(why) => {
+                        victory_gpu::port_placed::fallback(&why);
+                        false
+                    }
+                };
+            if placed_ok {
+                physical.whole.push((at, len, first.section.clone()));
+            } else {
+                if !map_view(at, len, &all) {
+                    return false;
+                }
+                tracing::info!(
+                    at = format_args!("{at:#x}"),
+                    len,
+                    "a reservation of physical pages shown whole"
+                );
+                victory_gpu::title_memory_remapped(at, len);
+                physical.views.insert(at, (len, all));
+                physical.whole.push((at, len, first.section.clone()));
             }
-            tracing::info!(at = format_args!("{at:#x}"), len, "a reservation of physical pages shown whole");
-            victory_gpu::title_memory_remapped(at, len);
-            physical.views.insert(at, (len, all));
-            physical.whole.push((at, len, first.section.clone()));
             (at, len, first.section.clone())
         }
     };
@@ -1460,6 +1509,108 @@ fn map_whole(physical: &mut Physical, base: usize, pages: &[usize]) -> bool {
         physical.bound.insert(*page);
     }
     true
+}
+
+fn give_back_placed_placeholders(allocations: &[(usize, usize)]) {
+    for &(at, size) in allocations {
+        // SAFETY: `at..at + size` was committed in place of a placeholder in `map_whole_placed`.
+        unsafe { VirtualFree(at as *mut c_void, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER) };
+    }
+}
+
+fn map_whole_placed(at: usize, len: usize, section: &Arc<Section>) -> Result<(), String> {
+    let end = at.checked_add(len).ok_or("overflow")?;
+    let mut pieces = Vec::new();
+    let mut here = at;
+    while here < end {
+        // SAFETY: plain output buffer for `VirtualQuery`.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: queries a live address in our process.
+        let asked = unsafe { VirtualQuery(here as *const c_void, &mut info, size_of_val(&info)) };
+        if asked == 0
+            || info.State != MEM_RESERVE
+            || info.Type != MEM_PRIVATE
+            || info.AllocationBase as usize != at
+            || info.RegionSize == 0
+        {
+            return Err(format!(
+                "{here:#x} is not a private placeholder (state={:#x}, type={:#x})",
+                info.State, info.Type
+            ));
+        }
+        let stop = (info.BaseAddress as usize + info.RegionSize).min(end);
+        pieces.push((here, stop - here));
+        here = stop;
+    }
+    let prepared = victory_gpu::port_placed::prepare(len)?;
+    let mut committed = Vec::with_capacity(pieces.len());
+    for &(p_at, p_size) in &pieces {
+        // SAFETY: `[p_at, p_at + p_size)` is a reserved placeholder owned by this reservation.
+        let got = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                p_at as *const c_void,
+                p_size,
+                MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if got as usize != p_at {
+            let err = std::io::Error::last_os_error();
+            give_back_placed_placeholders(&committed);
+            return Err(format!("placeholder {p_at:#x}+{p_size:#x} commit failed: {err}"));
+        }
+        committed.push((p_at, p_size));
+    }
+    if let Err(why) = victory_gpu::port_placed::map(&prepared, at) {
+        give_back_placed_placeholders(&committed);
+        return Err(why);
+    }
+    let pages = section.size / PAGE;
+    let mut copied_pages = 0usize;
+    let mut p = 0usize;
+    while p < pages {
+        if section.commit_state[p].load(Ordering::Acquire) != COMMITTED {
+            p += 1;
+            continue;
+        }
+        let run = (p..pages)
+            .take_while(|&q| section.commit_state[q].load(Ordering::Acquire) == COMMITTED)
+            .count();
+        let slice = Slice {
+            section: section.clone(),
+            index: p,
+        };
+        let Some(mut src) = View::temporary(&slice, run) else {
+            victory_gpu::port_placed::unmap(&prepared);
+            give_back_placed_placeholders(&committed);
+            return Err(format!("failed copying committed pages {p}..{}", p + run));
+        };
+        let bytes = run * PAGE;
+        // SAFETY: `at + p * PAGE..at + (p + run) * PAGE` is committed RW placed memory.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.bytes_at(0, bytes).as_ptr(),
+                (at + p * PAGE) as *mut u8,
+                bytes,
+            );
+        }
+        copied_pages += run;
+        p += run;
+    }
+    section.placed.store(at, Ordering::Release);
+    victory_gpu::title_memory_remapped(at, len);
+    victory_gpu::port_placed::register(prepared, at);
+    tracing::info!(
+        at = format_args!("{at:#x}"),
+        len,
+        placeholders = pieces.len(),
+        copied_pages,
+        "a whole reservation placed in L0 VRAM (no section view, no userptr)"
+    );
+    Ok(())
 }
 
 /// Whether `[base, base + len)` lies in a reservation shown whole.
@@ -2771,6 +2922,39 @@ mod tests {
         // SAFETY: `va` is our whole reservation.
         assert_ne!(unsafe { VirtualFree(va, 0, MEM_RELEASE) }, 0);
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
+    }
+
+    #[test]
+    fn placed_whole_reservation_places_and_routes_writes_when_enabled() {
+        if !victory_gpu::port_placed::on() {
+            return;
+        }
+        let len = MIN_WHOLE_RESERVATION;
+        let count = len / PAGE;
+        let pages = allocate(count);
+        let va = XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            len,
+            MEM_RESERVE | PAGES_64K,
+            0,
+            PAGE_READWRITE,
+        );
+        assert!(!va.is_null());
+        assert_eq!(XMemMapPhysicalPages(va, count, pages.as_ptr()), va);
+        assert!(victory_gpu::port_placed::placed_touches(va as u64, len as u64));
+
+        let payload = [0xA5u8; 4096];
+        assert!(write_physical(&pages, PAGE, &payload));
+        // SAFETY: `va + PAGE` is backed by the placed L0 reservation.
+        let landed = unsafe { std::slice::from_raw_parts((va as *const u8).add(PAGE), 4096) };
+        assert_eq!(landed, &payload);
+
+        let _ = victory_gpu::port_placed::release(va as usize, len);
+        {
+            let mut phys = physical();
+            phys.whole.retain(|&(at, _, _)| at != va as usize);
+        }
+        assert_ne!(XMemFreePhysicalPages(count, pages.as_ptr()), 0);
     }
 }
 

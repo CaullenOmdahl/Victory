@@ -30,6 +30,7 @@
 *.dll
 *.pdb
 *.lib
+tools/vk-layer-placed/libVkLayer_victory_placed.so
 *.sys
 *.obj
 *.exp

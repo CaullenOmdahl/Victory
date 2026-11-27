@@ -55,6 +55,8 @@ pub mod pipeline;
 #[cfg(windows)]
 mod port_cbv;
 #[cfg(windows)]
+pub mod port_placed;
+#[cfg(windows)]
 mod primitive;
 pub mod query;
 pub mod queue;

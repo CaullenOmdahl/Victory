@@ -1733,6 +1733,35 @@ pub(crate) fn in_place(address: u64, end: u64) -> bool {
         .any(|(_, s)| s.start + s.len >= end)
 }
 
+/// Retires any cached in-place window overlapping `[start, end)`.
+pub(crate) fn retire_direct(start: u64, end: u64) {
+    use windows::core::Interface;
+    let mut removed = Vec::new();
+    {
+        let mut map = windows_of_memory();
+        let keys: Vec<u64> = map
+            .iter()
+            .filter(|(_, s)| s.start < end && s.start + s.len > start)
+            .map(|(&k, _)| k)
+            .collect();
+        for k in keys {
+            if let Some(s) = map.remove(&k) {
+                removed.push(s);
+            }
+        }
+    }
+    for s in removed {
+        if let Some(d) = &s.direct {
+            d.dead.store(true, Ordering::Release);
+        }
+        GONE.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(s.buffer.as_raw() as usize);
+        HAS_GONE.store(true, Ordering::Release);
+        crate::host::retire(s);
+    }
+}
+
 /// The window of title memory holding `[address, end)`, made on first use.
 /// `None` where the host GPU cannot use the memory in place: parts of it
 /// not committed, or of several allocations (views of physical pages).
@@ -1742,6 +1771,57 @@ fn direct(address: u64, end: u64) -> Option<Arc<Shadow>> {
     static DEVICE: std::sync::OnceLock<Option<ID3D12Device13>> = std::sync::OnceLock::new();
     if cfg!(test) {
         return None;
+    }
+    if crate::port_placed::on() && crate::port_placed::placed_touches(address, end - address) {
+        let mut map = windows_of_memory();
+        if let Some(s) = map
+            .range(..=address)
+            .rev()
+            .take(8)
+            .map(|(_, s)| s)
+            .find(|s| s.start + s.len >= end)
+        {
+            return Some(s.clone());
+        }
+        if let Some(h) = host()
+            && let Some((heap, buffer, start, len)) =
+                crate::port_placed::place_in(&h.device, address, end - address)
+        {
+            crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} placed"));
+            // SAFETY: `buffer` is a live D3D12 resource.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            let window = Arc::new(Shadow {
+                buffer,
+                data: start as *mut u8,
+                gpu,
+                start,
+                len,
+                copied: Mutex::default(),
+                verified: Mutex::default(),
+                watched: AtomicU8::new(NOT_WATCHED),
+                pending: Mutex::default(),
+                pending_len: std::sync::atomic::AtomicUsize::new(0),
+                before: Mutex::default(),
+                direct: Some(Direct {
+                    heap,
+                    aliases: Mutex::default(),
+                    dead: std::sync::atomic::AtomicBool::new(false),
+                }),
+                unwatched: Mutex::default(),
+                clean_spans: Mutex::default(),
+                page_epochs: Box::default(),
+                sparse: None,
+                card: None,
+                gone: std::sync::atomic::AtomicBool::new(false),
+            });
+            tracing::info!(
+                start = format_args!("{:#x}", window.start),
+                len = window.len,
+                "title memory placed in L0 VRAM at title address"
+            );
+            map.insert(window.start, window.clone());
+            return Some(window);
+        }
     }
     let device = DEVICE.get_or_init(|| {
         let on_wine = on_wine();

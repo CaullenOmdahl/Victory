@@ -17,7 +17,7 @@
 | **In-world rendering** | Renders lit open world, characters, textures, water, sky, and geometry (ray-traced indirect light replaced by constant ambient fallback; in-game phone broken) |
 | **Playable** | **Yes** — controller input, walking around in the world, and interactions work |
 | **Story progress** | **Opening scene only** (have not progressed further yet) |
-| **World frame rate** | **2.1–4.8 fps** outdoors (`206.3–538.1 ms/frame` at `~5,000` draws/frame), up to **22.9 fps** (`43.6 ms/frame`) indoors (`14.6 fps` cutscene peak) |
+| **World frame rate** | **2.1–5.5 fps** outdoors (`181.3–538.1 ms/frame` at `~5,000` draws/frame; **`5.1–5.5 fps` / `181.3–194.4 ms`** with Loop 141 `VICTORY_PORT_PLACED=1` + `VICTORY_COLD_SKIP=1` + `VICTORY_CCD=1`), up to **22.9 fps** (`43.6 ms/frame`) indoors (`14.6 fps` cutscene peak) |
 | **Stability** | **0** `0x887A0005` GPUVM/page faults across repeated in-world test runs; long-duration crash-free stability not yet formally measured |
 | **Memory** | `~5.6 GiB` commit (`~10.9 GiB` title private, `~19.9 GiB` mapped) |
 
@@ -36,7 +36,8 @@ Over 160 commits on top of `Belobug/VIctory-Belobug-AMD` focused on running clea
 - **Sharded write-watch & 64 KiB page dedup (`07410ac`):** Sharded `watch::JOURNALS` into 64 aligned `RwLock` stripes and deduplicated 4 KiB `GetWriteWatch` pages into 64 KiB pages — reaching **4.52 avg_fps** overall and **22.9 fps / 43.6 ms/frame** indoors with `0` GPUVM/page faults.
 - **`RwLock` physical & view tables (`15c1b16`):** Converted `xmem::PHYSICAL` (with non-blocking `try_read()` fallback in `write_beside`) and `watch::VIEWS` to `RwLock`, cutting peak streaming copy-back lock stalls from **4,378.9 ms to 128.1 ms** (**4.0 fps** steady-state, `28.6 ms` copy-back).
 - **Zero-protect copy-back & GPU texture readback (`518977f`, `ce0e6da`):** Enabled `VICTORY_COPY_BACK_BESIDE` by default (`21.1–37.1 ms/frame` copy-back without `VirtualProtect` cycles) and added opt-in `VICTORY_TEXTURE_BACK=1` (`texback.rs`) for tiling shader-written ocean/displacement UAV textures back to title memory cleanly.
-- **Lock-free / low-contention host paths (`0e04b91`, `7922b08`, `f905d00`, `ada5c7a`, `622e793`, `39c7ad6`, `129f8c4`, `c65cda7`, `3961805`):**
+- **Placed RADV L0 VRAM & low-contention host paths (`0e04b91`, `7922b08`, `f905d00`, `ada5c7a`, `622e793`, `39c7ad6`, `129f8c4`, `c65cda7`, `3961805`):**
+  - `VICTORY_PORT_PLACED=1` + `ENABLE_VICTORY_PLACED=1` (`tools/vk-layer-placed/` + `port_placed.rs`, `avatarmanz #420`): backs 32-bit `XMem` reservations directly in RADV L0 VRAM via `VK_KHR_map_memory2` + `VK_EXT_map_memory_placed` + `ID3D12DXVKInteropDevice3::GetVulkanHeapInfo`, eliminating host refresh copies for placed heaps (`refreshes` cut `82.9 -> 39.5 GB/f`, reaching **4.01 avg_fps** / **`5.1–5.5 fps` / `181.3–194.4 ms/frame`** steady state with `0` faults).
   - AVX2 32-byte copy-back merges in `shadow.rs` and idle readback-chunk / `HostList` trimming (`0e04b91`).
   - `RwLock` on `shadow::BUFFERS` and `shadow::LOOSE` with off-thread `victory-bury` retirement (`7922b08`, `f905d00`).
   - `VICTORY_COLD_SKIP=1` cold 2 MiB chunk refresh skip (`ada5c7a`), `VICTORY_CCD=1` Ryzen CCD worker pinning & same-page remap skip (`622e793`), AVX2 texture hashing & `VICTORY_CARD_FETCH_INFLIGHT=1` (`39c7ad6`), plus opt-in `VICTORY_HEAP_WORKER=1` (`129f8c4`), `VICTORY_PORT_CBV=1` (`c65cda7`), and `VICTORY_PORT_GUARD=1` (`3961805`).
