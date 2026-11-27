@@ -957,6 +957,9 @@ struct Gather {
     spare: Vec<ID3D12Resource>,
     runs: Vec<crate::indirect::GatherSet>,
     run_spare: Vec<(ID3D12Resource, bool)>,
+    /// Single-record indirect dispatches clamped together between two title
+    /// waits (`VICTORY_DISPATCH_RUNS`, [`HostList::dispatch_slot`]).
+    dispatch_runs: Vec<crate::indirect::GatherSet>,
 }
 
 const GATHER_SETS: usize = 8;
@@ -2791,8 +2794,9 @@ impl HostList {
         // COMMON at list end so the next recording starts from COMMON.
         let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
         {
-            let Gather { runs, run_spare, .. } = &mut *gather;
+            let Gather { runs, run_spare, dispatch_runs, .. } = &mut *gather;
             run_spare.extend(runs.drain(..).map(|set| (set.into_scratch(), true)));
+            run_spare.extend(dispatch_runs.drain(..).map(|set| (set.into_scratch(), true)));
             for (scratch, readable) in run_spare.iter_mut().filter(|s| s.1) {
                 // SAFETY: an open list and a live buffer left in INDIRECT_ARGUMENT.
                 unsafe {
@@ -2883,6 +2887,7 @@ impl HostList {
                 spare,
                 runs,
                 run_spare,
+                dispatch_runs,
                 ..
             } = &mut *gather;
             *closed = false;
@@ -2892,6 +2897,7 @@ impl HostList {
                 }
             }
             run_spare.extend(runs.drain(..).map(|set| (set.into_scratch(), false)));
+            run_spare.extend(dispatch_runs.drain(..).map(|set| (set.into_scratch(), false)));
             run_spare.truncate(GATHER_SETS);
             for spare in run_spare.iter_mut() {
                 spare.1 = false;
@@ -3331,6 +3337,7 @@ impl HostList {
 
     /// A wait for a memory value.
     pub(crate) fn note_wait(&self, wait: crate::memwait::Wait) {
+        self.dispatch_runs_close();
         let mut deferred = self.deferred();
         let before = deferred.writes.len();
         deferred.waits.push((before, wait));
@@ -3380,6 +3387,49 @@ impl HostList {
     pub(crate) fn count_write(&self) {
         self.writes.fetch_add(1, Ordering::Relaxed);
         self.gather_close();
+        self.dispatch_runs_close();
+    }
+
+    /// Counts a title dispatch: as [`HostList::count_write`], except that
+    /// the dispatches' run of clamped records stays open: what a dispatch
+    /// writes is not there for a later command before the title waits for
+    /// it (a barrier or a pipeline sync, which close the run).
+    pub(crate) fn count_dispatch(&self) {
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.gather_close();
+    }
+
+    /// Counts a plain (direct) title dispatch: it ends the dispatches' run
+    /// of clamped records unless `VICTORY_DISPATCH_RUNS=2`.
+    pub(crate) fn count_direct_dispatch(&self) {
+        self.count_dispatch();
+        if crate::indirect::dispatch_runs_mode() != 2 {
+            self.dispatch_runs_close();
+        }
+    }
+
+    /// Ends the run of clamped dispatch records ([`HostList::dispatch_slot`]):
+    /// the title waits for earlier work, or a command may write arguments.
+    pub(crate) fn dispatch_runs_close(&self) {
+        let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
+        if gather.dispatch_runs.is_empty() {
+            return;
+        }
+        let Gather { dispatch_runs, run_spare, .. } = &mut *gather;
+        run_spare.extend(dispatch_runs.drain(..).map(|set| (set.into_scratch(), true)));
+    }
+
+    /// A slot for the single record of an indirect dispatch at `offset` in
+    /// `src` (`src_id`), clamped by the run's pass opened at the first
+    /// dispatch after the title last waited (`VICTORY_DISPATCH_RUNS`).
+    pub(crate) fn dispatch_slot(
+        &self,
+        src: &ID3D12Resource,
+        src_id: u64,
+        offset: u32,
+        spec: (u32, u32),
+    ) -> Option<(ID3D12Resource, u64, bool)> {
+        self.gather_run_slot(src, src_id, offset, spec, true)
     }
 
     /// Stops gathering single-record indirect draws for this list's prelude:
@@ -3397,15 +3447,19 @@ impl HostList {
         src_id: u64,
         offset: u32,
         (kind, stride): (u32, u32),
+        dispatch: bool,
     ) -> Option<(ID3D12Resource, u64, bool)> {
         let budget = self.budget()?;
         let mut gather = self.gather.lock().unwrap_or_else(|e| e.into_inner());
-        for set in gather
-            .runs
+        let open = if dispatch { &mut gather.dispatch_runs } else { &mut gather.runs };
+        for set in open
             .iter_mut()
             .filter(|s| s.is_of(src, src_id, (kind, stride)))
         {
             if let Some(slot) = set.slot(offset) {
+                if dispatch {
+                    crate::indirect::DISPATCH_RUNS[1].fetch_add(1, Ordering::Relaxed);
+                }
                 return Some((set.scratch.clone(), u64::from(slot) * u64::from(stride), false));
             }
         }
@@ -3436,7 +3490,20 @@ impl HostList {
         }
         let slot = set.slot(offset)?;
         let scratch = set.scratch.clone();
-        gather.runs.push(set);
+        if dispatch {
+            let opened = crate::indirect::DISPATCH_RUNS[0].fetch_add(1, Ordering::Relaxed) + 1;
+            if opened.is_power_of_two() && opened >= 1024 {
+                tracing::info!(
+                    opened,
+                    joined = crate::indirect::DISPATCH_RUNS[1].load(Ordering::Relaxed),
+                    mode = crate::indirect::dispatch_runs_mode(),
+                    "indirect dispatch runs (VICTORY_DISPATCH_RUNS)"
+                );
+            }
+            gather.dispatch_runs.push(set);
+        } else {
+            gather.runs.push(set);
+        }
         Some((scratch, u64::from(slot) * u64::from(stride), true))
     }
 
@@ -3453,7 +3520,7 @@ impl HostList {
         if gather.closed {
             if crate::indirect::gather_runs() {
                 drop(gather);
-                return self.gather_run_slot(src, src_id, offset, (kind, stride));
+                return self.gather_run_slot(src, src_id, offset, (kind, stride), false);
             }
             return None;
         }

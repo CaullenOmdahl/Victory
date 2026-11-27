@@ -1166,7 +1166,7 @@ impl State {
                 at += MAX_GROUPS;
             }
         }
-        list.count_write();
+        list.count_direct_dispatch();
         list.count_work();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         // Depth textures it wrote as images get what it wrote; then the
@@ -1308,6 +1308,7 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, y, z) };
                     list.count_work();
+                    list.dispatch_runs_close();
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -1745,6 +1746,7 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             list.count_work();
+            list.dispatch_runs_close();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1845,6 +1847,7 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             list.count_work();
+            list.dispatch_runs_close();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         if !ran {
@@ -1992,21 +1995,35 @@ impl State {
         // scattered indirect draw records so `list.prelude` clamps all of them
         // in one batched dispatch instead of a separate dispatch + UAV barrier
         // per draw.
-        let gathered = (kind != DISPATCH
+        let dispatch_run = kind == DISPATCH
+            && max == 1
+            && count.is_none()
+            && crate::indirect::dispatch_runs();
+        let gathered = ((kind != DISPATCH
             && max == 1
             && count.is_none()
             && !rects_indirect
             && !may_store
             && gathers())
+            || dispatch_run)
         .then(|| {
             use windows::core::Interface;
             let src_id = args.buffer.as_raw() as u64;
-            let (scratch, at, recorded) = crate::indirect::gather(
-                list,
-                (&args.buffer, src_id),
-                args.offset(arguments),
-                (kind, stride),
-            )?;
+            let (scratch, at, recorded) = if dispatch_run {
+                crate::indirect::gather_dispatch(
+                    list,
+                    (&args.buffer, src_id),
+                    args.offset(arguments),
+                    (kind, stride),
+                )?
+            } else {
+                crate::indirect::gather(
+                    list,
+                    (&args.buffer, src_id),
+                    args.offset(arguments),
+                    (kind, stride),
+                )?
+            };
             args.refresh(list, arguments, len);
             if recorded {
                 self.host_pipeline = 0;
@@ -2055,7 +2072,13 @@ impl State {
                 // Bounded first: the clamp binds a compute pipeline of its own and
                 // copies clamped active records into a scratch buffer at offset 0.
                 #[cfg(feature = "diagnostics")]
-                list.note_op(|| format!("clamp of kind {kind}"));
+                list.note_op(|| {
+                    format!(
+                        "clamp of kind {kind} [clamp kind {kind} max {} count {} store {may_store} rects {rects_indirect}]",
+                        if max <= 1 { "1".to_string() } else if max <= 64 { "<=64".into() } else { ">64".into() },
+                        count.is_some()
+                    )
+                });
                 let Some(bounded) = crate::indirect::bound(
                     list,
                     (&args.buffer, args.offset(arguments)),
@@ -2182,7 +2205,7 @@ impl State {
             crate::indirect::done(list, &bounded);
         }
         if kind == DISPATCH {
-            list.count_write();
+            list.count_dispatch();
             list.count_work();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
             if crate::twin::resolve(list) {
@@ -2190,6 +2213,7 @@ impl State {
             }
         } else {
             list.count_work();
+            list.dispatch_runs_close();
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true

@@ -659,6 +659,9 @@ extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> 
         }) {
             host.push(UAV_BARRIER);
         }
+        if count > 0 {
+            list.dispatch_runs_close();
+        }
         let host = coalesce_barriers(host);
         if !host.is_empty() {
             use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
@@ -1740,7 +1743,15 @@ extern "system" fn set_pipeline(this: This, pipeline: This) {
 /// bottom of the pipe `(flags, control, address, size)`. Host lists order
 /// their own work and every submission is waited for, so there is nothing
 /// to do.
-extern "system" fn sync(_: This, _flags: u32, _control: u32, _address: u64, _size: u64) {}
+/// (It ends the run of clamped dispatch records: `HostList::dispatch_slot`.)
+extern "system" fn sync(this: This, _flags: u32, _control: u32, _address: u64, _size: u64) {
+    #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.dispatch_runs_close();
+    }
+    #[cfg(not(windows))]
+    let _ = this;
+}
 
 /// Reset with console flags `(allocator, pipeline, flags)`; the flags only
 /// tune the console's command memory.
@@ -2177,6 +2188,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     if count > 0
         && let Some(list) = host_list(this)
     {
+        list.dispatch_runs_close();
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
         // SAFETY: the same layout; no resource named.
         let barrier = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };

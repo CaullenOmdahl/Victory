@@ -665,6 +665,47 @@ pub(crate) fn gatherable(src_gpu: u64, offset: u64, (kind, stride): (u32, u32)) 
         .filter(|o| o.checked_add(stride).is_some())
 }
 
+/// Whether single-record indirect dispatches between two title waits are
+/// clamped in one pass (`VICTORY_DISPATCH_RUNS=1`; after Vice-Tay
+/// `03759624`, `VICTORY_INDIRECT_BATCH=2`): the title runs its tile-class
+/// dispatches side by side, and a clamp of their own put two full waits
+/// between every two of them.
+///
+/// `1`: a run ends at every title wait (barrier, pipeline sync, memory
+/// wait), draw, copy and plain dispatch: only indirect dispatches recorded
+/// one after another share a pass. `2`: as Vice-Tay's
+/// `VICTORY_INDIRECT_BATCH=2`, plain dispatches do not end it either.
+pub(crate) fn dispatch_runs() -> bool {
+    dispatch_runs_mode() > 0
+}
+
+pub(crate) fn dispatch_runs_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("VICTORY_DISPATCH_RUNS").as_deref() {
+        Ok("1") => 1,
+        Ok("2") => 2,
+        _ => 0,
+    })
+}
+
+/// Dispatch runs opened, and records that joined one ([`dispatch_runs`]).
+pub(crate) static DISPATCH_RUNS: [std::sync::atomic::AtomicU64; 2] =
+    [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+
+/// As [`gather`], for an indirect dispatch's record: its slot in the run
+/// of dispatches opened since the title last waited ([`dispatch_runs`]).
+pub(crate) fn gather_dispatch(
+    list: &HostList,
+    (src, src_id): (&ID3D12Resource, u64),
+    offset: u64,
+    spec: (u32, u32),
+) -> Option<(ID3D12Resource, u64, bool)> {
+    clamp()?;
+    // SAFETY: a live D3D12 buffer resource.
+    let offset = gatherable(unsafe { src.GetGPUVirtualAddress() }, offset, spec)?;
+    list.dispatch_slot(src, src_id, offset, spec)
+}
+
 /// Gathers a single scattered indirect record for `list`'s prelude or current
 /// run to clamp in one batched pass instead of a serialized dispatch per draw.
 /// The third return value is `true` if a clamp pass was recorded inline now
