@@ -128,6 +128,9 @@ Speed:
   allocations for up to 64 root-table entries per draw, and large (`>= 4 MiB`)
   host copy reads split across a persistent `victory-wide` pool
   (`VICTORY_WIDE_THREADS=<n>`, `1` disables).
+- Cold 2 MiB chunks of host copies with no journaled writes since their last
+  walk can be skipped without per-page scanning (`VICTORY_COLD_SKIP=1|alt`, off
+  by default).
 
 Memory the title shows at several addresses:
 - Every view of a guarded physical page is guarded with it, so a write of

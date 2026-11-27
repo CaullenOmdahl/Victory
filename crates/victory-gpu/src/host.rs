@@ -5712,6 +5712,8 @@ impl Meter {
             #[cfg(feature = "diagnostics")]
             tracing::info!("sparse writes since: {}", crate::shadow::sparse_writes_text());
             #[cfg(feature = "diagnostics")]
+            crate::shadow::cold_skip_log(frames);
+            #[cfg(feature = "diagnostics")]
             log_gpu_waits();
             #[cfg(feature = "diagnostics")]
             tracing::info!(

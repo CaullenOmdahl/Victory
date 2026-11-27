@@ -140,8 +140,8 @@ const WW_SHARDS: usize = 64;
 const JOURNAL_PAGE_STRIPE_SHIFT: usize = WW_STRIPE_SHIFT - 16; // 1024 * 64 KiB = 64 MiB
 const JOURNAL_SHARDS: usize = WW_SHARDS;
 static WRITE_WATCH_LOCKS: [Mutex<()>; WW_SHARDS] = [const { Mutex::new(()) }; WW_SHARDS];
-static JOURNALS: [RwLock<BTreeMap<usize, u64>>; JOURNAL_SHARDS] =
-    [const { RwLock::new(BTreeMap::new()) }; JOURNAL_SHARDS];
+static JOURNALS: [RwLock<crate::cold_skip::Written>; JOURNAL_SHARDS] =
+    [const { RwLock::new(crate::cold_skip::Written::new()) }; JOURNAL_SHARDS];
 /// With `VICTORY_DIRTY_4K=1`: `(last_ask, prev_ask, mask_4k)` per 64 KiB page
 /// for writes reported by `GetWriteWatch`, sharded identically to [`JOURNALS`].
 static SUB_JOURNALS: [RwLock<BTreeMap<usize, (u64, u64, u16)>>; JOURNAL_SHARDS] =
@@ -189,36 +189,58 @@ fn journal_shard(page: usize) -> usize {
     (page >> JOURNAL_PAGE_STRIPE_SHIFT) & (JOURNAL_SHARDS - 1)
 }
 
+#[cfg(test)]
 fn journal_read_range(first: usize, last: usize) -> Vec<(usize, u64)> {
+    journal_read_range_marked(first, last, None)
+}
+
+fn journal_read_range_marked(
+    first: usize,
+    last: usize,
+    mut marks: Option<&mut Vec<(usize, u64)>>,
+) -> Vec<(usize, u64)> {
     if first >= last {
         return Vec::new();
     }
     let s0 = first >> JOURNAL_PAGE_STRIPE_SHIFT;
     let s1 = (last - 1) >> JOURNAL_PAGE_STRIPE_SHIFT;
+    let mut out = Vec::new();
     if s0 == s1 {
         let j = JOURNALS[journal_shard(first)]
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        return j.range(first..last).map(|(&p, &w)| (p, w)).collect();
+        j.extend_noted(first, last, marks, &mut out);
+        return out;
     }
-    let mut out = Vec::new();
     for stripe in s0..=s1 {
         let lo = first.max(stripe << JOURNAL_PAGE_STRIPE_SHIFT);
         let hi = last.min((stripe + 1) << JOURNAL_PAGE_STRIPE_SHIFT);
         let j = JOURNALS[stripe & (JOURNAL_SHARDS - 1)]
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        out.extend(j.range(lo..hi).map(|(&p, &w)| (p, w)));
+        j.extend_noted(lo, hi, marks.as_deref_mut(), &mut out);
     }
     out
 }
 
+#[cfg(test)]
 fn journal_record_and_read(
     pages: &[(usize, u16)],
     now: u64,
     first: usize,
     last: usize,
     kernel_sub: bool,
+) -> Vec<(usize, u64)> {
+    journal_record_and_read_marked(pages, now, first, last, kernel_sub, None)
+}
+
+fn journal_record_and_read_marked(
+    pages: &[(usize, u16)],
+    now: u64,
+    first: usize,
+    last: usize,
+    kernel_sub: bool,
+    marks: Option<&mut Vec<(usize, u64)>>,
 ) -> Vec<(usize, u64)> {
     let track_sub = kernel_sub && dirty4k();
     let clear_sub = !kernel_sub && dirty4k();
@@ -232,7 +254,8 @@ fn journal_record_and_read(
     if let Some(s0) = single {
         let shard = s0 & (JOURNAL_SHARDS - 1);
         let mut prevs: Vec<(usize, u64, u16)> = Vec::new();
-        let out = {
+        let mut out = Vec::new();
+        {
             let mut j = JOURNALS[shard].write().unwrap_or_else(|e| e.into_inner());
             for &(page, mask) in pages {
                 let before = j.insert(page, now).unwrap_or(0);
@@ -240,7 +263,7 @@ fn journal_record_and_read(
                     prevs.push((page, before, mask));
                 }
             }
-            j.range(first..last).map(|(&p, &w)| (p, w)).collect()
+            j.extend_noted(first, last, marks, &mut out);
         };
         if track_sub && !prevs.is_empty() {
             let mut sub = SUB_JOURNALS[shard]
@@ -294,7 +317,7 @@ fn journal_record_and_read(
             }
         }
     }
-    journal_read_range(first, last)
+    journal_read_range_marked(first, last, marks)
 }
 
 fn record_sub_entry(
@@ -445,8 +468,19 @@ pub(crate) fn reset_write_watch(start: usize, len: usize) {
 }
 
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_marked(start, end, guarded, None)
+}
+
+/// [`writes`] that also records per-2 MiB chunk marks into `marks` under
+/// the same journal shard lock (`VICTORY_COLD_SKIP`, `crate::cold_skip`).
+pub(crate) fn writes_marked(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    marks: Option<&mut Vec<(usize, u64)>>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     if guarded && known_view(start) {
-        return writes_guarded(start, end);
+        return writes_guarded_marked(start, end, marks);
     }
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
@@ -496,7 +530,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         if !guarded {
             return None;
         }
-        return writes_guarded(start, end);
+        return writes_guarded_marked(start, end, marks);
     }
     #[cfg(feature = "diagnostics")]
     {
@@ -507,9 +541,9 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     let now = ASKED.fetch_add(1, Ordering::AcqRel) + 1;
     if pages.is_empty() {
         drop(ww);
-        return Some((now, journal_read_range(first, last)));
+        return Some((now, journal_read_range_marked(first, last, marks)));
     }
-    let out = journal_record_and_read(&pages, now, first, last, true);
+    let out = journal_record_and_read_marked(&pages, now, first, last, true, marks);
     drop(ww);
     Some((now, out))
 }
@@ -518,6 +552,15 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
 /// view memory: skips the `GetWriteWatch` syscall (which always fails on
 /// mapped views).
 pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)> {
+    writes_guarded_marked(start, end, None)
+}
+
+/// [`writes_guarded`] with optional `marks` collection for `VICTORY_COLD_SKIP`.
+pub(crate) fn writes_guarded_marked(
+    start: usize,
+    end: usize,
+    marks: Option<&mut Vec<(usize, u64)>>,
+) -> Option<(u64, Vec<(usize, u64)>)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -530,10 +573,13 @@ pub(crate) fn writes_guarded(start: usize, end: usize) -> Option<(u64, Vec<(usiz
     }
     let now = ASKED.fetch_add(1, Ordering::AcqRel) + 1;
     if guarded.is_empty() {
-        return Some((now, journal_read_range(first, last)));
+        return Some((now, journal_read_range_marked(first, last, marks)));
     }
     let whole: Vec<(usize, u16)> = guarded.into_iter().map(|p| (p, 0)).collect();
-    Some((now, journal_record_and_read(&whole, now, first, last, false)))
+    Some((
+        now,
+        journal_record_and_read_marked(&whole, now, first, last, false, marks),
+    ))
 }
 
 /// Guarded blocks of view memory.

@@ -36,6 +36,9 @@ pub(crate) struct Shadow {
     /// Per page of title memory from `start`'s on: the write-watch asking
     /// after which it was last copied (0: never).
     copied: Mutex<Vec<u64>>,
+    /// With `VICTORY_COLD_SKIP`: per 2 MiB chunk, the journal mark when a walk
+    /// last left it fresh (`crate::cold_skip::Chunks`).
+    verified: Mutex<Vec<u64>>,
     /// Whether the memory is write-watched: unknown, yes, no.
     watched: AtomicU8,
     /// Ranges shaders of a submission not yet copied back may be writing:
@@ -201,6 +204,52 @@ pub(crate) fn sparse_writes_text() -> String {
     )
 }
 
+/// Whether `copy_stale` skips 2 MiB chunks with unchanged journal marks
+/// (`VICTORY_COLD_SKIP=1|alt`, off by default).
+fn cold_skip() -> bool {
+    match crate::cold_skip::mode() {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20)
+                .is_multiple_of(2);
+            static LAST: AtomicU8 = AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "refreshes pass over chunks with no write since from now (VICTORY_COLD_SKIP=alt): {}",
+                    if on {
+                        "ON"
+                    } else {
+                        "off, every page looked at as usual"
+                    }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// With [`cold_skip`], since the last log: pages looked at one by one, pages
+/// passed over without walking.
+static COLD_SKIP: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Logs [`cold_skip`] stats alongside periodic frame metrics when active.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn cold_skip_log(frames: f64) {
+    let [walked, passed] = COLD_SKIP.each_ref().map(|n| n.swap(0, Ordering::Relaxed));
+    if walked + passed == 0 {
+        return;
+    }
+    let frames = frames.max(1.0);
+    tracing::info!(
+        "refreshes with VICTORY_COLD_SKIP per frame: {:.0} pages of 64 KiB passed over, {:.0} looked at ({:.1}% passed over)",
+        passed as f64 / frames,
+        walked as f64 / frames,
+        passed as f64 * 100.0 / (walked + passed) as f64
+    );
+}
+
 /// Bytes of the snapshot memory kept for reuse.
 pub(crate) fn pool_bytes() -> u64 {
     let pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
@@ -325,6 +374,7 @@ impl Shadow {
             start,
             len,
             copied: Mutex::new(vec![0; pages as usize]),
+            verified: Mutex::default(),
             watched: AtomicU8::new(0),
             pending: Mutex::default(),
             pending_len: std::sync::atomic::AtomicUsize::new(0),
@@ -838,27 +888,41 @@ impl Shadow {
             if j - i == 1 {
                 let (from, to) = clamped[i];
                 copied += self.update_lazily(from, to - from, lazy);
-            } else if let Some((now, written)) = crate::watch::writes(c_start, c_end, false) {
-                let subs = crate::watch::subpages(c_start, c_end);
-                for &(from, to) in &clamped[i..j] {
-                    let p0 = from / PAGE;
-                    let p1 = to.div_ceil(PAGE);
-                    let w0 = written.partition_point(|&(p, _)| p < p0);
-                    let w1 = written.partition_point(|&(p, _)| p < p1);
-                    let s0 = subs.partition_point(|&(p, ..)| p < p0);
-                    let s1 = subs.partition_point(|&(p, ..)| p < p1);
-                    let n = self.copy_stale(from, to, now, &written[w0..w1], &subs[s0..s1]);
-                    copied += n;
-                    #[cfg(feature = "diagnostics")]
-                    {
-                        use crate::copystat::{C, add};
-                        add(C::Checked, (to - from) as u64);
-                        add(C::Unchanged, (to - from).saturating_sub(n) as u64);
-                    }
-                }
             } else {
-                for &(from, to) in &clamped[i..j] {
-                    copied += self.update_lazily(from, to - from, lazy);
+                let skip = cold_skip();
+                let mut marks = Vec::new();
+                if let Some((now, written)) =
+                    crate::watch::writes_marked(c_start, c_end, false, skip.then_some(&mut marks))
+                {
+                    let subs = crate::watch::subpages(c_start, c_end);
+                    let marks = skip.then_some(marks.as_slice());
+                    for &(from, to) in &clamped[i..j] {
+                        let p0 = from / PAGE;
+                        let p1 = to.div_ceil(PAGE);
+                        let w0 = written.partition_point(|&(p, _)| p < p0);
+                        let w1 = written.partition_point(|&(p, _)| p < p1);
+                        let s0 = subs.partition_point(|&(p, ..)| p < p0);
+                        let s1 = subs.partition_point(|&(p, ..)| p < p1);
+                        let n = self.copy_stale(
+                            from,
+                            to,
+                            now,
+                            &written[w0..w1],
+                            &subs[s0..s1],
+                            marks,
+                        );
+                        copied += n;
+                        #[cfg(feature = "diagnostics")]
+                        {
+                            use crate::copystat::{C, add};
+                            add(C::Checked, (to - from) as u64);
+                            add(C::Unchanged, (to - from).saturating_sub(n) as u64);
+                        }
+                    }
+                } else {
+                    for &(from, to) in &clamped[i..j] {
+                        copied += self.update_lazily(from, to - from, lazy);
+                    }
                 }
             }
             i = j;
@@ -952,12 +1016,17 @@ impl Shadow {
             }
             return self.update_guarded_chunk(from, to, lazy);
         } else if mode != NOT_WATCHED {
+            let skip = cold_skip();
+            let mut marks = Vec::new();
             // Probe write-watch first; if that fails and guard succeeds, mark
             // this shadow as guarded so subsequent calls skip GetWriteWatch.
-            if let Some((now, written)) = crate::watch::writes(from, to, false) {
+            if let Some((now, written)) =
+                crate::watch::writes_marked(from, to, false, skip.then_some(&mut marks))
+            {
                 self.watched.store(1, Ordering::Relaxed);
                 let subs = crate::watch::subpages(from, to);
-                let copied = self.copy_stale(from, to, now, &written, &subs);
+                let copied =
+                    self.copy_stale(from, to, now, &written, &subs, skip.then_some(marks.as_slice()));
                 #[cfg(feature = "diagnostics")]
                 {
                     use crate::copystat::{C, add};
@@ -973,9 +1042,13 @@ impl Shadow {
                 Vec::new()
             };
             let ge = crate::watch::region_epoch(from, to);
-            if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
+            let mut g_marks = Vec::new();
+            if let Some((now, written)) =
+                crate::watch::writes_guarded_marked(from, to, skip.then_some(&mut g_marks))
+            {
                 self.watched.store(WATCHED_GUARDED, Ordering::Relaxed);
-                let copied = self.copy_stale(from, to, now, &written, &[]);
+                let copied =
+                    self.copy_stale(from, to, now, &written, &[], skip.then_some(g_marks.as_slice()));
                 if !self.page_epochs.is_empty() {
                     self.stamp_page_epochs(from, to, p0, p1, &pre);
                 } else if crate::watch::region_epoch(from, to) == ge {
@@ -1092,9 +1165,13 @@ impl Shadow {
             {
                 checked_bytes += re - rs;
             }
+            let skip = cold_skip();
+            let mut marks = Vec::new();
             let pre: Vec<u64> = (rp0..=rp1).map(|p| crate::watch::block_epoch(p * PAGE)).collect();
-            if let Some((now, written)) = crate::watch::writes_guarded(rs, re) {
-                let n = self.copy_stale(rs, re, now, &written, &[]);
+            if let Some((now, written)) =
+                crate::watch::writes_guarded_marked(rs, re, skip.then_some(&mut marks))
+            {
+                let n = self.copy_stale(rs, re, now, &written, &[], skip.then_some(marks.as_slice()));
                 copied += n;
                 self.stamp_page_epochs(rs, re, rp0, rp1, &pre);
                 if let Some(ge) = partial_ge
@@ -1113,10 +1190,13 @@ impl Shadow {
                     add(C::Unchanged, (re - rs).saturating_sub(n) as u64);
                 }
             } else if self.sparse.is_some()
-                && let Some((now, written)) = crate::watch::writes(rs, re, false)
+                && let Some((now, written)) = {
+                    marks.clear();
+                    crate::watch::writes_marked(rs, re, false, skip.then_some(&mut marks))
+                }
             {
                 let subs = crate::watch::subpages(rs, re);
-                let n = self.copy_stale(rs, re, now, &written, &subs);
+                let n = self.copy_stale(rs, re, now, &written, &subs, skip.then_some(marks.as_slice()));
                 copied += n;
                 #[cfg(feature = "diagnostics")]
                 {
@@ -1160,8 +1240,13 @@ impl Shadow {
                 return 0;
             }
         }
-        if let Some((now, written)) = crate::watch::writes_guarded(from, to) {
-            let copied = self.copy_stale(from, to, now, &written, &[]);
+        let skip = cold_skip();
+        let mut marks = Vec::new();
+        if let Some((now, written)) =
+            crate::watch::writes_guarded_marked(from, to, skip.then_some(&mut marks))
+        {
+            let copied =
+                self.copy_stale(from, to, now, &written, &[], skip.then_some(marks.as_slice()));
             if crate::watch::region_epoch(from, to) == ge {
                 let mut spans = self.clean_spans.lock().unwrap_or_else(|e| e.into_inner());
                 if spans.len() >= 8192 {
@@ -1180,10 +1265,14 @@ impl Shadow {
         // A sparse 2 GiB chunk can hold MEM_PRIVATE allocations alongside
         // MEM_MAPPED views; probe GetWriteWatch before unwatched hashing.
         if self.sparse.is_some()
-            && let Some((now, written)) = crate::watch::writes(from, to, false)
+            && let Some((now, written)) = {
+                marks.clear();
+                crate::watch::writes_marked(from, to, false, skip.then_some(&mut marks))
+            }
         {
             let subs = crate::watch::subpages(from, to);
-            let copied = self.copy_stale(from, to, now, &written, &subs);
+            let copied =
+                self.copy_stale(from, to, now, &written, &subs, skip.then_some(marks.as_slice()));
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1323,73 +1412,101 @@ impl Shadow {
         now: u64,
         written: &[(usize, u64)],
         subs: &[(usize, u64, u64, u16)],
+        marks: Option<&[(usize, u64)]>,
     ) -> usize {
         const KERNEL_PAGE: usize = 4096;
         let base = self.start as usize / PAGE;
         let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        let mut verified = self.verified.lock().unwrap_or_else(|e| e.into_inner());
+        let pages = base..base + copied.len();
+        let mut chunks =
+            marks.map(|marks| crate::cold_skip::Chunks::new(&mut verified, pages, marks));
         let mut writes = written.iter().peekable();
         let mut sub_iter = subs.iter().peekable();
         let (mut bytes, mut run): (usize, Option<usize>) = (0, None);
+        let (mut walked, mut passed) = (0usize, 0usize);
         let last = (to - 1) / PAGE;
-        for page in from / PAGE..=last {
-            let write = match writes.peek() {
-                Some(&&(p, w)) if p == page => {
-                    writes.next();
-                    w
+        for span in crate::cold_skip::spans(from / PAGE, last) {
+            if chunks.as_ref().is_some_and(|c| c.unchanged(&span)) {
+                if let Some(first) = run.take() {
+                    bytes += self.copy((first * PAGE).max(from), (span.start * PAGE).min(to));
                 }
-                _ => 0,
-            };
-            while sub_iter.peek().is_some_and(|s| s.0 < page) {
-                sub_iter.next();
+                passed += span.len();
+                continue;
             }
-            let sub = sub_iter
-                .peek()
-                .filter(|s| s.0 == page && s.1 == write && write != 0)
-                .map(|s| (s.2, s.3));
-            let at = &mut copied[page - base];
-            if *at == 0 || write > *at {
-                let taken = *at;
-                // A page only partly in the range is copied in part: it
-                // stays stale for the rest.
-                let (start, end) = (self.start as usize, (self.start + self.len) as usize);
-                if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
-                    *at = now;
+            walked += span.len();
+            let mut all_fresh = true;
+            for page in span.clone() {
+                while writes.peek().is_some_and(|w| w.0 < page) {
+                    writes.next();
                 }
-                if let Some((prev_ask, bits)) = sub
-                    && taken != 0
-                    && prev_ask <= taken
-                    && bits != 0
-                    && bits != u16::MAX
-                {
-                    if let Some(first) = run.take() {
-                        bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                let write = match writes.peek() {
+                    Some(&&(p, w)) if p == page => {
+                        writes.next();
+                        w
                     }
-                    let mut k = 0usize;
-                    while k < PAGE / KERNEL_PAGE {
-                        if bits & (1 << k) == 0 {
-                            k += 1;
-                            continue;
-                        }
-                        let k_start = k;
-                        while k < PAGE / KERNEL_PAGE && (bits & (1 << k)) != 0 {
-                            k += 1;
-                        }
-                        let sub_from = (page * PAGE + k_start * KERNEL_PAGE).max(from);
-                        let sub_to = (page * PAGE + k * KERNEL_PAGE).min(to);
-                        if sub_from < sub_to {
-                            bytes += self.copy(sub_from, sub_to);
-                        }
-                    }
-                } else {
-                    run.get_or_insert(page);
+                    _ => 0,
+                };
+                while sub_iter.peek().is_some_and(|s| s.0 < page) {
+                    sub_iter.next();
                 }
-            } else if let Some(first) = run.take() {
-                bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                let sub = sub_iter
+                    .peek()
+                    .filter(|s| s.0 == page && s.1 == write && write != 0)
+                    .map(|s| (s.2, s.3));
+                let at = &mut copied[page - base];
+                if *at == 0 || write > *at {
+                    let taken = *at;
+                    // A page only partly in the range is copied in part: it
+                    // stays stale for the rest.
+                    let (start, end) = (self.start as usize, (self.start + self.len) as usize);
+                    if (page * PAGE).max(start) >= from && ((page + 1) * PAGE).min(end) <= to {
+                        *at = now;
+                    }
+                    all_fresh &= crate::cold_skip::fresh(*at, write);
+                    if let Some((prev_ask, bits)) = sub
+                        && taken != 0
+                        && prev_ask <= taken
+                        && bits != 0
+                        && bits != u16::MAX
+                    {
+                        if let Some(first) = run.take() {
+                            bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                        }
+                        let mut k = 0usize;
+                        while k < PAGE / KERNEL_PAGE {
+                            if bits & (1 << k) == 0 {
+                                k += 1;
+                                continue;
+                            }
+                            let k_start = k;
+                            while k < PAGE / KERNEL_PAGE && (bits & (1 << k)) != 0 {
+                                k += 1;
+                            }
+                            let sub_from = (page * PAGE + k_start * KERNEL_PAGE).max(from);
+                            let sub_to = (page * PAGE + k * KERNEL_PAGE).min(to);
+                            if sub_from < sub_to {
+                                bytes += self.copy(sub_from, sub_to);
+                            }
+                        }
+                    } else {
+                        run.get_or_insert(page);
+                    }
+                } else if let Some(first) = run.take() {
+                    bytes += self.copy((first * PAGE).max(from), (page * PAGE).min(to));
+                }
+            }
+            if let Some(chunks) = chunks.as_mut() {
+                chunks.walked(&span, all_fresh);
             }
         }
         // Cut to the range: next to it shaders may be writing the copy.
         if let Some(first) = run {
             bytes += self.copy((first * PAGE).max(from), ((last + 1) * PAGE).min(to));
+        }
+        if marks.is_some() {
+            COLD_SKIP[0].fetch_add(walked as u64, Ordering::Relaxed);
+            COLD_SKIP[1].fetch_add(passed as u64, Ordering::Relaxed);
         }
         bytes
     }
@@ -1511,6 +1628,7 @@ fn placed(
         start,
         len,
         copied: Mutex::default(),
+        verified: Mutex::default(),
         watched: AtomicU8::new(NOT_WATCHED),
         pending: Mutex::default(),
         pending_len: std::sync::atomic::AtomicUsize::new(0),
@@ -2443,6 +2561,7 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
         start,
         len,
         copied: Mutex::new(if of.is_some() { Vec::new() } else { vec![0; (len / PAGE as u64) as usize] }),
+        verified: Mutex::default(),
         watched: AtomicU8::new(0),
         pending: Mutex::default(),
         pending_len: std::sync::atomic::AtomicUsize::new(0),
@@ -4688,7 +4807,7 @@ mod find_cache_tests {
         register(resource, page_addr as u64, PAGE as u64);
         let s = find(page_addr as u64, 1).expect("shadow");
         // Seed initial copy at ask 10.
-        assert_eq!(s.copy_stale(page_addr, page_addr + PAGE, 10, &[], &[]), PAGE);
+        assert_eq!(s.copy_stale(page_addr, page_addr + PAGE, 10, &[], &[], None), PAGE);
         // Subpages 1 and 4 dirty at ask 20, prev_ask 5 <= taken 10 -> copies 8192 B.
         let bits = (1u16 << 1) | (1u16 << 4);
         let copied = s.copy_stale(
@@ -4697,6 +4816,7 @@ mod find_cache_tests {
             20,
             &[(page, 20)],
             &[(page, 20, 5, bits)],
+            None,
         );
         assert_eq!(copied, 8192);
         // prev_ask 25 > taken 20 -> falls back to full 64 KiB page copy.
@@ -4706,6 +4826,7 @@ mod find_cache_tests {
             30,
             &[(page, 30)],
             &[(page, 30, 25, bits)],
+            None,
         );
         assert_eq!(fallback, PAGE);
         unregister(resource, page_addr as u64);
