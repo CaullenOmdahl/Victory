@@ -88,6 +88,12 @@ fn late() -> bool {
         && *ON.get_or_init(|| std::env::var_os("VICTORY_LATE_SIGNALS").is_some_and(|v| v == "1"))
 }
 
+fn async_wait() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    late()
+        && *ON.get_or_init(|| std::env::var_os("VICTORY_ASYNC_WAIT").is_some_and(|v| v == "1"))
+}
+
 static LATE: Mutex<VecDeque<(u64, Held, u64)>> = Mutex::new(VecDeque::new());
 
 fn signal_late(fence: Held, value: u64) {
@@ -224,6 +230,12 @@ impl Timeline {
                             s.hold(true);
                             return moved;
                         }
+                        if async_wait() {
+                            s.hold(true);
+                            drop(s);
+                            finisher::ask();
+                            return moved;
+                        }
                         Box::new(finish)
                     } else {
                         let op = s.ops.pop_front();
@@ -242,6 +254,12 @@ impl Timeline {
                         // As for a fence above.
                         if !finishing() {
                             s.hold(true);
+                            return moved;
+                        }
+                        if async_wait() {
+                            s.hold(true);
+                            drop(s);
+                            finisher::ask();
                             return moved;
                         }
                         Box::new(finish)
