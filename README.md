@@ -16,7 +16,7 @@ Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on *
 | **In-world rendering** | Lit open world, characters, textures, water, sky, and geometry (constant ambient fallback; no RT) |
 | **Playable** | **Yes** — controller input, walking, and interactions work |
 | **Story progress** | Opening scene only (not progressed further yet) |
-| **World frame rate** | **5.1–5.5 fps** outdoors (`181–194 ms/frame`, ~5,000 draws/frame) · up to **22.9 fps** indoors (`43.6 ms/frame`) · `14.6 fps` cutscene peak |
+| **World frame rate** | **5.5–5.6 fps** outdoors (`178.9–183.4 ms/frame`, `4.75 avg_fps`, ~5,000 draws/frame with Loop 142 `EARLY_DEPTH` + Loop 141 `VICTORY_PORT_PLACED=1` + `VICTORY_COLD_SKIP=1` + `VICTORY_CCD=1`) · up to **22.9 fps** indoors (`43.6 ms/frame`) · `14.6 fps` cutscene peak |
 | **Stability** | **0** `0x887A0005` GPUVM/page faults across test runs (long-duration session not yet formally timed) |
 | **Memory** | `~5.6 GiB` commit (`~10.9 GiB` title private, `~19.9 GiB` mapped) |
 
@@ -57,7 +57,8 @@ Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on *
   - Default-on ReBAR `D3D12_HEAP_TYPE_GPU_UPLOAD` (`VICTORY_GPU_UPLOAD=0` to disable, +45% FPS on RX 6800 16 GiB) and hair simulation (`VICTORY_HAIR=0` to disable).
   - AVX2 copy-back merges & idle `HostList`/chunk trimming (`0e04b91`), `RwLock` on `shadow::BUFFERS` and `shadow::LOOSE` with off-thread `victory-bury` retirement (`7922b08`, `f905d00`), and `victory_shader::SOURCE_HASH` cache keying.
 - **Shader & rendering correctness:**
-  - Console DXGI formats 189, 190, and 191 (`35c0619`), `R9G9B9E5` format family mapping & SDWA 16-bit `UNUSED_SEXT` sign-extension (`dac3e58`).
+  - **Shader & rendering correctness:** Console DXGI formats 189–191 (`35c0619`), `ForceEarlyDepthStencil` (`EARLY_DEPTH`, `avatarmanz #435`) on `DEPTH_BEFORE_SHADER` pixel shaders (prevents glass prepass depth/motion writes over foreground characters; **`5.5–5.6 fps` / `178.9–183.4 ms/frame`** steady state, `4.75 avg_fps`, `frame-4270.png` clean).
+- Console DXGI formats 189, 190, and 191 (`35c0619`), `R9G9B9E5` format family mapping & SDWA 16-bit `UNUSED_SEXT` sign-extension (`dac3e58`).
   - Directed `f16` rounding (`#3159`) & negative-offset `CODE` descriptor reads (`#3155`, `4b8c9d9`).
   - Cube-map subnormal/signed-zero semantics (`#3127`) & near-unity 1-ULP `v_log_f32` (`#2160`, `12efdd0`).
   - 16-bit typed buffer view preservation (`79b950f`, `half_views` unsigned `R16*_UINT` twins + `bufferLoad.i32`/`bufferStore.i32`).
