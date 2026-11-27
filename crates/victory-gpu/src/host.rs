@@ -5041,8 +5041,14 @@ impl Pool {
 fn pool() -> &'static Pool {
     static POOL: OnceLock<Pool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let total = std::thread::available_parallelism()
-            .map_or(6, |n| n.get().saturating_sub(2).clamp(4, 20));
+        let total = std::env::var("VICTORY_POOL_THREADS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|n| n.clamp(1, 24))
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map_or(6, |n| n.get().saturating_sub(2).clamp(4, 20))
+            });
         spawn_pool("victory-pool", total)
     })
 }
