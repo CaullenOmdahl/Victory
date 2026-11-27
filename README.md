@@ -1,55 +1,69 @@
 # VIctory — Linux / Proton Fork (AMD Radeon)
 
-`CaullenOmdahl/Victory` is a source-only compatibility layer fork built on [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD) and [Marvisak/VIctory](https://github.com/Marvisak/VIctory) (with selected fixes from upstream PRs, [DexNom/VIctory](https://github.com/DexNom/VIctory), and [fxceless/victory-fork](https://github.com/fxceless/victory-fork)) to run **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on **Linux under Proton (`vkd3d-proton` + Mesa RADV)**.
+Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on **Linux under Proton (`vkd3d-proton` + Mesa RADV)**, built on [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD) and [Marvisak/VIctory](https://github.com/Marvisak/VIctory). Combines 160+ commits of Wine/Proton compatibility, lock-free host memory paths, and L0 VRAM placement with custom companion Wine and `vkd3d-proton` forks.
 
-**This repository contains no game files, keys, executables, or downloads.** You must supply your own copy of the game. This project is not affiliated with or endorsed by Rockstar Games, Take-Two, or Microsoft.
+> **No game files, keys, executables, or downloads are included.** Supply your own copy of the game. Not affiliated with or endorsed by Rockstar Games, Take-Two, or Microsoft.
 
 ---
 
-## Linux / Proton Status (`CaullenOmdahl/Victory`, 2026-11-27)
+## Status at a Glance (`2026-11-27`)
 
-- **Test machine:** CachyOS Linux (`7.3.4-1-cachyos`), Proton (`proton-patched`, `vkd3d-proton` + Mesa RADV), AMD Radeon RX 6800 16 GB (RDNA2), Ryzen 9 5900X (12C/24T), 62 GiB RAM, Series X profile.
+**Test machine:** CachyOS Linux (`7.3.4-1-cachyos`) · Custom Proton (`vkd3d-proton` + Mesa RADV) · AMD Radeon RX 6800 16 GB (RDNA2) · Ryzen 9 5900X · 62 GiB RAM · Series X profile
 
-| Metric | Status on Linux + Proton (RX 6800) |
-|--------|------------------------------------|
-| **Executable & boot** | Loads and boots (`game_scarlett_master.exe`, Series X 1.0.2.1) |
-| **Main menu** | Works at **22–30 fps** |
-| **In-world rendering** | Renders lit open world, characters, textures, water, sky, and geometry (ray-traced indirect light replaced by constant ambient fallback; in-game phone broken) |
-| **Playable** | **Yes** — controller input, walking around in the world, and interactions work |
-| **Story progress** | **Opening scene only** (have not progressed further yet) |
-| **World frame rate** | **2.1–5.5 fps** outdoors (`181.3–538.1 ms/frame` at `~5,000` draws/frame; **`5.1–5.5 fps` / `181.3–194.4 ms`** with Loop 141 `VICTORY_PORT_PLACED=1` + `VICTORY_COLD_SKIP=1` + `VICTORY_CCD=1`), up to **22.9 fps** (`43.6 ms/frame`) indoors (`14.6 fps` cutscene peak) |
-| **Stability** | **0** `0x887A0005` GPUVM/page faults across repeated in-world test runs; long-duration crash-free stability not yet formally measured |
+| Metric | Current State (Linux + Proton, RX 6800) |
+|--------|-----------------------------------------|
+| **Boot & menus** | Works (**22–30 fps**) |
+| **In-world rendering** | Lit open world, characters, textures, water, sky, and geometry (constant ambient fallback; no RT) |
+| **Playable** | **Yes** — controller input, walking, and interactions work |
+| **Story progress** | Opening scene only (not progressed further yet) |
+| **World frame rate** | **5.1–5.5 fps** outdoors (`181–194 ms/frame`, ~5,000 draws/frame) · up to **22.9 fps** indoors (`43.6 ms/frame`) · `14.6 fps` cutscene peak |
+| **Stability** | **0** `0x887A0005` GPUVM/page faults across test runs (long-duration session not yet formally timed) |
 | **Memory** | `~5.6 GiB` commit (`~10.9 GiB` title private, `~19.9 GiB` mapped) |
 
 ---
 
-## What's Unique to This Fork
+## Full Linux / Proton Runtime Stack
 
-Over 160 commits on top of `Belobug/VIctory-Belobug-AMD` focused on running cleanly and faster under Linux / Proton (`vkd3d-proton` + RADV):
+| Repository | Role | Highlights |
+|------------|------|------------|
+| [`CaullenOmdahl/Victory`](https://github.com/CaullenOmdahl/Victory) | Core compatibility layer & RDNA2→DXIL translator | 160+ commits over `Belobug/VIctory-Belobug-AMD`: Proton/Wine fixes, lock-free host paths, and `VK_LAYER_VICTORY_placed` L0 VRAM placement |
+| [`CaullenOmdahl/victory-cachyos-radv-runtime`](https://github.com/CaullenOmdahl/victory-cachyos-radv-runtime) | Build scripts, patch exports & A/B harness | Automated `ntdll.so` / `vkd3d-proton` builds, minimal patch exports, and serialized `flock` A/B benchmarking |
+| [`CaullenOmdahl/wine-cachyos-victory-radv`](https://github.com/CaullenOmdahl/wine-cachyos-victory-radv) (`victory-radv-rx6800`) | Custom Wine (`cachyos-11.0-20261015-native` base) | 128-way 2 MiB `vm_prot_stripes`, lockless `PAGEMAP_SCAN`, `vm_tree_state` rwlock + AVX2 range queries, native `winevulkan`/`win32u` `VK_EXT_map_memory_placed` |
+| [`CaullenOmdahl/vkd3d-proton-victory-radv`](https://github.com/CaullenOmdahl/vkd3d-proton-victory-radv) (`victory-radv-rx6800`) | Custom `vkd3d-proton` (`3.2.0` base) | `VK_KHR_map_memory2` + `VK_EXT_map_memory_placed` wiring for zero-copy placed heap placement |
 
-### Linux / Proton (`vkd3d-proton` + RADV) Compatibility
-- **Vulkan/D3D12 interop:** Page-aligned `vkMapMemory` view offsets, batched `UpdateTileMappings`, and null-blob `ID3D12PipelineLibrary` support under Proton.
-- **Avoided Wine `USERPTR` slowdown:** Gated `OpenExistingHeapFromAddress1` (`direct()`) behind `VICTORY_IN_PLACE_WINE=1` because Wine `MEM_PRIVATE` round-trips, zeroed `MEM_MAPPED` reads, and host-RAM `USERPTR` slow RX 6800 GPU execution ~20× compared to VRAM copies.
-- **Wine runtime & memory-section stability:** Wine stack unwind guards (`bcd337e`), lazy `ws2_32` export resolution (`#3091`), optional Wine temp-file physical-section backing (`VICTORY_PHYSICAL_BACKING_DIR` / `VICTORY_PHYSICAL_PAGEFILE_FIRST_MB`, `14fdfb8`), `LoaderLock` unwind `Drop` guard (`#3001`), NUL-terminated DualSense HID paths (`#207`), and remap/guard/descriptor fixes that eliminated `0x887A0005` GPUVM faults.
+---
 
-### Measured Performance & Concurrency Wins
-- **Sharded write-watch & 64 KiB page dedup (`07410ac`):** Sharded `watch::JOURNALS` into 64 aligned `RwLock` stripes and deduplicated 4 KiB `GetWriteWatch` pages into 64 KiB pages — reaching **4.52 avg_fps** overall and **22.9 fps / 43.6 ms/frame** indoors with `0` GPUVM/page faults.
-- **`RwLock` physical & view tables (`15c1b16`):** Converted `xmem::PHYSICAL` (with non-blocking `try_read()` fallback in `write_beside`) and `watch::VIEWS` to `RwLock`, cutting peak streaming copy-back lock stalls from **4,378.9 ms to 128.1 ms** (**4.0 fps** steady-state, `28.6 ms` copy-back).
-- **Zero-protect copy-back & GPU texture readback (`518977f`, `ce0e6da`):** Enabled `VICTORY_COPY_BACK_BESIDE` by default (`21.1–37.1 ms/frame` copy-back without `VirtualProtect` cycles) and added opt-in `VICTORY_TEXTURE_BACK=1` (`texback.rs`) for tiling shader-written ocean/displacement UAV textures back to title memory cleanly.
-- **Placed RADV L0 VRAM & low-contention host paths (`0e04b91`, `7922b08`, `f905d00`, `ada5c7a`, `622e793`, `39c7ad6`, `129f8c4`, `c65cda7`, `3961805`):**
-  - `VICTORY_PORT_PLACED=1` + `ENABLE_VICTORY_PLACED=1` (`tools/vk-layer-placed/` + `port_placed.rs`, `avatarmanz #420`): backs 32-bit `XMem` reservations directly in RADV L0 VRAM via `VK_KHR_map_memory2` + `VK_EXT_map_memory_placed` + `ID3D12DXVKInteropDevice3::GetVulkanHeapInfo`, eliminating host refresh copies for placed heaps (`refreshes` cut `82.9 -> 39.5 GB/f`, reaching **4.01 avg_fps** / **`5.1–5.5 fps` / `181.3–194.4 ms/frame`** steady state with `0` faults).
-  - AVX2 32-byte copy-back merges in `shadow.rs` and idle readback-chunk / `HostList` trimming (`0e04b91`).
-  - `RwLock` on `shadow::BUFFERS` and `shadow::LOOSE` with off-thread `victory-bury` retirement (`7922b08`, `f905d00`).
-  - `VICTORY_COLD_SKIP=1` cold 2 MiB chunk refresh skip (`ada5c7a`), `VICTORY_CCD=1` Ryzen CCD worker pinning & same-page remap skip (`622e793`), AVX2 texture hashing & `VICTORY_CARD_FETCH_INFLIGHT=1` (`39c7ad6`), plus opt-in `VICTORY_HEAP_WORKER=1` (`129f8c4`), `VICTORY_PORT_CBV=1` (`c65cda7`), and `VICTORY_PORT_GUARD=1` (`3961805`).
-- **Offline shader & pipeline warming:** `victory_shader::SOURCE_HASH` build-time cache keying plus offline 24-thread DXIL translation (`victory translate --cache`) and Proton headless pipeline warming (`victory warm --used`), keeping `25,694` DXIL shaders cached (`0` shader misses in steady-state runs).
-- **Default-on ReBAR & hair simulation:** `D3D12_HEAP_TYPE_GPU_UPLOAD` (`VICTORY_GPU_UPLOAD=0` to disable, +45% FPS on RX 6800 16 GiB) and hair strands (`VICTORY_HAIR=0` to disable).
+## Measured Performance & Engineering Highlights
 
-### Shader & Rendering Correctness
-- Console DXGI formats 189, 190, and 191 (`35c0619`), `R9G9B9E5` format family mapping & SDWA 16-bit `UNUSED_SEXT` sign-extension (`dac3e58`).
-- Directed `f16` rounding (`#3159`) & negative-offset `CODE` descriptor reads (`#3155`, `4b8c9d9`).
-- Cube-map subnormal/signed-zero semantics (`#3127`) & near-unity 1-ULP `v_log_f32` (`#2160`, `12efdd0`).
-- 16-bit typed buffer view preservation (`79b950f`, `half_views` unsigned `R16*_UINT` twins + `bufferLoad.i32`/`bufferStore.i32`).
-- Ported upstream RDNA2-to-DXIL wave, `f16`/`f64`, LDS atomic, BC7, and mesh/pixel linking fixes.
+| Area | Change | Measured Result | Ref |
+|------|--------|-----------------|-----|
+| **Placed L0 VRAM** | `VK_LAYER_VICTORY_placed` + `VICTORY_PORT_PLACED=1` | Host refreshes `82.9 → 39.5 GB/f`; **5.1–5.5 fps** (`181–194 ms/f`) outdoors, `0` faults | [`8755d8c`](https://github.com/CaullenOmdahl/Victory/commit/8755d8c) |
+| **Custom Proton Runtime** | 128-way `vm_prot_stripes`, lockless `PAGEMAP_SCAN`, native `VK_EXT_map_memory_placed` | `prot lock` `59–69 → 8.8–10.9 ms` (>6×); **4.6–5.0 → 4.9–5.3 fps** A/B uplift (`prep -12%`, `copies -33%`, `watches -38%`) | [`victory-cachyos-radv-runtime`](https://github.com/CaullenOmdahl/victory-cachyos-radv-runtime) |
+| **Copy-Back Lock Stalls** | `RwLock` on `xmem::PHYSICAL` + `watch::VIEWS` | Peak streaming copy-back stall **4,378.9 → 128.1 ms** | [`15c1b16`](https://github.com/CaullenOmdahl/Victory/commit/15c1b16) |
+| **Write-Watch Sharding** | 64-way `watch::JOURNALS` + 4 KiB→64 KiB dedup | Up to **22.9 fps** (`43.6 ms/f`) indoors, `0` faults | [`07410ac`](https://github.com/CaullenOmdahl/Victory/commit/07410ac) |
+| **Shader & Copy-Back Pipeline** | Default-on `VICTORY_COPY_BACK_BESIDE` + offline 24T DXIL / `victory warm --used` | `21–37 ms/f` copy-back without `VirtualProtect`; `25,694` DXIL cached (`0` misses) | [`518977f`](https://github.com/CaullenOmdahl/Victory/commit/518977f), [`ce0e6da`](https://github.com/CaullenOmdahl/Victory/commit/ce0e6da) |
+
+<details>
+<summary>Technical details & tuning flags</summary>
+
+- **Linux / Proton (`vkd3d-proton` + RADV) compatibility:**
+  - Page-aligned `vkMapMemory` view offsets, batched `UpdateTileMappings`, and null-blob `ID3D12PipelineLibrary` support under Proton.
+  - Gated `OpenExistingHeapFromAddress1` (`direct()`) behind `VICTORY_IN_PLACE_WINE=1` (Wine `MEM_PRIVATE` round-trips, zeroed `MEM_MAPPED` reads, and host-RAM `USERPTR` slow RX 6800 GPU execution ~20× vs VRAM copies).
+  - Wine stack unwind guards (`bcd337e`), lazy `ws2_32` export resolution (`#3091`), optional Wine temp-file physical-section backing (`VICTORY_PHYSICAL_BACKING_DIR` / `VICTORY_PHYSICAL_PAGEFILE_FIRST_MB`, `14fdfb8`), `LoaderLock` unwind `Drop` guard (`#3001`), NUL-terminated DualSense HID paths (`#207`), and remap/guard/descriptor fixes eliminating `0x887A0005` GPUVM faults.
+- **Tuning & performance flags:**
+  - `VICTORY_PORT_PLACED=1` + `ENABLE_VICTORY_PLACED=1` (`tools/vk-layer-placed/` + `port_placed.rs`): backs 32-bit `XMem` reservations directly in RADV L0 VRAM (`8755d8c`).
+  - `VICTORY_COPY_BACK_BESIDE` (default-on, `0` to disable) & `VICTORY_TEXTURE_BACK=1` (`texback.rs`, shader-written ocean/displacement UAV texture readback).
+  - `VICTORY_COLD_SKIP=1` (`ada5c7a`), `VICTORY_CCD=1` (`622e793`), `VICTORY_CARD_FETCH_INFLIGHT=1` (`39c7ad6`), `VICTORY_HEAP_WORKER=1` (`129f8c4`), `VICTORY_PORT_CBV=1` (`c65cda7`), `VICTORY_PORT_GUARD=1` (`3961805`).
+  - Default-on ReBAR `D3D12_HEAP_TYPE_GPU_UPLOAD` (`VICTORY_GPU_UPLOAD=0` to disable, +45% FPS on RX 6800 16 GiB) and hair simulation (`VICTORY_HAIR=0` to disable).
+  - AVX2 copy-back merges & idle `HostList`/chunk trimming (`0e04b91`), `RwLock` on `shadow::BUFFERS` and `shadow::LOOSE` with off-thread `victory-bury` retirement (`7922b08`, `f905d00`), and `victory_shader::SOURCE_HASH` cache keying.
+- **Shader & rendering correctness:**
+  - Console DXGI formats 189, 190, and 191 (`35c0619`), `R9G9B9E5` format family mapping & SDWA 16-bit `UNUSED_SEXT` sign-extension (`dac3e58`).
+  - Directed `f16` rounding (`#3159`) & negative-offset `CODE` descriptor reads (`#3155`, `4b8c9d9`).
+  - Cube-map subnormal/signed-zero semantics (`#3127`) & near-unity 1-ULP `v_log_f32` (`#2160`, `12efdd0`).
+  - 16-bit typed buffer view preservation (`79b950f`, `half_views` unsigned `R16*_UINT` twins + `bufferLoad.i32`/`bufferStore.i32`).
+  - Selected RDNA2-to-DXIL wave, `f16`/`f64`, LDS atomic, BC7, and mesh/pixel linking fixes ported from upstream PRs, `DexNom/VIctory`, and `fxceless/victory-fork`.
+
+</details>
 
 ---
 
@@ -63,9 +77,9 @@ Over 160 commits on top of `Belobug/VIctory-Belobug-AMD` focused on running clea
 
 ---
 
-## Building & Running on Linux (`cargo-xwin` + Proton)
+## Quick Start (Linux + Proton)
 
-Requirements: Linux x86_64, Rust toolchain (`rust-toolchain.toml`), `cargo-xwin`, a Vulkan 1.3+ GPU with shader model 6.6 + mesh shaders (tested on Mesa RADV), and Proton (`vkd3d-proton`).
+**Requirements:** Linux x86_64, Rust toolchain (`rust-toolchain.toml`), `cargo-xwin`, a Vulkan 1.3+ GPU with Shader Model 6.6 + mesh shaders (tested on Mesa RADV), and Proton (`vkd3d-proton`).
 
 ```bash
 # 1. Install asset-policy commit hook and run host unit tests (no game files needed)
@@ -78,18 +92,17 @@ cargo xwin build --release --target x86_64-pc-windows-msvc -p victory
 cargo xwin build --profile diag --target x86_64-pc-windows-msvc -p victory --features diagnostics
 ```
 
-Copy `victory.example.toml` to `victory.toml` (git-ignored) to configure local paths outside the repo, then launch through Proton (`proton runinprefix`) with:
+Copy `victory.example.toml` to `victory.toml` (git-ignored) to configure paths outside the repository. For best performance, build the custom Wine + `vkd3d-proton` runtime from [`victory-cachyos-radv-runtime`](https://github.com/CaullenOmdahl/victory-cachyos-radv-runtime) and launch via Proton (`proton runinprefix`) with:
 - `WINEDLLOVERRIDES="d3d12,d3d12core,dxgi,d3dcompiler_47=n"`
-- `VKD3D_SHADER_CACHE_PATH` pointing outside the repository so `vkd3d-proton.cache.write` stays out of the working tree.
+- `VKD3D_SHADER_CACHE_PATH` pointing outside the repository so `vkd3d-proton.cache.write` stays out of the working tree
 
-Example execution:
 ```bash
 victory.exe run <path/to/game_scarlett_master.exe> --execute --console series-x
 ```
 
-Input supports XInput controllers, DualSense / DualSense Edge over USB or Bluetooth HID, and keyboard fallback (`WASD`/`IJKL` sticks, arrows D-pad, `Enter`/`O` A/B, `Backspace`/`X`/`Y` face buttons, `Q`/`E`/`Z`/`C` shoulders/triggers, `Esc`/`Tab` Menu/View).
+**Input:** Supports XInput controllers, DualSense / DualSense Edge (USB or Bluetooth HID), and keyboard fallback (`WASD`/`IJKL` sticks, arrows D-pad, `Enter`/`O` A/B, `Backspace`/`X`/`Y` face buttons, `Q`/`E`/`Z`/`C` shoulders/triggers, `Esc`/`Tab` Menu/View).
 
-For full CLI commands (`inspect`, `census`, `translate`, `warm`, `config`) and diagnostics environment variables, see [docs/architecture.md](docs/architecture.md) and upstream [Marvisak/VIctory](https://github.com/Marvisak/VIctory#readme).
+For full CLI commands (`inspect`, `census`, `translate`, `warm`, `config`) and diagnostics switches, see [docs/architecture.md](docs/architecture.md) and upstream [Marvisak/VIctory](https://github.com/Marvisak/VIctory#readme).
 
 ---
 
