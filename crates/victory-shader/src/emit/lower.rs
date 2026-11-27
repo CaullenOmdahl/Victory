@@ -4287,7 +4287,16 @@ impl<'a> Lower<'a> {
         let az = self.s.m.cmp(c, pred::OEQ, a, zero);
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
-        let product_zero = self.s.m.bin(c, Bin::Add, zero, addend);
+        // DXIL fadd can give -0 for +0 + -0. Select the +0 bits explicitly
+        // for the legacy rule, while keeping the add's NaN behavior.
+        let acc_bits = self.as_int(addend);
+        let neg_zero = self.s.m.i32(0x8000_0000);
+        let acc_neg_zero = self.s.m.cmp(c, pred::EQ, acc_bits, neg_zero);
+        let sum = self.s.m.bin(c, Bin::Add, zero, addend);
+        let sum_bits = self.as_int(sum);
+        let zero_bits = self.s.m.i32(0);
+        let sum_bits = self.s.m.select(c, acc_neg_zero, zero_bits, sum_bits);
+        let product_zero = self.as_float(sum_bits);
         // shortcut: FMad lets the driver fuse, as for `v_fma_f32`.
         let fused = self.fmad(a, b, addend);
         self.s.m.select(c, z, product_zero, fused)
@@ -7674,16 +7683,20 @@ impl<'a> Lower<'a> {
         let c = self.cur;
         let mut halves = Vec::new();
         for x in channels {
-            halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
-                let m = self.s.m.i32(0xFFFF);
-                self.s.m.bin(c, Bin::And, x, m)
-            } else if matches!(numeric, Numeric::Float) {
-                let f = self.as_float(x);
-                self.f16_toward_zero(f)
-            } else {
-                let (f, i32t) = (self.as_float(x), self.s.t.i32);
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+            halves.push(match numeric {
+                Numeric::Uint | Numeric::Sint => {
+                    let m = self.s.m.i32(0xFFFF);
+                    self.s.m.bin(c, Bin::And, x, m)
+                }
+                Numeric::Float => {
+                    let f = self.as_float(x);
+                    self.f16_toward_zero(f)
+                }
+                Numeric::Uscaled | Numeric::Sscaled | Numeric::Unorm | Numeric::Snorm => {
+                    // D16 rounds these formats to nearest even, independently of VALU MODE.
+                    let f = self.as_float(x);
+                    self.narrow16_in_mode(f, 0)
+                }
             });
         }
         let mut out = Vec::new();
