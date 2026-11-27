@@ -16,7 +16,7 @@ Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on *
 | **In-world rendering** | Lit open world, characters, textures, water, sky, and geometry (constant ambient fallback; no RT) |
 | **Playable** | **Yes** — controller input, walking, and interactions work |
 | **Story progress** | Opening scene only (not progressed further yet) |
-| **World frame rate** | **6.4 fps** outdoors (`155.1 ms/frame` steady state, ~5,077 draws/frame with Loop 143 `VICTORY_WC_NO_BACK=1` + `EARLY_DEPTH` + `VICTORY_PORT_PLACED=1` + `VICTORY_COLD_SKIP=1` + `VICTORY_CCD=1`) · up to **22.9 fps** indoors (`43.6 ms/frame`) · `14.6 fps` cutscene peak |
+| **World frame rate** | **7.0–7.2 fps** outdoors (`139.6–142.9 ms/frame` steady state, ~5,010 draws/frame with Loop 144 `VICTORY_INDIRECT_REST=0` + Loop 143 `VICTORY_WC_NO_BACK=1` + `EARLY_DEPTH` + `VICTORY_PORT_PLACED=1` + `VICTORY_COLD_SKIP=1` + `VICTORY_CCD=1`) · up to **22.9 fps** indoors (`43.6 ms/frame`) · `14.6 fps` cutscene peak |
 | **Stability** | **0** `0x887A0005` GPUVM/page faults across test runs (long-duration session not yet formally timed) |
 | **Memory** | `~5.6 GiB` commit (`~10.9 GiB` title private, `~19.9 GiB` mapped) |
 
@@ -37,7 +37,7 @@ Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on *
 
 | Area | Change | Measured Result | Ref |
 |------|--------|-----------------|-----|
-| **WC Copy-Back Bypass** | `VICTORY_WC_NO_BACK=1` (`Belobug #477`, including sparse shadows) | Copy-back **23.5 → 2.0 ms/f** (`39.2 → 0.5 MB/f`); **6.4 fps** (`155.1 ms/f`) outdoors, `0` faults | `wc.rs` / `shadow.rs` |
+| **WC Copy-Back Bypass** | `VICTORY_WC_NO_BACK=1` (`Belobug #477`, including sparse shadows) | Copy-back **23.5 → 1.7 ms/f** (`39.2 → 0.5 MB/f`); **7.0–7.2 fps** (`139.6–142.9 ms/f`) outdoors with `VICTORY_INDIRECT_REST=0`, `0` faults | [`271eea4`](https://github.com/CaullenOmdahl/Victory/commit/271eea4) |
 | **Placed L0 VRAM** | `VK_LAYER_VICTORY_placed` + `VICTORY_PORT_PLACED=1` | Host refreshes `82.9 → 39.5 GB/f`; **5.1–5.5 fps** (`181–194 ms/f`) outdoors, `0` faults | [`8755d8c`](https://github.com/CaullenOmdahl/Victory/commit/8755d8c) |
 | **Custom Proton Runtime** | 128-way `vm_prot_stripes`, lockless `PAGEMAP_SCAN`, native `VK_EXT_map_memory_placed` | `prot lock` `59–69 → 8.8–10.9 ms` (>6×); **4.6–5.0 → 4.9–5.3 fps** A/B uplift (`prep -12%`, `copies -33%`, `watches -38%`) | [`victory-cachyos-radv-runtime`](https://github.com/CaullenOmdahl/victory-cachyos-radv-runtime) |
 | **Copy-Back Lock Stalls** | `RwLock` on `xmem::PHYSICAL` + `watch::VIEWS` | Peak streaming copy-back stall **4,378.9 → 128.1 ms** | [`15c1b16`](https://github.com/CaullenOmdahl/Victory/commit/15c1b16) |
@@ -53,7 +53,8 @@ Compatibility layer running **Grand Theft Auto VI (Xbox Series X 1.0.2.1)** on *
   - Wine stack unwind guards (`bcd337e`), lazy `ws2_32` export resolution (`#3091`), optional Wine temp-file physical-section backing (`VICTORY_PHYSICAL_BACKING_DIR` / `VICTORY_PHYSICAL_PAGEFILE_FIRST_MB`, `14fdfb8`), `LoaderLock` unwind `Drop` guard (`#3001`), NUL-terminated DualSense HID paths (`#207`), and remap/guard/descriptor fixes eliminating `0x887A0005` GPUVM faults.
 - **Tuning & performance flags:**
   - `VICTORY_PORT_PLACED=1` + `ENABLE_VICTORY_PLACED=1` (`tools/vk-layer-placed/` + `port_placed.rs`): backs 32-bit `XMem` reservations directly in RADV L0 VRAM (`8755d8c`).
-  - `VICTORY_WC_NO_BACK=1` (`wc.rs`, `VICTORY_WC_NO_BACK_MIN_KB=64` default): leaves `>= 64 KiB` write-combined GPU writes on card/sparse shadows without snapshots or copy-back (`copy-back` `23.5 -> 2.0 ms/f`, `0.5 MB/f`, **`6.4 fps` / `155.1 ms/f`**).
+  - `VICTORY_WC_NO_BACK=1` (`wc.rs`, `VICTORY_WC_NO_BACK_MIN_KB=64` default): leaves `>= 64 KiB` write-combined GPU writes on card/sparse shadows without snapshots or copy-back (`copy-back` `23.5 -> 1.7 ms/f`, `0.5 MB/f`, **`7.0–7.2 fps` / `139.6–142.9 ms/f`**).
+  - `VICTORY_INDIRECT_REST=0` (`indirect.rs`, `fork-cgbj 449830f`): prevents an oversized indirect record from exhausting the rest of a command list's indirect budget so trailing draws keep executing.
   - `VICTORY_COPY_BACK_BESIDE` (default-on, `0` to disable) & `VICTORY_TEXTURE_BACK=1` (`texback.rs`, shader-written ocean/displacement UAV texture readback).
   - `VICTORY_COLD_SKIP=1` (`ada5c7a`), `VICTORY_CCD=1` (`622e793`), `VICTORY_CARD_FETCH_INFLIGHT=1` (`39c7ad6`), `VICTORY_HEAP_WORKER=1` (`129f8c4`), `VICTORY_PORT_CBV=1` (`c65cda7`), `VICTORY_PORT_GUARD=1` (`3961805`).
   - Default-on ReBAR `D3D12_HEAP_TYPE_GPU_UPLOAD` (`VICTORY_GPU_UPLOAD=0` to disable, +45% FPS on RX 6800 16 GiB) and hair simulation (`VICTORY_HAIR=0` to disable).

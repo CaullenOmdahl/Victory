@@ -125,7 +125,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             for (uint j = 0; j < n; j++) {
                 uint c = costs[j];
                 if (c > 0 && next < BUDGET) {
-                    next = (BUDGET - next <= c) ? BUDGET : (next + c);
+                    next = (BUDGET - next < c) ? (REST ? BUDGET : next) : (next + c);
                 }
             }
             if (next == before) { settled = true; break; }
@@ -140,7 +140,7 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
             uint fit = 1;
             if (c > 0) {
                 fit = (settled && at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
-                at = (at >= BUDGET || BUDGET - at <= c) ? BUDGET : (at + c);
+                at = (at >= BUDGET || BUDGET - at < c) ? (REST ? BUDGET : at) : (at + c);
             }
             fits[k] = fit;
         }
@@ -196,14 +196,22 @@ fn make() -> windows::core::Result<Clamp> {
     make_for(device)
 }
 
+fn rest() -> u32 {
+    u32::from(std::env::var("VICTORY_INDIRECT_REST").map_or(true, |v| v != "0"))
+}
+
 fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
+    make_from(device, &format!("#define REST {}\n{SOURCE}", rest()))
+}
+
+fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
     let compiled = unsafe {
         D3DCompile(
-            SOURCE.as_ptr().cast(),
-            SOURCE.len(),
+            source.as_ptr().cast(),
+            source.len(),
             s!("clamp"),
             None,
             None,
@@ -1598,5 +1606,84 @@ void main() {
         assert_eq!(&out[4..6], &[0, 0]);
         assert_eq!(&out[8..12], &[1024, 3, 2, 4]);
         assert_eq!(&out[12..14], &[0, 0]);
+    }
+
+    #[test]
+    fn warp_indirect_rest_zero_preserves_remaining_budget_for_later_records() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        const KIND_DRAW: u32 = 0;
+        const STRIDE: u32 = 16;
+        const RECORDS: u32 = 4;
+        const BUDGET_CAP: u32 = 1 << 27;
+        let run = |warp: &mut WarpHarness, rest: u32| -> (u32, Vec<u32>) {
+            let clamp =
+                make_from(&warp.device, &format!("#define REST {rest}\n{SOURCE}")).expect("clamp");
+            let total = (STRIDE * RECORDS) as usize;
+            let (src_buf, src_ptr, _) = warp.shared_buffer(total as u64);
+            let (_budget_buf, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+            let (readback_buf, readback_ptr, _) = warp.shared_buffer(total as u64);
+            let dst_buf = warp.default_uav(total as u64);
+            let inputs: [[u32; 4]; 4] = [
+                [100, 1, 7, 9],
+                [250, 1, 7, 9],
+                [50, 1, 7, 9],
+                [100, 1, 7, 9],
+            ];
+            // SAFETY: mapped buffers sized for 4 * 16 bytes + 256-byte budget.
+            unsafe {
+                for (i, w) in inputs.iter().enumerate() {
+                    for (k, val) in w.iter().enumerate() {
+                        (src_ptr as *mut u32).add(i * 4 + k).write(*val);
+                    }
+                }
+                (budget_ptr as *mut u32).write_volatile(BUDGET_CAP - 300);
+                std::ptr::write_bytes(readback_ptr, 0, total);
+            }
+            assert!(record_clamp(
+                &clamp,
+                &warp.list,
+                &dst_buf,
+                budget_gpu,
+                (&src_buf, 0),
+                None,
+                (KIND_DRAW, STRIDE, RECORDS),
+            ));
+            done_on(&warp.list, &dst_buf);
+            // SAFETY: open command list.
+            unsafe {
+                warp.list.ResourceBarrier(&[transition(
+                    &dst_buf,
+                    D3D12_RESOURCE_STATE_COMMON,
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                warp.list
+                    .CopyBufferRegion(&readback_buf, 0, &dst_buf, 0, total as u64);
+            }
+            warp.submit_and_wait();
+            // SAFETY: GPU finished.
+            unsafe {
+                (
+                    (budget_ptr as *const u32).read_volatile(),
+                    std::slice::from_raw_parts(readback_ptr.cast::<u32>().cast_const(), 16)
+                        .to_vec(),
+                )
+            }
+        };
+
+        let (spent_one, out_one) = run(&mut warp, 1);
+        assert_eq!(spent_one, BUDGET_CAP);
+        assert_eq!(&out_one[0..4], &[100, 1, 7, 9]);
+        for i in 1..4 {
+            assert_eq!(&out_one[i * 4..i * 4 + 4], &[0, 0, 7, 9]);
+        }
+
+        let (spent_zero, out_zero) = run(&mut warp, 0);
+        assert_eq!(spent_zero, BUDGET_CAP - 50);
+        assert_eq!(&out_zero[0..4], &[100, 1, 7, 9]);
+        assert_eq!(&out_zero[4..8], &[0, 0, 7, 9]);
+        assert_eq!(&out_zero[8..12], &[50, 1, 7, 9]);
+        assert_eq!(&out_zero[12..16], &[100, 1, 7, 9]);
     }
 }
