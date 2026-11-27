@@ -1800,6 +1800,36 @@ impl Host {
     }
 
     /// Waits for any in-flight async submission while `self.submitted` is already held.
+    fn in_flight_len(&self) -> usize {
+        self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    fn wait_oldest_in_flight_locked(&self, submitted: &mut u64) {
+        let fence = {
+            self.in_flight
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .front()
+                .map(|f| f.fence)
+        };
+        let Some(fence) = fence else {
+            return;
+        };
+        // SAFETY: the fence and event are ours.
+        let done = unsafe { self.fence.GetCompletedValue() };
+        if done < fence {
+            let waiting = std::time::Instant::now();
+            unsafe {
+                if self.fence.SetEventOnCompletion(fence, self.event).is_ok() {
+                    WaitForSingleObject(self.event, INFINITE);
+                }
+            }
+            let gpu = waiting.elapsed();
+            SUBMISSION_US[1].fetch_add(gpu.as_micros() as u64, Ordering::Relaxed);
+        }
+        self.reap_completed(submitted);
+    }
+
     fn drain_in_flight_locked(&self, submitted: &mut u64) {
         let target = self
             .in_flight
@@ -1950,12 +1980,23 @@ impl Host {
         // buffers in `prepare`. During the gap between submissions, the GPU
         // ran in parallel with the title's CPU command-list recording, and
         // runs on while this submission's buffer copies are refreshed.
-        let ahead = if keep.is_some() && self.in_flight_running() {
+        let max_flights = multi_flight();
+        let allow_multi = max_flights > 1
+            && keep.is_some()
+            && self.card.get().and_then(|o| o.as_ref()).is_none();
+        let ahead = if keep.is_some() && !allow_multi && self.in_flight_running() {
             self.prewarm(runs)
         } else {
             Vec::new()
         };
-        self.drain_in_flight_locked(&mut submitted);
+        if allow_multi {
+            self.reap_completed(&mut submitted);
+            while self.in_flight_len() >= max_flights {
+                self.wait_oldest_in_flight_locked(&mut submitted);
+            }
+        } else {
+            self.drain_in_flight_locked(&mut submitted);
+        }
         for (heap, _) in &ahead {
             EARLY_SLOTS.fetch_add(heap.flush_staged() as u64, Ordering::Relaxed);
         }
@@ -4391,6 +4432,17 @@ unsafe impl Sync for Prelude {}
 
 const PARALLEL_PRELUDE_BARRIERS: usize = 2048;
 
+fn multi_flight() -> usize {
+    static MAX: OnceLock<usize> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("VICTORY_MULTI_FLIGHT")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 8)
+    })
+}
+
 fn parallel_preludes(runs: &[&HostList]) -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     let on =
@@ -4779,24 +4831,44 @@ impl Early {
         unsafe impl Send for List {}
         // SAFETY: as above.
         unsafe impl Sync for List {}
-        static LIST: OnceLock<Option<List>> = OnceLock::new();
-        // SAFETY: the list is not executing (every submission is waited
-        // for); the textures and staging buffers are live.
+        const RING: usize = 8;
+        static LISTS: OnceLock<Vec<List>> = OnceLock::new();
+        static CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        // SAFETY: `multi_flight()` is capped at `RING`, so the slot selected
+        // here has already completed on the GPU; textures and staging buffers
+        // are kept live in `InFlight::_early_copies`.
         unsafe {
-            let List(allocator, list) = LIST
-                .get_or_init(|| {
-                    let allocator: ID3D12CommandAllocator = host
+            let ring = LISTS.get_or_init(|| {
+                let mut v = Vec::with_capacity(RING);
+                for _ in 0..RING {
+                    let Ok(allocator) = host
                         .device
-                        .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
-                        .ok()?;
-                    let list: ID3D12GraphicsCommandList = host
-                        .device
-                        .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
-                        .ok()?;
-                    list.Close().ok()?;
-                    Some(List(allocator, list))
-                })
-                .as_ref()?;
+                        .CreateCommandAllocator::<ID3D12CommandAllocator>(
+                            D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        )
+                    else {
+                        break;
+                    };
+                    let Ok(list) = host.device.CreateCommandList::<_, _, ID3D12GraphicsCommandList>(
+                        0,
+                        D3D12_COMMAND_LIST_TYPE_DIRECT,
+                        &allocator,
+                        None,
+                    ) else {
+                        break;
+                    };
+                    if list.Close().is_err() {
+                        break;
+                    }
+                    v.push(List(allocator, list));
+                }
+                v
+            });
+            if ring.is_empty() {
+                return None;
+            }
+            let idx = CURSOR.fetch_add(1, Ordering::Relaxed) % ring.len();
+            let List(allocator, list) = &ring[idx];
             let recorded = allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
                 if !self.before.is_empty() {
