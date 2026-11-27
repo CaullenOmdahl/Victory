@@ -145,6 +145,29 @@ fn validate_plan<'a>(
     })
 }
 
+/// Checks the same subresource and buffer bounds as [`detile`] without reading
+/// or writing either buffer.
+pub(crate) fn check_detile(
+    layout: &Layout,
+    tiled_len: usize,
+    mip: u32,
+    slice: u32,
+    linear_len: usize,
+    row_pitch: usize,
+    depth_pitch: usize,
+) -> Result<(), Error> {
+    validate_plan(
+        layout,
+        tiled_len,
+        mip,
+        slice,
+        linear_len,
+        row_pitch,
+        depth_pitch,
+    )
+    .map(|_| ())
+}
+
 /// Detiles one subresource from `tiled` into `linear`.
 pub(crate) fn detile(
     layout: &Layout,

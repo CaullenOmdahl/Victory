@@ -535,9 +535,14 @@ impl Staging {
                     return (0, false);
                 }
                 if last.asked == 0 {
+                    if !with_tiled_copy(self.memory, size, |tiled| self.detile(tiled)) {
+                        last.asked = 0;
+                        last.hash = None;
+                        last.gen_digest = None;
+                        return (size, false);
+                    }
                     last.asked = now;
                     last.dirty.clear();
-                    with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
                     #[cfg(feature = "diagnostics")]
                     crate::copystat::add(crate::copystat::C::TexWatched, size as u64);
                     return (size, true);
@@ -567,22 +572,34 @@ impl Staging {
                         }
                     }
                 }
-                last.asked = now;
                 if subs.is_empty() {
+                    last.asked = now;
                     return (0, false);
                 }
-                let read = if full_read {
-                    last.dirty.clear();
-                    with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
-                    size
+                let (read, ok) = if full_read {
+                    let ok = with_tiled_copy(self.memory, size, |tiled| self.detile(tiled));
+                    if ok {
+                        last.dirty.clear();
+                    }
+                    (size, ok)
                 } else {
                     let spans = merge_ranges(read_spans);
+                    let mut ok = false;
                     let bytes = with_tiled_spans(self.memory, size, &spans, |tiled| {
-                        self.detile_sub(tiled, &subs);
+                        ok = self.detile_sub(tiled, &subs);
                     });
-                    last.dirty = subs;
-                    bytes
+                    if ok {
+                        last.dirty = subs;
+                    }
+                    (bytes, ok)
                 };
+                if !ok {
+                    last.asked = 0;
+                    last.hash = None;
+                    last.gen_digest = None;
+                    return (read, false);
+                }
+                last.asked = now;
                 #[cfg(feature = "diagnostics")]
                 crate::copystat::add(crate::copystat::C::TexWatched, read as u64);
                 return (read, true);
@@ -666,6 +683,25 @@ impl Staging {
                 "VICTORY_TEXTURE_HASH_ORACLE: texture bytes changed without a generation bump"
             );
         }
+        let staging_len = self.size as usize;
+        if let Some(cached) = last.cache_lookup(&hash).filter(|b| b.len() == staging_len) {
+            // SAFETY: `self.data` covers `staging_len` writable staging bytes under `last`'s lock.
+            unsafe { std::ptr::copy_nonoverlapping(cached.as_ptr(), self.data, staging_len) };
+            #[cfg(feature = "diagnostics")]
+            DETILE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            if !self.detile(tiled) {
+                last.hash = None;
+                last.asked = 0;
+                last.gen_digest = None;
+                return (size, false);
+            }
+            if last.changes.saturating_add(1) >= 2 && staging_len <= DETILE_CACHE_MAX_TEX {
+                // SAFETY: `self.data` holds `staging_len` initialized bytes produced by `self.detile`.
+                let detiled = unsafe { std::slice::from_raw_parts(self.data, staging_len) };
+                last.cache_store(hash, detiled);
+            }
+        }
         #[cfg(feature = "diagnostics")]
         flips::note(self, &hash, tiled, told, last.hash.is_some());
         if last.hash.replace(hash).is_some() {
@@ -675,20 +711,6 @@ impl Staging {
         last.gen_digest = new_digest;
         last.dirty.clear();
         last.changes = last.changes.saturating_add(1);
-        let staging_len = self.size as usize;
-        if let Some(cached) = last.cache_lookup(&hash).filter(|b| b.len() == staging_len) {
-            // SAFETY: `self.data` covers `staging_len` writable staging bytes under `last`'s lock.
-            unsafe { std::ptr::copy_nonoverlapping(cached.as_ptr(), self.data, staging_len) };
-            #[cfg(feature = "diagnostics")]
-            DETILE_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.detile(tiled);
-            if last.changes >= 2 && staging_len <= DETILE_CACHE_MAX_TEX {
-                // SAFETY: `self.data` holds `staging_len` initialized bytes produced by `self.detile`.
-                let detiled = unsafe { std::slice::from_raw_parts(self.data, staging_len) };
-                last.cache_store(hash, detiled);
-            }
-        }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::TexChanged, size as u64);
         (size, true)
@@ -773,15 +795,19 @@ impl Staging {
     }
 
     /// Detiles `tiled` (the texture's memory) into the staging buffer.
-    fn detile(&self, tiled: &[u8]) {
+    /// Returns `true` only when every subresource succeeded; otherwise the
+    /// digest/asked state must not be committed (`avatarmanz #419`).
+    fn detile(&self, tiled: &[u8]) -> bool {
         let all: Vec<_> = (0..self.footprints.len() as u32)
             .map(|i| (i, None))
             .collect();
-        self.detile_sub(tiled, &all);
+        self.detile_sub(tiled, &all)
     }
 
-    /// Detiles only the specified `(subresource, optional_rows)` entries.
-    fn detile_sub(&self, tiled: &[u8], subs: &[(u32, Option<std::ops::Range<u32>>)]) {
+    /// Detiles only the specified `(subresource, optional_rows)` entries,
+    /// preflighting every subresource first so a failing mip leaves staging
+    /// and cached digests untouched.
+    fn detile_sub(&self, tiled: &[u8], subs: &[(u32, Option<std::ops::Range<u32>>)]) -> bool {
         #[cfg(feature = "diagnostics")]
         if tracing::enabled!(tracing::Level::DEBUG) {
             if tiled.iter().all(|&b| b == 0) {
@@ -790,6 +816,21 @@ impl Staging {
                     desc = ?self.layout.desc,
                     "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
                 );
+            }
+        }
+        for (idx, _) in subs {
+            let i = *idx as usize;
+            let (footprint, rows) = (&self.footprints[i], self.rows[i]);
+            let (mip, slice) = (*idx % self.mips + self.skip, *idx / self.mips);
+            let f = footprint.Footprint;
+            let pitch = f.RowPitch as usize;
+            let len = pitch * rows as usize * f.Depth as usize;
+            if let Err(e) = self
+                .layout
+                .check_detile(tiled.len(), mip, slice, len, pitch, pitch * rows as usize)
+            {
+                tracing::warn!(?e, mip, slice, "texture not detiled");
+                return false;
             }
         }
         for (idx, rows_range) in subs {
@@ -824,9 +865,10 @@ impl Staging {
             };
             if let Err(e) = res {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
-                return;
+                return false;
             }
         }
+        true
     }
 }
 

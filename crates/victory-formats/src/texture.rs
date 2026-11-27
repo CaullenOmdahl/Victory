@@ -691,6 +691,20 @@ impl Layout {
         self.mips.get(mip as usize).map_or(0, |m| m.depth)
     }
 
+    /// Checks the same subresource and buffer bounds as [`Layout::detile`]
+    /// without reading or writing either buffer.
+    pub fn check_detile(
+        &self,
+        tiled_len: usize,
+        mip: u32,
+        slice: u32,
+        linear_len: usize,
+        row_pitch: usize,
+        depth_pitch: usize,
+    ) -> Result<(), Error> {
+        crate::detile::check_detile(self, tiled_len, mip, slice, linear_len, row_pitch, depth_pitch)
+    }
+
     /// Copies one subresource out of tiled memory (the whole texture,
     /// [`Layout::reach`] bytes of the mip at least) into linear rows: mip `mip` of array slice
     /// `slice` (3D: every depth slice of the mip, `slice` 0). Rows are
@@ -1422,6 +1436,31 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn detile_preflight_matches_the_copy() {
+        let layout = Layout::new(&desc(3, 2, 1, 1, Swizzle::LINEAR)).unwrap();
+        let tiled = vec![7; layout.size as usize];
+        let size = tiled.len();
+        for (mip, slice, src_len, dst_len, pitch, expected) in [
+            (0, 0, size, 6, 3, Ok(())),
+            (1, 0, size, 6, 3, Err(Error::Invalid)),
+            (0, 1, size, 6, 3, Err(Error::Invalid)),
+            (0, 0, size - 1, 6, 3, Err(Error::TooSmall)),
+            (0, 0, size, 5, 3, Err(Error::TooSmall)),
+            (0, 0, size, 6, 2, Err(Error::TooSmall)),
+        ] {
+            let mut linear = vec![0; dst_len];
+            assert_eq!(
+                layout.check_detile(src_len, mip, slice, dst_len, pitch, 6),
+                expected
+            );
+            assert_eq!(
+                layout.detile(&tiled[..src_len], mip, slice, &mut linear, pitch, 6),
+                expected
+            );
+        }
     }
 
     /// Pure element-by-element scalar reference using `Layout::offset`.
