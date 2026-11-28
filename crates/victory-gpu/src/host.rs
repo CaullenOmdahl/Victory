@@ -2136,6 +2136,12 @@ impl Host {
         }
         let mut async_signalled = false;
         let mut card_after_ran = false;
+        // `VICTORY_MERGE_GROUPS=1`: the runs go to the queue in one call
+        // (one host submission) when they are not timed one by one; the
+        // splitting only matters for frames of a second or more.
+        let merged: [&[Option<ID3D12CommandList>]; 1] = [&lists[..]];
+        let groups: &[&[Option<ID3D12CommandList>]] =
+            if !each && merge_groups() && groups.len() > 1 && !lists.is_empty() { &merged } else { &groups };
         for (i, group) in groups.iter().enumerate() {
             // Diagnostics: everything but the GPU's work, to look at the
             // order of the title's submissions.
@@ -4498,6 +4504,11 @@ unsafe impl Send for Prelude {}
 unsafe impl Sync for Prelude {}
 
 const PARALLEL_PRELUDE_BARRIERS: usize = 2048;
+
+fn merge_groups() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_GROUPS").is_some_and(|v| v == "1"))
+}
 
 fn multi_flight() -> usize {
     static MAX: OnceLock<usize> = OnceLock::new();
